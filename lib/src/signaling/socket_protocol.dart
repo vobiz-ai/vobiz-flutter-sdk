@@ -9,6 +9,9 @@ enum SocketCommand {
   bye,
   candidate,
   keepAlive,
+  hold,
+  resume,
+  merge,
 }
 
 class SocketEnvelope {

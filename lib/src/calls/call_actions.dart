@@ -4,6 +4,8 @@ class CallActions {
     this.canReject = false,
     this.canHangup = false,
     this.canMute = false,
+    this.canHold = false,
+    this.canResume = false,
     this.canSendDtmf = false,
   });
 
@@ -11,5 +13,7 @@ class CallActions {
   final bool canReject;
   final bool canHangup;
   final bool canMute;
+  final bool canHold;
+  final bool canResume;
   final bool canSendDtmf;
 }

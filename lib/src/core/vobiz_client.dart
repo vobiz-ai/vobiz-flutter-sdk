@@ -359,7 +359,7 @@ class VobizClient {
           payload: ByeMessage(callId: callId, reason: 'hangup').toJson(),
         ),
       );
-      await _peerService.disposeCurrentCall();
+      await _peerService.disposeCall(callId);
       _callRepository.remove(callId);
       _callManager.remove(callId, message: 'Call ended');
     } catch (error, stackTrace) {
@@ -376,15 +376,107 @@ class VobizClient {
   /// Mutes the local microphone for the current peer connection.
   Future<void> mute(String callId) async {
     final CallSession session = _requireCall(callId);
-    await _peerService.setMuted(true);
+    await _peerService.setMutedForCall(callId, true);
     session.muted = true;
   }
 
   /// Unmutes the local microphone for the current peer connection.
   Future<void> unmute(String callId) async {
     final CallSession session = _requireCall(callId);
-    await _peerService.setMuted(false);
+    await _peerService.setMutedForCall(callId, false);
     session.muted = false;
+  }
+
+  /// Puts a call on hold — silences its audio locally and notifies signaling.
+  ///
+  /// The call stays tracked in [CallManager] with state [CallStateStatus.held].
+  /// The peer connection remains alive but the mic track is disabled so the
+  /// remote party hears silence (music-on-hold is server-side).
+  Future<void> hold(String callId) async {
+    final CallSession session = _requireCall(callId);
+    if (session.state != CallStateStatus.active) return;
+
+    await _peerService.setMutedForCall(callId, true);
+    _callManager.hold(callId, message: 'Call on hold');
+
+    try {
+      await _socketService.send(
+        SocketEnvelope(
+          command: SocketCommand.hold,
+          payload: <String, dynamic>{'callId': callId},
+        ),
+      );
+    } catch (error, stackTrace) {
+      _logger.error('Hold signal failed for $callId: $error\n$stackTrace');
+      // Hold is best-effort at the signaling layer — local state is already
+      // updated so the UI reflects the hold immediately.
+    }
+  }
+
+  /// Resumes a held call and switches the active peer connection to it.
+  Future<void> resume(String callId) async {
+    final CallSession session = _requireCall(callId);
+    if (session.state != CallStateStatus.held) return;
+
+    _peerService.setActiveCall(callId);
+    await _peerService.setMutedForCall(callId, false);
+    _callManager.resume(callId, message: 'Call resumed');
+
+    try {
+      await _socketService.send(
+        SocketEnvelope(
+          command: SocketCommand.resume,
+          payload: <String, dynamic>{'callId': callId},
+        ),
+      );
+    } catch (error, stackTrace) {
+      _logger.error('Resume signal failed for $callId: $error\n$stackTrace');
+    }
+  }
+
+  /// Holds the current active call then dials [destination] as a second leg.
+  ///
+  /// Returns the new call's ID. The first call remains tracked as
+  /// [CallStateStatus.held] until [resume] or [mergeConference] is called.
+  Future<String> addCall(String destination) async {
+    final CallSession? active = currentCall;
+    if (active != null && active.state == CallStateStatus.active) {
+      await hold(active.callId);
+    }
+    return makeCall(destination);
+  }
+
+  /// Asks the backend to bridge two call legs into a single conference room.
+  ///
+  /// Both [callId1] and [callId2] must be tracked calls. The backend is
+  /// responsible for moving each PSTN leg into the conference; the SDK emits
+  /// the merge command and then updates local state optimistically.
+  Future<void> mergeConference(String callId1, String callId2) async {
+    _requireCall(callId1);
+    _requireCall(callId2);
+
+    try {
+      await _socketService.send(
+        SocketEnvelope(
+          command: SocketCommand.merge,
+          payload: <String, dynamic>{
+            'callId1': callId1,
+            'callId2': callId2,
+          },
+        ),
+      );
+      // Mark both calls as active (conference) locally.
+      _callManager.setActive(callId1, message: 'In conference');
+      _callManager.setActive(callId2, message: 'In conference');
+    } catch (error, stackTrace) {
+      _logger.error('Merge failed: $error\n$stackTrace');
+      _emitError(
+        code: 'merge_failed',
+        message: 'Unable to merge calls into conference',
+        cause: error,
+      );
+      rethrow;
+    }
   }
 
   /// Routes call audio to the speaker or earpiece.
@@ -471,7 +563,7 @@ class VobizClient {
   /// Disconnects the signaling socket and clears local call/session state.
   Future<void> disconnect() async {
     try {
-      await _peerService.disposeCurrentCall();
+      await _peerService.disposeAllCalls();
       await _socketService.close();
     } catch (error, stackTrace) {
       _logger.error('Failed during disconnect: $error\n$stackTrace');
@@ -683,7 +775,7 @@ class VobizClient {
       case SocketCommand.bye:
       case SocketCommand.reject:
         final String callId = envelope.payload['callId'] as String;
-        await _peerService.disposeCurrentCall();
+        await _peerService.disposeCall(callId);
         _callRepository.remove(callId);
         _callManager.remove(callId, message: 'Remote ended the call');
         break;
@@ -695,6 +787,31 @@ class VobizClient {
           CallStateStatus.ringing,
           message: 'Remote is ringing',
         );
+        break;
+
+      case SocketCommand.hold:
+        // Server-initiated hold — update local state.
+        final String callId =
+            envelope.payload['callId'] as String? ?? '';
+        if (callId.isNotEmpty) {
+          await _peerService.setMutedForCall(callId, true);
+          _callManager.hold(callId, message: 'Remote hold received');
+        }
+        break;
+
+      case SocketCommand.resume:
+        // Server-initiated resume — restore audio.
+        final String callId =
+            envelope.payload['callId'] as String? ?? '';
+        if (callId.isNotEmpty) {
+          _peerService.setActiveCall(callId);
+          await _peerService.setMutedForCall(callId, false);
+          _callManager.resume(callId, message: 'Remote resume received');
+        }
+        break;
+
+      case SocketCommand.merge:
+        // Server acknowledgement of conference merge — no local action needed.
         break;
 
       case SocketCommand.login:

@@ -29,11 +29,22 @@ class CallSession {
         return const CallActions(canAnswer: true, canReject: true);
       case CallStateStatus.connecting:
       case CallStateStatus.ringing:
-      case CallStateStatus.active:
         return const CallActions(
           canHangup: true,
           canMute: true,
           canSendDtmf: true,
+        );
+      case CallStateStatus.active:
+        return const CallActions(
+          canHangup: true,
+          canMute: true,
+          canHold: true,
+          canSendDtmf: true,
+        );
+      case CallStateStatus.held:
+        return const CallActions(
+          canHangup: true,
+          canResume: true,
         );
       default:
         return const CallActions();
