@@ -15,4 +15,3 @@ export 'src/models/call/outgoing_call.dart';
 export 'src/state/call_state.dart';
 export 'src/state/connection_state.dart';
 export 'src/state/registration_state.dart';
-export 'src/state/transport_state.dart';

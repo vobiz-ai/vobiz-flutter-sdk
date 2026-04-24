@@ -1,8 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:http/http.dart' as http;
 
-import '../calls/call_manager.dart';
 import '../calls/call_session.dart';
 import '../events/call_event.dart';
 import '../events/connection_event.dart';
@@ -10,15 +11,7 @@ import '../events/error_event.dart';
 import '../events/media_event.dart';
 import '../models/auth/credential_config.dart';
 import '../models/auth/token_config.dart';
-import '../models/call/incoming_call.dart';
-import '../models/signaling/answer_message.dart';
-import '../models/signaling/bye_message.dart';
-import '../models/signaling/candidate_message.dart';
-import '../models/signaling/invite_message.dart';
-import '../repositories/call_repository.dart';
-import '../repositories/session_repository.dart';
-import '../signaling/socket_protocol.dart';
-import '../signaling/socket_service.dart';
+import '../signaling/sip_service.dart';
 import '../state/call_state.dart';
 import '../state/connection_state.dart';
 import '../state/registration_state.dart';
@@ -26,63 +19,75 @@ import '../utils/logger.dart';
 import '../utils/stream_extensions.dart';
 import '../webrtc/peer_service.dart';
 import 'sdk_config.dart';
-import 'sdk_constants.dart';
 
-/// Main client used by the SDK consumer to manage signaling and call state.
+/// Main entry point for SDK consumers.
 ///
-/// The design mirrors the responsibilities of `TelnyxClient`:
-/// - open and close the signaling socket
-/// - authenticate with login credentials or token credentials
-/// - expose broadcast event streams for connection, call, media, and errors
-/// - keep internal state in sync with socket and signaling messages
+/// Connect with SIP credentials, make and receive calls, and control call
+/// state. All state changes are emitted as events on the public streams.
+///
+/// ```dart
+/// final client = VobizClient(config: SdkConfig(
+///   wsUrl: 'wss://registrar.vobiz.ai:5063/',
+///   sipServer: 'registrar.vobiz.ai',
+///   backendUrl: 'http://your-server:3000',
+/// ));
+///
+/// await client.connect(CredentialConfig(
+///   username: 'your-sip-username',
+///   password: 'your-sip-password',
+/// ));
+///
+/// client.callEvents.listen((event) {
+///   if (event.state == CallStateStatus.incoming) {
+///     await client.acceptCall();
+///   }
+/// });
+///
+/// await client.makeCall('+919876543210');
+/// ```
 class VobizClient {
   VobizClient({
     SdkConfig config = const SdkConfig(),
     Logger? logger,
-  })  : _logger = logger ?? Logger(),
-        _config = config,
-        _callRepository = CallRepository(),
-        _sessionRepository = SessionRepository(),
-        _callManager = CallManager(),
-        _socketService = SocketService(
-          socketUrl: config.socketUrl ?? SdkConstants.defaultSocketUrl,
-          autoReconnect: config.autoReconnect,
+  })  : _config = config,
+        _logger = logger ?? Logger(),
+        _sip = SIPService(
+          wsUrl: config.wsUrl,
+          sipServer: config.sipServer,
           logger: logger,
         ),
-        _peerService = PeerService(
+        _peer = PeerService(
           iceConfig: config.iceConfig,
           mediaConstraints: config.mediaConstraints,
           logger: logger,
         ) {
-    _wireServices();
+    _wireSip();
   }
 
-  // Core services used by the client.
-  final Logger _logger;
   final SdkConfig _config;
-  final CallRepository _callRepository;
-  final SessionRepository _sessionRepository;
-  final CallManager _callManager;
-  final SocketService _socketService;
-  final PeerService _peerService;
+  final Logger _logger;
+  final SIPService _sip;
+  final PeerService _peer;
 
-  // Public event streams.
-  final StreamController<ConnectionEvent> _connectionEvents =
-      StreamController<ConnectionEvent>.broadcast();
-  final StreamController<CallEvent> _callEvents =
-      StreamController<CallEvent>.broadcast();
-  final StreamController<MediaEvent> _mediaEvents =
-      StreamController<MediaEvent>.broadcast();
-  final StreamController<ErrorEvent> _errorEvents =
-      StreamController<ErrorEvent>.broadcast();
-
-  // Subscriptions are tracked so the client can clean them up if disposed later.
-  final List<StreamSubscription<dynamic>> _subscriptions =
-      <StreamSubscription<dynamic>>[];
-
+  // Internal state
+  String? _callId;
+  CallStateStatus _callState = CallStateStatus.idle;
   RegistrationState _registrationState = RegistrationState.unregistered;
   ConnectionStateStatus _connectionState = ConnectionStateStatus.disconnected;
-  bool _isConnected = false;
+  bool _isMuted = false;
+
+  // Inbound polling state
+  String? _pendingInboundCaller;
+  String? _pendingInboundJoinNumber;
+  Timer? _pollTimer;
+  Timer? _callSetupTimer;
+
+  // Event streams
+  final _connectionEvents =
+      StreamController<ConnectionEvent>.broadcast();
+  final _callEvents = StreamController<CallEvent>.broadcast();
+  final _mediaEvents = StreamController<MediaEvent>.broadcast();
+  final _errorEvents = StreamController<ErrorEvent>.broadcast();
 
   /// Broadcasts connection and registration changes.
   Stream<ConnectionEvent> get connectionEvents => _connectionEvents.stream;
@@ -93,795 +98,567 @@ class VobizClient {
   /// Broadcasts local and remote media updates.
   Stream<MediaEvent> get mediaEvents => _mediaEvents.stream;
 
-  /// Broadcasts recoverable and fatal SDK errors.
+  /// Broadcasts SDK errors.
   Stream<ErrorEvent> get errorEvents => _errorEvents.stream;
 
-  /// Returns all known calls currently held by the client.
-  Iterable<CallSession> get calls => _callManager.calls;
-
-  /// Returns the current connection state snapshot.
-  ConnectionStateStatus get connectionState => _connectionState;
-
-  /// Returns the current registration state snapshot.
+  /// Current registration state snapshot.
   RegistrationState get registrationState => _registrationState;
 
-  /// Returns whether the signaling session is currently established.
-  bool get isConnected => _isConnected;
+  /// Current connection state snapshot.
+  ConnectionStateStatus get connectionState => _connectionState;
 
-  /// Returns the most recent call that is still actionable.
-  ///
-  /// This allows convenience methods like [acceptCall] and [rejectCall] to
-  /// work without forcing the consumer to pass a call ID every time.
+  /// Whether the client is currently registered.
+  bool get isConnected =>
+      _connectionState == ConnectionStateStatus.connected &&
+      _registrationState == RegistrationState.registered;
+
+  /// The active call ID, if any.
+  String? get currentCallId => _callId;
+
+  /// Active call snapshot for consumers that prefer the CallSession model.
   CallSession? get currentCall {
-    for (final CallSession call in _callManager.calls.toList().reversed) {
-      if (call.state != CallStateStatus.ended &&
-          call.state != CallStateStatus.failed) {
-        return call;
-      }
-    }
-    return null;
+    final id = _callId;
+    if (id == null) return null;
+    return CallSession(
+      callId: id,
+      remoteIdentity: _pendingInboundCaller ?? '',
+      isIncoming: _pendingInboundCaller != null,
+      answerUrl: null,
+      state: _callState,
+    );
   }
 
-  /// Connects the client using either [CredentialConfig] or [TokenConfig].
-  ///
-  /// This is the main login entry point requested by the API contract.
+  /// All tracked calls (at most one in the current implementation).
+  Iterable<CallSession> get calls =>
+      currentCall != null ? <CallSession>[currentCall!] : const [];
+
+  // ---------------------------------------------------------------------------
+  // Connect / Disconnect
+  // ---------------------------------------------------------------------------
+
+  /// Connects and registers with either [CredentialConfig] or [TokenConfig].
   Future<void> connect(Object credentials) async {
     if (credentials is CredentialConfig) {
-      await connectWithCredentials(credentials);
+      await _connectWithSip(credentials.username, credentials.password);
       return;
     }
-
     if (credentials is TokenConfig) {
-      await connectWithToken(credentials);
+      // Token-based auth: token maps to a SIP username+password on the server.
+      // Treat the token as password with a placeholder username for now.
+      await _connectWithSip(credentials.displayName ?? 'token-user',
+          credentials.token);
       return;
     }
-
-    throw ArgumentError(
-      'Unsupported credentials type: ${credentials.runtimeType}. '
-      'Use CredentialConfig or TokenConfig.',
-    );
+    throw ArgumentError('Unsupported credentials type: ${credentials.runtimeType}');
   }
 
-  /// Connects with username/password style credentials.
-  Future<void> connectWithCredentials(CredentialConfig config) async {
-    await _connectInternal(
-      userId: config.username,
-      successMessage: 'Credential login sent',
-      loginCommand: SocketCommand.login,
-      payload: <String, dynamic>{
-        'username': config.username,
-        'password': config.password,
-        if (config.displayName != null) 'displayName': config.displayName,
-        'answerUrl': config.answerUrl ?? _config.answerUrl,
-      },
-    );
-  }
+  /// Convenience: connect with username + password.
+  Future<void> connectWithCredentials(CredentialConfig config) =>
+      _connectWithSip(config.username, config.password);
 
-  /// Connects with a server-issued token.
-  Future<void> connectWithToken(TokenConfig config) async {
-    await _connectInternal(
-      userId: config.displayName ?? 'token-user',
-      successMessage: 'Token login sent',
-      loginCommand: SocketCommand.tokenLogin,
-      payload: <String, dynamic>{
-        'token': config.token,
-        if (config.displayName != null) 'displayName': config.displayName,
-        'answerUrl': config.answerUrl ?? _config.answerUrl,
-      },
-    );
-  }
-
-  /// Convenience wrapper for starting an outbound call.
-  ///
-  /// This uses `flutter_webrtc` through [PeerService] to create local media,
-  /// build an SDP offer, and send the invite over the signaling socket.
-  Future<String> makeCall(
-    String destination, {
-    Map<String, String> headers = const <String, String>{},
-  }) {
-    return startCall(destination, headers: headers);
-  }
-
-  /// Starts an outbound call by creating a local offer and sending an invite.
-  Future<String> startCall(
-    String destination, {
-    Map<String, String> headers = const <String, String>{},
-  }) async {
-    _ensureConnected();
-
-    final String callId = DateTime.now().microsecondsSinceEpoch.toString();
-    final CallSession session = _callManager.createOutgoing(
-      callId: callId,
-      destination: destination,
-      answerUrl: _config.answerUrl,
-      metadata: <String, dynamic>{'headers': headers},
-    );
-    _callRepository.upsert(session);
-
-    try {
-      _callManager.updateState(
-        callId,
-        CallStateStatus.connecting,
-        message: 'Preparing local offer',
-      );
-
-      await _peerService.initialize(callId);
-      final RTCSessionDescription offer = await _peerService.createOffer();
-
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.invite,
-          payload: InviteMessage(
-            callId: callId,
-            destination: destination,
-            sdp: offer.sdp ?? '',
-            headers: headers,
-          ).toJson(),
-        ),
-      );
-
-      _callManager.updateState(
-        callId,
-        CallStateStatus.ringing,
-        message: 'Invite sent',
-      );
-      return callId;
-    } catch (error, stackTrace) {
-      _logger.error('Failed to start call: $error\n$stackTrace');
-      _callManager.updateState(
-        callId,
-        CallStateStatus.failed,
-        message: 'Failed to start outgoing call',
-      );
-      _emitError(
-        code: 'start_call_failed',
-        message: 'Unable to start the call',
-        cause: error,
-      );
-      rethrow;
-    }
-  }
-
-  /// Answers an incoming call.
-  ///
-  /// If the invite contained a remote SDP offer, it is applied before creating
-  /// the local answer.
-  Future<void> answerCall(String callId) async {
-    final CallSession session = _requireCall(callId);
-
-    try {
-      await _peerService.initialize(callId);
-
-      final String? remoteSdp = session.metadata['remoteSdp'] as String?;
-      if (remoteSdp != null && remoteSdp.isNotEmpty) {
-        await _peerService.setRemoteDescription(
-          RTCSessionDescription(remoteSdp, 'offer'),
-        );
-      }
-
-      final RTCSessionDescription answer = await _peerService.createAnswer();
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.answer,
-          payload: AnswerMessage(
-            callId: callId,
-            sdp: answer.sdp ?? '',
-          ).toJson(),
-        ),
-      );
-
-      _callManager.updateState(
-        callId,
-        CallStateStatus.active,
-        message: 'Answer sent',
-      );
-    } catch (error, stackTrace) {
-      _logger.error('Failed to answer call $callId: $error\n$stackTrace');
-      _callManager.updateState(
-        callId,
-        CallStateStatus.failed,
-        message: 'Failed to answer incoming call',
-      );
-      _emitError(
-        code: 'answer_failed',
-        message: 'Unable to answer call $callId',
-        cause: error,
-      );
-      rethrow;
-    }
-  }
-
-  /// Rejects an incoming call and removes it from local state.
-  /// Accepts the current incoming call or a specific call when [callId] is set.
-  ///
-  /// The method initializes WebRTC media, applies the remote offer when
-  /// available, creates an SDP answer, and sends it through the socket.
-  Future<void> acceptCall([String? callId]) async {
-    final String resolvedCallId = _resolveCallId(
-      explicitCallId: callId,
-      allowedStates: <CallStateStatus>{
-        CallStateStatus.incoming,
-        CallStateStatus.ringing,
-      },
-      actionName: 'accept',
-    );
-    await answerCall(resolvedCallId);
-  }
-
-  /// Rejects the current incoming call or a specific call when [callId] is set.
-  ///
-  /// A reject message is sent through the signaling socket and local state is
-  /// updated so listeners can react immediately.
-  Future<void> rejectCall([String? callId]) async {
-    final String resolvedCallId = _resolveCallId(
-      explicitCallId: callId,
-      allowedStates: <CallStateStatus>{
-        CallStateStatus.incoming,
-        CallStateStatus.ringing,
-      },
-      actionName: 'reject',
-    );
-    _requireCall(resolvedCallId);
-
-    try {
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.reject,
-          payload: ByeMessage(
-            callId: resolvedCallId,
-            reason: 'rejected',
-          ).toJson(),
-        ),
-      );
-      _callRepository.remove(resolvedCallId);
-      _callManager.remove(resolvedCallId, message: 'Call rejected');
-    } catch (error, stackTrace) {
-      _logger.error(
-        'Failed to reject call $resolvedCallId: $error\n$stackTrace',
-      );
-      _emitError(
-        code: 'reject_failed',
-        message: 'Unable to reject call $resolvedCallId',
-        cause: error,
-      );
-      rethrow;
-    }
-  }
-
-  /// Hangs up an active or ringing call.
-  Future<void> hangup(String callId) async {
-    _requireCall(callId);
-
-    try {
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.bye,
-          payload: ByeMessage(callId: callId, reason: 'hangup').toJson(),
-        ),
-      );
-      await _peerService.disposeCall(callId);
-      _callRepository.remove(callId);
-      _callManager.remove(callId, message: 'Call ended');
-    } catch (error, stackTrace) {
-      _logger.error('Failed to hang up call $callId: $error\n$stackTrace');
-      _emitError(
-        code: 'hangup_failed',
-        message: 'Unable to hang up call $callId',
-        cause: error,
-      );
-      rethrow;
-    }
-  }
-
-  /// Mutes the local microphone for the current peer connection.
-  Future<void> mute(String callId) async {
-    final CallSession session = _requireCall(callId);
-    await _peerService.setMutedForCall(callId, true);
-    session.muted = true;
-  }
-
-  /// Unmutes the local microphone for the current peer connection.
-  Future<void> unmute(String callId) async {
-    final CallSession session = _requireCall(callId);
-    await _peerService.setMutedForCall(callId, false);
-    session.muted = false;
-  }
-
-  /// Puts a call on hold — silences its audio locally and notifies signaling.
-  ///
-  /// The call stays tracked in [CallManager] with state [CallStateStatus.held].
-  /// The peer connection remains alive but the mic track is disabled so the
-  /// remote party hears silence (music-on-hold is server-side).
-  Future<void> hold(String callId) async {
-    final CallSession session = _requireCall(callId);
-    if (session.state != CallStateStatus.active) return;
-
-    await _peerService.setMutedForCall(callId, true);
-    _callManager.hold(callId, message: 'Call on hold');
-
-    try {
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.hold,
-          payload: <String, dynamic>{'callId': callId},
-        ),
-      );
-    } catch (error, stackTrace) {
-      _logger.error('Hold signal failed for $callId: $error\n$stackTrace');
-      // Hold is best-effort at the signaling layer — local state is already
-      // updated so the UI reflects the hold immediately.
-    }
-  }
-
-  /// Resumes a held call and switches the active peer connection to it.
-  Future<void> resume(String callId) async {
-    final CallSession session = _requireCall(callId);
-    if (session.state != CallStateStatus.held) return;
-
-    _peerService.setActiveCall(callId);
-    await _peerService.setMutedForCall(callId, false);
-    _callManager.resume(callId, message: 'Call resumed');
-
-    try {
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.resume,
-          payload: <String, dynamic>{'callId': callId},
-        ),
-      );
-    } catch (error, stackTrace) {
-      _logger.error('Resume signal failed for $callId: $error\n$stackTrace');
-    }
-  }
-
-  /// Holds the current active call then dials [destination] as a second leg.
-  ///
-  /// Returns the new call's ID. The first call remains tracked as
-  /// [CallStateStatus.held] until [resume] or [mergeConference] is called.
-  Future<String> addCall(String destination) async {
-    final CallSession? active = currentCall;
-    if (active != null && active.state == CallStateStatus.active) {
-      await hold(active.callId);
-    }
-    return makeCall(destination);
-  }
-
-  /// Asks the backend to bridge two call legs into a single conference room.
-  ///
-  /// Both [callId1] and [callId2] must be tracked calls. The backend is
-  /// responsible for moving each PSTN leg into the conference; the SDK emits
-  /// the merge command and then updates local state optimistically.
-  Future<void> mergeConference(String callId1, String callId2) async {
-    _requireCall(callId1);
-    _requireCall(callId2);
-
-    try {
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.merge,
-          payload: <String, dynamic>{
-            'callId1': callId1,
-            'callId2': callId2,
-          },
-        ),
-      );
-      // Mark both calls as active (conference) locally.
-      _callManager.setActive(callId1, message: 'In conference');
-      _callManager.setActive(callId2, message: 'In conference');
-    } catch (error, stackTrace) {
-      _logger.error('Merge failed: $error\n$stackTrace');
-      _emitError(
-        code: 'merge_failed',
-        message: 'Unable to merge calls into conference',
-        cause: error,
-      );
-      rethrow;
-    }
-  }
-
-  /// Routes call audio to the speaker or earpiece.
-  Future<void> setSpeakerEnabled(String callId, bool enabled) async {
-    final CallSession session = _requireCall(callId);
-    await _peerService.enableSpeaker(enabled);
-    session.speakerEnabled = enabled;
-  }
-
-  /// Sends a DTMF signaling message for the specified call.
-  Future<void> sendDtmf(String callId, String tone) async {
-    _requireCall(callId);
-    await _socketService.send(
-      SocketEnvelope(
-        command: SocketCommand.keepAlive,
-        payload: <String, dynamic>{
-          'type': 'dtmf',
-          'callId': callId,
-          'tone': tone,
-        },
-      ),
-    );
-  }
-
-  /// Adds a remote ICE candidate to the peer connection.
-  ///
-  /// The same candidate is also forwarded through the signaling socket when the
-  /// application wants to use this method to publish a local candidate.
-  Future<void> addRemoteCandidate(
-    String callId,
-    RTCIceCandidate candidate,
-  ) async {
-    _requireCall(callId);
-
-    try {
-      await _peerService.addIceCandidate(candidate);
-      await _socketService.send(
-        SocketEnvelope(
-          command: SocketCommand.candidate,
-          payload: CandidateMessage(
-            callId: callId,
-            candidate: candidate.candidate ?? '',
-            sdpMid: candidate.sdpMid,
-            sdpMLineIndex: candidate.sdpMLineIndex,
-          ).toJson(),
-        ),
-      );
-    } catch (error, stackTrace) {
-      _logger.error(
-        'Failed to process ICE candidate for $callId: $error\n$stackTrace',
-      );
-      _emitError(
-        code: 'candidate_failed',
-        message: 'Unable to process ICE candidate for call $callId',
-        cause: error,
-      );
-      rethrow;
-    }
-  }
-
-  /// Creates a synthetic incoming call event for demo/testing flows.
-  Future<void> simulateIncomingCall({
-    required String callId,
-    required String callerName,
-    required String callerNumber,
-    String? remoteSdp,
-  }) async {
-    final IncomingCall incoming = IncomingCall(
-      callId: callId,
-      callerName: callerName,
-      callerNumber: callerNumber,
-      metadata: <String, dynamic>{
-        if (remoteSdp != null) 'remoteSdp': remoteSdp,
-      },
-    );
-
-    final CallSession session = _callManager.createIncoming(
-      incoming,
-      answerUrl: _config.answerUrl,
-    );
-    _callRepository.upsert(session);
-  }
-
-  /// Disconnects the signaling socket and clears local call/session state.
+  /// Disconnects the SIP session and clears all call state.
   Future<void> disconnect() async {
-    try {
-      await _peerService.disposeAllCalls();
-      await _socketService.close();
-    } catch (error, stackTrace) {
-      _logger.error('Failed during disconnect: $error\n$stackTrace');
-      _emitError(
-        code: 'disconnect_failed',
-        message: 'An error occurred while disconnecting',
-        cause: error,
-      );
-      rethrow;
-    } finally {
-      _callManager.clear();
-      _callRepository.clear();
-      _sessionRepository.clear();
-      _registrationState = RegistrationState.unregistered;
-      _connectionState = ConnectionStateStatus.disconnected;
-      _isConnected = false;
-      _connectionEvents.addIfOpen(
-        ConnectionEvent(
-          connectionState: _connectionState,
-          registrationState: _registrationState,
-          message: 'Disconnected',
-        ),
-      );
-    }
+    _stopPolling();
+    _clearCallSetupTimer();
+    _sip.disconnect();
+    await _peer.disposeAllCalls();
+    _callId = null;
+    _callState = CallStateStatus.idle;
+    _registrationState = RegistrationState.unregistered;
+    _connectionState = ConnectionStateStatus.disconnected;
+    _connectionEvents.addIfOpen(ConnectionEvent(
+      connectionState: _connectionState,
+      registrationState: _registrationState,
+      message: 'Disconnected',
+    ));
   }
 
-  /// Optional cleanup helper if the client instance is no longer reused.
+  /// Releases all resources. Call when the client is no longer needed.
   Future<void> dispose() async {
     await disconnect();
-    for (final StreamSubscription<dynamic> subscription in _subscriptions) {
-      await subscription.cancel();
-    }
     await _connectionEvents.close();
     await _callEvents.close();
     await _mediaEvents.close();
     await _errorEvents.close();
+    await _peer.dispose();
   }
 
-  // Subscribes once to the lower-level services and republishes their events.
-  void _wireServices() {
-    _subscriptions.add(
-      _socketService.connectionEvents.listen(_handleConnectionEvent),
-    );
-    _subscriptions.add(
-      _socketService.errorEvents.listen((ErrorEvent event) {
-        if (event.code == 'socket_error') {
-          _connectionState = ConnectionStateStatus.failed;
-          _registrationState = RegistrationState.failed;
-          _isConnected = false;
-        }
-        _errorEvents.addIfOpen(event);
-      }),
-    );
-    _subscriptions.add(
-      _socketService.messages.listen((SocketEnvelope envelope) async {
-        try {
-          await _handleSocketMessage(envelope);
-        } catch (error, stackTrace) {
-          _logger.error(
-            'Unhandled signaling message failure: $error\n$stackTrace',
-          );
-          _emitError(
-            code: 'signaling_message_failed',
-            message:
-                'Failed to process signaling message ${envelope.command.name}',
-            cause: error,
-          );
-        }
-      }),
-    );
-    _subscriptions.add(_callManager.callEvents.listen(_callEvents.addIfOpen));
-    _subscriptions.add(_peerService.mediaEvents.listen(_mediaEvents.addIfOpen));
-  }
+  // ---------------------------------------------------------------------------
+  // Outbound call
+  // ---------------------------------------------------------------------------
 
-  // Shared login implementation used by both credential styles.
-  Future<void> _connectInternal({
-    required String userId,
-    required SocketCommand loginCommand,
-    required Map<String, dynamic> payload,
-    required String successMessage,
-  }) async {
-    if (_isConnected) {
-      _logger.info('Ignoring connect request because the client is connected');
-      _connectionEvents.addIfOpen(
-        ConnectionEvent(
-          connectionState: _connectionState,
-          registrationState: _registrationState,
-          message: 'Already connected',
-        ),
-      );
-      return;
+  /// Initiates an outbound call to [destination] (E.164 phone number or SIP user).
+  Future<String> makeCall(String destination) async {
+    if (!isConnected) throw StateError('Not registered — call connect() first');
+    if (_callState != CallStateStatus.idle) {
+      throw StateError('Already in a call');
     }
 
-    _registrationState = RegistrationState.registering;
-    _sessionRepository.currentUserId = userId;
-    _connectionEvents.addIfOpen(
-      ConnectionEvent(
-        connectionState: ConnectionStateStatus.connecting,
-        registrationState: _registrationState,
-        message: 'Connecting to signaling server',
-      ),
-    );
+    final callId = 'out_${DateTime.now().millisecondsSinceEpoch}';
+    _callId = callId;
+    _callState = CallStateStatus.connecting;
+    _emitCallEvent(callId, CallStateStatus.connecting, 'Preparing outbound call');
 
     try {
-      await _socketService.connect();
-      await _socketService.send(
-        SocketEnvelope(
-          command: loginCommand,
-          payload: payload,
-        ),
-      );
-      _setRegistered(successMessage);
-    } catch (error, stackTrace) {
-      _logger.error('Connect failed: $error\n$stackTrace');
-      _registrationState = RegistrationState.failed;
-      _connectionState = ConnectionStateStatus.failed;
-      _isConnected = false;
-      _emitError(
-        code: 'connect_failed',
-        message: 'Failed to connect to the signaling server',
-        cause: error,
-      );
-      _connectionEvents.addIfOpen(
-        ConnectionEvent(
-          connectionState: _connectionState,
-          registrationState: _registrationState,
-          message: 'Connection failed',
-        ),
-      );
+      await _peer.initialize(callId);
+      final offer = await _peer.createOffer();
+      await _waitForIceGathering(callId);
+      final local = await _peer.peerConnection?.getLocalDescription();
+      final sdp = local?.sdp ?? offer.sdp ?? '';
+
+      _sip.call(destination, sdp);
+      _callState = CallStateStatus.ringing;
+      _emitCallEvent(callId, CallStateStatus.ringing, 'INVITE sent');
+      _startCallSetupTimer(callId);
+      return callId;
+    } catch (e, st) {
+      _logger.error('makeCall failed: $e\n$st');
+      await _cleanupCall(callId);
+      _emitError('make_call_failed', 'Could not start the call', e);
       rethrow;
     }
   }
 
-  // Updates public state when a lower-level socket event arrives.
-  void _handleConnectionEvent(ConnectionEvent event) {
-    _connectionState = event.connectionState;
+  // ---------------------------------------------------------------------------
+  // Inbound call (SIP INVITE from Vobiz)
+  // ---------------------------------------------------------------------------
 
-    if (event.connectionState == ConnectionStateStatus.connected &&
-        _registrationState == RegistrationState.unregistered) {
-      _isConnected = true;
-    } else if (event.connectionState == ConnectionStateStatus.disconnected ||
-        event.connectionState == ConnectionStateStatus.failed) {
-      _isConnected = false;
-      if (_registrationState == RegistrationState.registered) {
-        _registrationState = RegistrationState.unregistered;
-      }
+  /// Accepts the current incoming call.
+  Future<void> acceptCall([String? callId]) async {
+    final id = callId ?? _callId;
+    if (id == null || _callState != CallStateStatus.incoming) return;
+
+    // Polling-detected inbound: Flutter dials out to join the conference.
+    if (_pendingInboundCaller != null) {
+      await _answerViaConference(id);
+      return;
     }
 
-    _connectionEvents.addIfOpen(
-      ConnectionEvent(
+    // True SIP INVITE inbound: answer with SDP.
+    await _answerSipInvite(id);
+  }
+
+  /// Rejects the current incoming call.
+  Future<void> rejectCall([String? callId]) async {
+    final id = callId ?? _callId;
+    if (id == null) return;
+    _sip.reject();
+    await _backend('/answer-inbound', method: 'DELETE').catchError((_) {});
+    await _cleanupCall(id);
+  }
+
+  /// Hangs up the active call.
+  Future<void> hangup([String? callId]) async {
+    final id = callId ?? _callId;
+    if (id == null) return;
+    _sip.hangup();
+    await _cleanupCall(id);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Audio control
+  // ---------------------------------------------------------------------------
+
+  /// Mutes the local microphone.
+  Future<void> mute([String? callId]) async {
+    final id = callId ?? _callId;
+    if (id == null) return;
+    await _peer.setMuted(true);
+    _isMuted = true;
+  }
+
+  /// Unmutes the local microphone.
+  Future<void> unmute([String? callId]) async {
+    final id = callId ?? _callId;
+    if (id == null) return;
+    await _peer.setMuted(false);
+    _isMuted = false;
+  }
+
+  bool get isMuted => _isMuted;
+
+  // ---------------------------------------------------------------------------
+  // Call control — all go through the backend server
+  // ---------------------------------------------------------------------------
+
+  /// Puts the active PSTN leg on hold (plays on-hold music to the caller).
+  Future<void> hold([String? callId]) async {
+    await _peer.setMuted(true);
+    await _backend('/hold-start');
+    final id = callId ?? _callId;
+    if (id != null) {
+      _callState = CallStateStatus.held;
+      _emitCallEvent(id, CallStateStatus.held, 'On hold');
+    }
+  }
+
+  /// Resumes a held call.
+  Future<void> resume([String? callId]) async {
+    await _peer.setMuted(false);
+    await _backend('/resume');
+    final id = callId ?? _callId;
+    if (id != null) {
+      _callState = CallStateStatus.active;
+      _emitCallEvent(id, CallStateStatus.active, 'Resumed');
+    }
+  }
+
+  /// Blind-transfers the PSTN caller to [to].
+  Future<void> transfer(String to) =>
+      _backend('/transfer', body: {'to': to});
+
+  /// Starts a warm (consultative) transfer to [to].
+  Future<void> warmTransferStart(String to) =>
+      _backend('/warm-transfer/start', body: {'to': to});
+
+  /// Completes a warm transfer (hangs up the SDK leg, leaves PSTN + target).
+  Future<void> warmTransferComplete() async {
+    _sip.hangup();
+    final id = _callId;
+    if (id != null) await _cleanupCall(id);
+  }
+
+  /// Merges a third party into the conference call.
+  Future<void> addCall(String to) => _backend('/add-call', body: {'to': to});
+
+  /// Starts a separate second call to [to] (puts first call on hold).
+  Future<void> startSecondCall(String to) =>
+      _backend('/second-call', body: {'to': to});
+
+  /// Swaps between the two active calls (Option B).
+  Future<void> swapCalls() => _backend('/swap-calls');
+
+  /// Merges two separate calls into a conference.
+  Future<void> mergeCalls() => _backend('/merge-calls');
+
+  /// Ends the second call and resumes the first.
+  Future<void> endSecondCall() => _backend('/end-second-call');
+
+  /// Removes the added conference party.
+  Future<void> removeAddedCall() => _backend('/remove-added-call');
+
+  // ---------------------------------------------------------------------------
+  // Private — SIP wiring
+  // ---------------------------------------------------------------------------
+
+  void _wireSip() {
+    _sip.onRegistered = () {
+      _registrationState = RegistrationState.registered;
+      _connectionState = ConnectionStateStatus.connected;
+      _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
-        message: event.message,
-      ),
-    );
-  }
+        message: 'Registered',
+      ));
+      _startPolling();
+    };
 
-  // Marks the login flow as completed and notifies listeners.
-  void _setRegistered(String message) {
-    _registrationState = RegistrationState.registered;
-    _connectionState = ConnectionStateStatus.connected;
-    _isConnected = true;
-    _connectionEvents.addIfOpen(
-      ConnectionEvent(
+    _sip.onRegistrationFailed = (String reason) {
+      _registrationState = RegistrationState.failed;
+      _connectionState = ConnectionStateStatus.failed;
+      _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
-        message: message,
-      ),
-    );
-  }
+        message: reason,
+      ));
+    };
 
-  // Handles application-level signaling messages from the WebSocket.
-  Future<void> _handleSocketMessage(SocketEnvelope envelope) async {
-    switch (envelope.command) {
-      case SocketCommand.incomingInvite:
-        final String callId = envelope.payload['callId'] as String? ??
-            DateTime.now().millisecondsSinceEpoch.toString();
-        await simulateIncomingCall(
-          callId: callId,
-          callerName: envelope.payload['callerName'] as String? ?? 'Unknown',
-          callerNumber:
-              envelope.payload['callerNumber'] as String? ?? 'Unknown',
-          remoteSdp: envelope.payload['sdp'] as String?,
-        );
-        break;
+    _sip.onSocketError = (String reason) {
+      _stopPolling();
+      _registrationState = RegistrationState.unregistered;
+      _connectionState = ConnectionStateStatus.disconnected;
+      _connectionEvents.addIfOpen(ConnectionEvent(
+        connectionState: _connectionState,
+        registrationState: _registrationState,
+        message: reason,
+      ));
+      _emitError('socket_error', reason, null);
+    };
 
-      case SocketCommand.answer:
-        final String callId = envelope.payload['callId'] as String;
-        final String sdp = envelope.payload['sdp'] as String? ?? '';
-        await _peerService.setRemoteDescription(
-          RTCSessionDescription(sdp, 'answer'),
-        );
-        _callManager.updateState(
-          callId,
-          CallStateStatus.active,
-          message: 'Remote answer applied',
-        );
-        break;
+    _sip.onRemoteRinging = () {
+      final id = _callId;
+      if (id == null) return;
+      _callState = CallStateStatus.ringing;
+      _emitCallEvent(id, CallStateStatus.ringing, 'Remote ringing');
+    };
 
-      case SocketCommand.candidate:
-        final RTCIceCandidate candidate = RTCIceCandidate(
-          envelope.payload['candidate'] as String?,
-          envelope.payload['sdpMid'] as String?,
-          envelope.payload['sdpMLineIndex'] as int?,
-        );
-        await _peerService.addIceCandidate(candidate);
-        break;
-
-      case SocketCommand.bye:
-      case SocketCommand.reject:
-        final String callId = envelope.payload['callId'] as String;
-        await _peerService.disposeCall(callId);
-        _callRepository.remove(callId);
-        _callManager.remove(callId, message: 'Remote ended the call');
-        break;
-
-      case SocketCommand.ringing:
-        final String callId = envelope.payload['callId'] as String;
-        _callManager.updateState(
-          callId,
-          CallStateStatus.ringing,
-          message: 'Remote is ringing',
-        );
-        break;
-
-      case SocketCommand.hold:
-        // Server-initiated hold — update local state.
-        final String callId =
-            envelope.payload['callId'] as String? ?? '';
-        if (callId.isNotEmpty) {
-          await _peerService.setMutedForCall(callId, true);
-          _callManager.hold(callId, message: 'Remote hold received');
-        }
-        break;
-
-      case SocketCommand.resume:
-        // Server-initiated resume — restore audio.
-        final String callId =
-            envelope.payload['callId'] as String? ?? '';
-        if (callId.isNotEmpty) {
-          _peerService.setActiveCall(callId);
-          await _peerService.setMutedForCall(callId, false);
-          _callManager.resume(callId, message: 'Remote resume received');
-        }
-        break;
-
-      case SocketCommand.merge:
-        // Server acknowledgement of conference merge — no local action needed.
-        break;
-
-      case SocketCommand.login:
-      case SocketCommand.tokenLogin:
-      case SocketCommand.invite:
-      case SocketCommand.keepAlive:
-        // These commands are outbound requests or no-op acknowledgements here.
-        break;
-    }
-  }
-
-  // Emits a standardized SDK error event.
-  void _emitError({
-    required String code,
-    required String message,
-    Object? cause,
-  }) {
-    _errorEvents.addIfOpen(
-      ErrorEvent(
-        code: code,
-        message: message,
-        cause: cause,
-      ),
-    );
-  }
-
-  // Throws when a connected session is required for an operation.
-  void _ensureConnected() {
-    if (!_isConnected) {
-      throw StateError('VobizClient is not connected');
-    }
-  }
-
-  // Throws when a call cannot be found locally.
-  CallSession _requireCall(String callId) {
-    final CallSession? session = _callManager.getById(callId);
-    if (session == null) {
-      throw StateError('Call $callId not found');
-    }
-    return session;
-  }
-
-  // Resolves a target call for convenience APIs that can operate on the latest
-  // active call when the consumer does not provide a call ID.
-  String _resolveCallId({
-    String? explicitCallId,
-    required Set<CallStateStatus> allowedStates,
-    required String actionName,
-  }) {
-    if (explicitCallId != null) {
-      final CallSession session = _requireCall(explicitCallId);
-      if (!allowedStates.contains(session.state)) {
-        throw StateError(
-          'Cannot $actionName call $explicitCallId while it is ${session.state.name}',
-        );
+    _sip.onCallAnswered = (String sdp) async {
+      final id = _callId;
+      if (id == null) return;
+      _clearCallSetupTimer();
+      try {
+        await _peer.setRemoteDescription(RTCSessionDescription(sdp, 'answer'));
+        _callState = CallStateStatus.active;
+        _emitCallEvent(id, CallStateStatus.active, 'Call connected');
+      } catch (e) {
+        _logger.error('Failed to apply remote answer: $e');
+        _emitError('answer_failed', 'Could not connect audio', e);
       }
-      return explicitCallId;
-    }
+    };
 
-    final CallSession? session = currentCall;
-    if (session == null) {
-      throw StateError('No call is available to $actionName');
-    }
+    _sip.onIncomingCall = (String callerId, String sdp) {
+      // True SIP INVITE inbound — not the polling path.
+      // We only handle this if the call was not already detected via polling.
+      if (_callState != CallStateStatus.idle) return;
+      final id = 'in_${DateTime.now().millisecondsSinceEpoch}';
+      _callId = id;
+      _callState = CallStateStatus.incoming;
+      _emitCallEvent(id, CallStateStatus.incoming, callerId);
+    };
 
-    if (!allowedStates.contains(session.state)) {
-      throw StateError(
-        'Cannot $actionName call ${session.callId} while it is ${session.state.name}',
-      );
-    }
+    _sip.onCallEnded = () {
+      final id = _callId;
+      if (id == null) return;
+      _cleanupCall(id);
+    };
 
-    return session.callId;
+    _sip.onCallFailed = (String reason) {
+      final id = _callId;
+      _clearCallSetupTimer();
+      if (id != null) _cleanupCall(id);
+      _emitError('call_failed', reason, null);
+    };
+
+    _peer.mediaEvents.listen((MediaEvent event) {
+      _mediaEvents.addIfOpen(event);
+    });
+  }
+
+  Future<void> _connectWithSip(String username, String password) async {
+    _registrationState = RegistrationState.registering;
+    _connectionState = ConnectionStateStatus.connecting;
+    _connectionEvents.addIfOpen(ConnectionEvent(
+      connectionState: _connectionState,
+      registrationState: _registrationState,
+      message: 'Connecting',
+    ));
+
+    try {
+      await _sip.connect();
+      _sip.register(username, password);
+    } catch (e) {
+      _registrationState = RegistrationState.failed;
+      _connectionState = ConnectionStateStatus.failed;
+      _connectionEvents.addIfOpen(ConnectionEvent(
+        connectionState: _connectionState,
+        registrationState: _registrationState,
+        message: 'Connection failed: $e',
+      ));
+      _emitError('connect_failed', 'Could not connect to SIP server', e);
+      rethrow;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — inbound conference (polling path)
+  // ---------------------------------------------------------------------------
+
+  void _startPolling() {
+    _stopPolling();
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+      if (!isConnected) return;
+      try {
+        final result = await _backendGet('/pending-call');
+        if (result == null) return;
+
+        // If showing incoming screen and PSTN hung up → revert to idle.
+        if (_callState == CallStateStatus.incoming &&
+            _pendingInboundCaller != null) {
+          if (result['pending'] != true) {
+            _pendingInboundCaller = null;
+            _pendingInboundJoinNumber = null;
+            final id = _callId;
+            if (id != null) await _cleanupCall(id);
+          }
+          return;
+        }
+
+        if (_callState != CallStateStatus.idle) return;
+        if (result['pending'] != true) return;
+
+        final caller = result['caller'] as String? ?? 'Unknown';
+        final joinNumber = result['joinNumber'] as String? ?? '';
+        _pendingInboundCaller = caller;
+        _pendingInboundJoinNumber = joinNumber;
+        final id = 'inbound_${DateTime.now().millisecondsSinceEpoch}';
+        _callId = id;
+        _callState = CallStateStatus.incoming;
+        _emitCallEvent(id, CallStateStatus.incoming, 'Inbound from $caller');
+      } catch (_) {}
+    });
+  }
+
+  void _stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  Future<void> _answerViaConference(String callId) async {
+    final caller = _pendingInboundCaller;
+    _pendingInboundCaller = null;
+    final joinTarget = _pendingInboundJoinNumber?.isNotEmpty == true
+        ? _pendingInboundJoinNumber!
+        : '';
+    _pendingInboundJoinNumber = null;
+
+    _callState = CallStateStatus.connecting;
+    _emitCallEvent(callId, CallStateStatus.connecting, 'Joining conference');
+
+    try {
+      if (joinTarget.isEmpty) {
+        throw StateError('No join number from server — check CALLER_ID in .env');
+      }
+      await _peer.initialize(callId);
+      final offer = await _peer.createOffer();
+      await _waitForIceGathering(callId);
+      final local = await _peer.peerConnection?.getLocalDescription();
+      final sdp = local?.sdp ?? offer.sdp ?? '';
+
+      await _backend('/answer-inbound');
+      _logger.info('Joining inbound conference via $joinTarget');
+      _sip.call(joinTarget, sdp);
+      _startCallSetupTimer(callId);
+    } catch (e, st) {
+      _logger.error('Inbound conference join failed: $e\n$st');
+      await _cleanupCall(callId);
+      _emitError('inbound_failed', 'Could not join the call', e);
+    }
+  }
+
+  Future<void> _answerSipInvite(String callId) async {
+    _callState = CallStateStatus.connecting;
+    _emitCallEvent(callId, CallStateStatus.connecting, 'Answering');
+
+    try {
+      await _peer.initialize(callId);
+      final answer = await _peer.createAnswer();
+      await _waitForIceGathering(callId);
+      final local = await _peer.peerConnection?.getLocalDescription();
+      final sdp = local?.sdp ?? answer.sdp ?? '';
+      _sip.answer(sdp);
+      _callState = CallStateStatus.active;
+      _emitCallEvent(callId, CallStateStatus.active, 'Call connected');
+    } catch (e, st) {
+      _logger.error('SIP answer failed: $e\n$st');
+      await _cleanupCall(callId);
+      _emitError('answer_failed', 'Could not answer the call', e);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — call setup timer
+  // ---------------------------------------------------------------------------
+
+  void _startCallSetupTimer(String callId) {
+    _clearCallSetupTimer();
+    _callSetupTimer = Timer(const Duration(seconds: 30), () {
+      if (_callState == CallStateStatus.connecting ||
+          _callState == CallStateStatus.ringing) {
+        _logger.warn('Call setup timeout for $callId');
+        _sip.hangup();
+        _cleanupCall(callId);
+        _emitError('call_timeout', 'Call setup timed out', null);
+      }
+    });
+  }
+
+  void _clearCallSetupTimer() {
+    _callSetupTimer?.cancel();
+    _callSetupTimer = null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — WebRTC helpers
+  // ---------------------------------------------------------------------------
+
+  Future<void> _waitForIceGathering(String callId) async {
+    final pc = _peer.peerConnection;
+    if (pc == null) return;
+
+    final deadline = DateTime.now().add(const Duration(seconds: 8));
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      final state = await pc.getIceGatheringState();
+      if (state == RTCIceGatheringState.RTCIceGatheringStateComplete) return;
+    }
+    _logger.warn('ICE gathering timeout — proceeding with available candidates');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — cleanup
+  // ---------------------------------------------------------------------------
+
+  Future<void> _cleanupCall(String callId) async {
+    _clearCallSetupTimer();
+    _pendingInboundCaller = null;
+    _pendingInboundJoinNumber = null;
+    _callState = CallStateStatus.ended;
+    _emitCallEvent(callId, CallStateStatus.ended, 'Call ended');
+    await _peer.disposeCall(callId);
+    _callId = null;
+    _callState = CallStateStatus.idle;
+    _isMuted = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — backend HTTP calls
+  // ---------------------------------------------------------------------------
+
+  static const Duration _backendTimeout = Duration(seconds: 10);
+
+  Future<void> _backend(
+    String path, {
+    String method = 'POST',
+    Map<String, String>? body,
+  }) async {
+    final url = Uri.parse('${_config.backendUrl}$path');
+    try {
+      final response = body != null
+          ? await http
+              .post(url,
+                  headers: {'Content-Type': 'application/json'},
+                  body: jsonEncode(body))
+              .timeout(_backendTimeout)
+          : method == 'DELETE'
+              ? await http.delete(url).timeout(_backendTimeout)
+              : await http.post(url).timeout(_backendTimeout);
+      if (response.statusCode >= 400) {
+        _logger.warn('Backend $path returned ${response.statusCode}');
+      }
+    } catch (e) {
+      _logger.warn('Backend $path failed (non-fatal): $e');
+    }
+  }
+
+  Future<Map<String, dynamic>?> _backendGet(String path) async {
+    try {
+      final response = await http
+          .get(Uri.parse('${_config.backendUrl}$path'))
+          .timeout(_backendTimeout);
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — events
+  // ---------------------------------------------------------------------------
+
+  void _emitCallEvent(String callId, CallStateStatus state, String message) {
+    _callEvents.addIfOpen(CallEvent(
+      callId: callId,
+      state: state,
+      message: message,
+    ));
+  }
+
+  void _emitError(String code, String message, Object? cause) {
+    _errorEvents.addIfOpen(ErrorEvent(
+      code: code,
+      message: message,
+      cause: cause,
+    ));
   }
 }
