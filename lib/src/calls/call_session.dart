@@ -1,7 +1,10 @@
+import 'package:meta/meta.dart';
+
 import '../models/call/call_stats.dart';
 import '../state/call_state.dart';
 import 'call_actions.dart';
 
+@internal
 class CallSession {
   CallSession({
     required this.callId,

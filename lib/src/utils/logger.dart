@@ -1,4 +1,8 @@
+import 'package:meta/meta.dart';
+
 typedef LogWriter = void Function(String message);
+
+@internal
 
 class Logger {
   Logger({LogWriter? writer}) : _writer = writer;

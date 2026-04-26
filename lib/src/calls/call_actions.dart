@@ -1,3 +1,6 @@
+import 'package:meta/meta.dart';
+
+@internal
 class CallActions {
   const CallActions({
     this.canAnswer = false,

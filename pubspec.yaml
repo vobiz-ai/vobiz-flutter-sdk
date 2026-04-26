@@ -1,7 +1,11 @@
 name: vobiz_webrtc
-description: Modular Flutter SDK scaffold for Vobiz WebRTC on Android and iOS.
+description: Flutter SDK for making and receiving calls on the Vobiz platform using SIP-over-WebSocket and WebRTC.
 version: 0.1.0
 publish_to: "none"
+
+homepage: https://vobiz.ai
+repository: https://github.com/devlume-in/vobiz-flutter-sdk
+issue_tracker: https://github.com/devlume-in/vobiz-flutter-sdk/issues
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -14,3 +18,4 @@ dependencies:
   web_socket_channel: ^3.0.1
   crypto: ^3.0.3
   http: ^1.2.0
+  meta: ^1.9.0

@@ -494,7 +494,6 @@ class VobizClient {
   }
 
   Future<void> _answerViaConference(String callId) async {
-    final caller = _pendingInboundCaller;
     _pendingInboundCaller = null;
     final joinTarget = _pendingInboundJoinNumber?.isNotEmpty == true
         ? _pendingInboundJoinNumber!

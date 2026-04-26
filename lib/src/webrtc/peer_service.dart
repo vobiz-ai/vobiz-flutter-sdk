@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../events/media_event.dart';
@@ -24,6 +25,7 @@ class _PeerCallState {
 ///
 /// Each call is identified by its [callId]. Operations that do not receive an
 /// explicit [callId] operate on the "active" call tracked by [_activeCallId].
+@internal
 class PeerService {
   PeerService({
     required this.iceConfig,
