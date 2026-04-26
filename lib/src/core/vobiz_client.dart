@@ -76,6 +76,14 @@ class VobizClient {
   ConnectionStateStatus _connectionState = ConnectionStateStatus.disconnected;
   bool _isMuted = false;
 
+  // Credentials stored for reconnection
+  String? _sipUsername;
+  String? _sipPassword;
+
+  // Reconnection state
+  int _reconnectAttempts = 0;
+  Timer? _reconnectTimer;
+
   // Inbound polling state
   String? _pendingInboundCaller;
   String? _pendingInboundJoinNumber;
@@ -158,6 +166,9 @@ class VobizClient {
 
   /// Disconnects the SIP session and clears all call state.
   Future<void> disconnect() async {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempts = 0;
     _stopPolling();
     _clearCallSetupTimer();
     _sip.disconnect();
@@ -343,6 +354,7 @@ class VobizClient {
 
   void _wireSip() {
     _sip.onRegistered = () {
+      _reconnectAttempts = 0;
       _registrationState = RegistrationState.registered;
       _connectionState = ConnectionStateStatus.connected;
       _connectionEvents.addIfOpen(ConnectionEvent(
@@ -373,6 +385,7 @@ class VobizClient {
         message: reason,
       ));
       _emitError('socket_error', reason, null);
+      if (_config.autoReconnect) _scheduleReconnect();
     };
 
     _sip.onRemoteRinging = () {
@@ -425,6 +438,8 @@ class VobizClient {
   }
 
   Future<void> _connectWithSip(String username, String password) async {
+    _sipUsername = username;
+    _sipPassword = password;
     _registrationState = RegistrationState.registering;
     _connectionState = ConnectionStateStatus.connecting;
     _connectionEvents.addIfOpen(ConnectionEvent(
@@ -447,6 +462,34 @@ class VobizClient {
       _emitError('connect_failed', 'Could not connect to SIP server', e);
       rethrow;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — reconnection (exponential backoff)
+  // ---------------------------------------------------------------------------
+
+  void _scheduleReconnect() {
+    final username = _sipUsername;
+    final password = _sipPassword;
+    if (username == null || password == null) return;
+
+    _reconnectTimer?.cancel();
+    // Backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s.
+    final delaySeconds = (_reconnectAttempts < 5)
+        ? (1 << _reconnectAttempts)
+        : 30;
+    _reconnectAttempts++;
+
+    _logger.warn('Reconnecting in ${delaySeconds}s (attempt $_reconnectAttempts)');
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+      if (_connectionState == ConnectionStateStatus.connected) return;
+      try {
+        await _sip.connect();
+        _sip.register(username, password);
+      } catch (_) {
+        if (_config.autoReconnect) _scheduleReconnect();
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------
