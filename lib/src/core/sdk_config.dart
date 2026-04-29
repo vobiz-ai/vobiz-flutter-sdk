@@ -21,6 +21,7 @@ class SdkConfig {
     this.wsUrl = 'wss://registrar.vobiz.ai:5063/',
     this.sipServer = 'registrar.vobiz.ai',
     this.backendUrl = 'http://10.0.2.2:3000',
+    this.answerUrl,
     this.autoReconnect = true,
     this.debug = false,
     this.iceConfig = const IceConfig(),
@@ -39,6 +40,12 @@ class SdkConfig {
   /// (`/hold-start`, `/resume`, `/transfer`, `/add-call`, etc.).
   /// On Android emulator use `http://10.0.2.2:3000` to reach the host machine.
   final String backendUrl;
+
+  /// Public answer webhook URL sent to Vobiz during login.
+  ///
+  /// Vobiz calls this URL when routing an inbound PSTN call to this client.
+  /// Must be publicly reachable (e.g. your ngrok URL + `/answer`).
+  final String? answerUrl;
 
   /// Reconnect automatically when the WebSocket drops.
   final bool autoReconnect;

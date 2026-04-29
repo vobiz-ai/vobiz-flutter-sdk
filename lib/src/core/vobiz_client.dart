@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 
@@ -20,46 +21,21 @@ import '../utils/stream_extensions.dart';
 import '../webrtc/peer_service.dart';
 import 'sdk_config.dart';
 
-/// Main entry point for SDK consumers.
-///
-/// Connect with SIP credentials, make and receive calls, and control call
-/// state. All state changes are emitted as events on the public streams.
-///
-/// ```dart
-/// final client = VobizClient(config: SdkConfig(
-///   wsUrl: 'wss://registrar.vobiz.ai:5063/',
-///   sipServer: 'registrar.vobiz.ai',
-///   backendUrl: 'http://your-server:3000',
-/// ));
-///
-/// await client.connect(CredentialConfig(
-///   username: 'your-sip-username',
-///   password: 'your-sip-password',
-/// ));
-///
-/// client.callEvents.listen((event) {
-///   if (event.state == CallStateStatus.incoming) {
-///     await client.acceptCall();
-///   }
-/// });
-///
-/// await client.makeCall('+919876543210');
-/// ```
 class VobizClient {
   VobizClient({
     SdkConfig config = const SdkConfig(),
     Logger? logger,
   })  : _config = config,
-        _logger = logger ?? Logger(),
+        _logger = logger ?? Logger(writer: config.debug ? debugPrint : null),
         _sip = SIPService(
           wsUrl: config.wsUrl,
           sipServer: config.sipServer,
-          logger: logger,
+          logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
         ),
         _peer = PeerService(
           iceConfig: config.iceConfig,
           mediaConstraints: config.mediaConstraints,
-          logger: logger,
+          logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
         ) {
     _wireSip();
   }
@@ -71,72 +47,57 @@ class VobizClient {
 
   // Internal state
   String? _callId;
+  String? _activeCallDestination;
   CallStateStatus _callState = CallStateStatus.idle;
   RegistrationState _registrationState = RegistrationState.unregistered;
   ConnectionStateStatus _connectionState = ConnectionStateStatus.disconnected;
   bool _isMuted = false;
 
   // Credentials stored for reconnection
-  String? _sipUsername;
-  String? _sipPassword;
+  String? _username;
+  String? _password;
 
-  // Reconnection state
+  // Reconnection
   int _reconnectAttempts = 0;
   Timer? _reconnectTimer;
 
-  // Inbound polling state
+  // Inbound call state
   String? _pendingInboundCaller;
-  String? _pendingInboundJoinNumber;
-  Timer? _pollTimer;
+  String? _pendingInboundSdp;
   Timer? _callSetupTimer;
 
   // Event streams
-  final _connectionEvents =
-      StreamController<ConnectionEvent>.broadcast();
+  final _connectionEvents = StreamController<ConnectionEvent>.broadcast();
   final _callEvents = StreamController<CallEvent>.broadcast();
   final _mediaEvents = StreamController<MediaEvent>.broadcast();
   final _errorEvents = StreamController<ErrorEvent>.broadcast();
 
-  /// Broadcasts connection and registration changes.
   Stream<ConnectionEvent> get connectionEvents => _connectionEvents.stream;
-
-  /// Broadcasts call lifecycle changes.
   Stream<CallEvent> get callEvents => _callEvents.stream;
-
-  /// Broadcasts local and remote media updates.
   Stream<MediaEvent> get mediaEvents => _mediaEvents.stream;
-
-  /// Broadcasts SDK errors.
   Stream<ErrorEvent> get errorEvents => _errorEvents.stream;
 
-  /// Current registration state snapshot.
   RegistrationState get registrationState => _registrationState;
-
-  /// Current connection state snapshot.
   ConnectionStateStatus get connectionState => _connectionState;
 
-  /// Whether the client is currently registered.
   bool get isConnected =>
       _connectionState == ConnectionStateStatus.connected &&
       _registrationState == RegistrationState.registered;
 
-  /// The active call ID, if any.
   String? get currentCallId => _callId;
 
-  /// Active call snapshot for consumers that prefer the CallSession model.
   CallSession? get currentCall {
     final id = _callId;
     if (id == null) return null;
     return CallSession(
       callId: id,
-      remoteIdentity: _pendingInboundCaller ?? '',
+      remoteIdentity: _pendingInboundCaller ?? _activeCallDestination ?? '',
       isIncoming: _pendingInboundCaller != null,
       answerUrl: null,
       state: _callState,
     );
   }
 
-  /// All tracked calls (at most one in the current implementation).
   Iterable<CallSession> get calls =>
       currentCall != null ? <CallSession>[currentCall!] : const [];
 
@@ -144,32 +105,27 @@ class VobizClient {
   // Connect / Disconnect
   // ---------------------------------------------------------------------------
 
-  /// Connects and registers with either [CredentialConfig] or [TokenConfig].
   Future<void> connect(Object credentials) async {
     if (credentials is CredentialConfig) {
-      await _connectWithSip(credentials.username, credentials.password);
+      await _connectWithCredentials(credentials.username, credentials.password);
       return;
     }
     if (credentials is TokenConfig) {
-      // Token-based auth: token maps to a SIP username+password on the server.
-      // Treat the token as password with a placeholder username for now.
-      await _connectWithSip(credentials.displayName ?? 'token-user',
-          credentials.token);
+      await _connectWithCredentials(
+          credentials.displayName ?? 'token-user', credentials.token);
       return;
     }
-    throw ArgumentError('Unsupported credentials type: ${credentials.runtimeType}');
+    throw ArgumentError(
+        'Unsupported credentials type: ${credentials.runtimeType}');
   }
 
-  /// Convenience: connect with username + password.
   Future<void> connectWithCredentials(CredentialConfig config) =>
-      _connectWithSip(config.username, config.password);
+      _connectWithCredentials(config.username, config.password);
 
-  /// Disconnects the SIP session and clears all call state.
   Future<void> disconnect() async {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempts = 0;
-    _stopPolling();
     _clearCallSetupTimer();
     _sip.disconnect();
     await _peer.disposeAllCalls();
@@ -184,7 +140,6 @@ class VobizClient {
     ));
   }
 
-  /// Releases all resources. Call when the client is no longer needed.
   Future<void> dispose() async {
     await disconnect();
     await _connectionEvents.close();
@@ -198,15 +153,15 @@ class VobizClient {
   // Outbound call
   // ---------------------------------------------------------------------------
 
-  /// Initiates an outbound call to [destination] (E.164 phone number or SIP user).
   Future<String> makeCall(String destination) async {
     if (!isConnected) throw StateError('Not registered — call connect() first');
     if (_callState != CallStateStatus.idle) {
       throw StateError('Already in a call');
     }
 
-    final callId = 'out_${DateTime.now().millisecondsSinceEpoch}';
+    final callId = DateTime.now().microsecondsSinceEpoch.toString();
     _callId = callId;
+    _activeCallDestination = destination;
     _callState = CallStateStatus.connecting;
     _emitCallEvent(callId, CallStateStatus.connecting, 'Preparing outbound call');
 
@@ -216,10 +171,9 @@ class VobizClient {
       await _waitForIceGathering(callId);
       final local = await _peer.peerConnection?.getLocalDescription();
       final sdp = local?.sdp ?? offer.sdp ?? '';
-
       _sip.call(destination, sdp);
       _callState = CallStateStatus.ringing;
-      _emitCallEvent(callId, CallStateStatus.ringing, 'INVITE sent');
+      _emitCallEvent(callId, CallStateStatus.ringing, 'Invite sent');
       _startCallSetupTimer(callId);
       return callId;
     } catch (e, st) {
@@ -231,34 +185,22 @@ class VobizClient {
   }
 
   // ---------------------------------------------------------------------------
-  // Inbound call (SIP INVITE from Vobiz)
+  // Inbound call
   // ---------------------------------------------------------------------------
 
-  /// Accepts the current incoming call.
   Future<void> acceptCall([String? callId]) async {
     final id = callId ?? _callId;
     if (id == null || _callState != CallStateStatus.incoming) return;
-
-    // Polling-detected inbound: Flutter dials out to join the conference.
-    if (_pendingInboundCaller != null) {
-      await _answerViaConference(id);
-      return;
-    }
-
-    // True SIP INVITE inbound: answer with SDP.
-    await _answerSipInvite(id);
+    await _answerInvite(id);
   }
 
-  /// Rejects the current incoming call.
   Future<void> rejectCall([String? callId]) async {
     final id = callId ?? _callId;
     if (id == null) return;
     _sip.reject();
-    await _backend('/answer-inbound', method: 'DELETE').catchError((_) {});
     await _cleanupCall(id);
   }
 
-  /// Hangs up the active call.
   Future<void> hangup([String? callId]) async {
     final id = callId ?? _callId;
     if (id == null) return;
@@ -270,18 +212,12 @@ class VobizClient {
   // Audio control
   // ---------------------------------------------------------------------------
 
-  /// Mutes the local microphone.
   Future<void> mute([String? callId]) async {
-    final id = callId ?? _callId;
-    if (id == null) return;
     await _peer.setMuted(true);
     _isMuted = true;
   }
 
-  /// Unmutes the local microphone.
   Future<void> unmute([String? callId]) async {
-    final id = callId ?? _callId;
-    if (id == null) return;
     await _peer.setMuted(false);
     _isMuted = false;
   }
@@ -289,10 +225,9 @@ class VobizClient {
   bool get isMuted => _isMuted;
 
   // ---------------------------------------------------------------------------
-  // Call control — all go through the backend server
+  // Call control — backend server
   // ---------------------------------------------------------------------------
 
-  /// Puts the active PSTN leg on hold (plays on-hold music to the caller).
   Future<void> hold([String? callId]) async {
     await _peer.setMuted(true);
     await _backend('/hold-start');
@@ -303,7 +238,6 @@ class VobizClient {
     }
   }
 
-  /// Resumes a held call.
   Future<void> resume([String? callId]) async {
     await _peer.setMuted(false);
     await _backend('/resume');
@@ -314,38 +248,24 @@ class VobizClient {
     }
   }
 
-  /// Blind-transfers the PSTN caller to [to].
   Future<void> transfer(String to) =>
       _backend('/transfer', body: {'to': to});
 
-  /// Starts a warm (consultative) transfer to [to].
   Future<void> warmTransferStart(String to) =>
       _backend('/warm-transfer/start', body: {'to': to});
 
-  /// Completes a warm transfer (hangs up the SDK leg, leaves PSTN + target).
   Future<void> warmTransferComplete() async {
-    _sip.hangup();
     final id = _callId;
+    _sip.hangup();
     if (id != null) await _cleanupCall(id);
   }
 
-  /// Merges a third party into the conference call.
   Future<void> addCall(String to) => _backend('/add-call', body: {'to': to});
-
-  /// Starts a separate second call to [to] (puts first call on hold).
   Future<void> startSecondCall(String to) =>
       _backend('/second-call', body: {'to': to});
-
-  /// Swaps between the two active calls (Option B).
   Future<void> swapCalls() => _backend('/swap-calls');
-
-  /// Merges two separate calls into a conference.
   Future<void> mergeCalls() => _backend('/merge-calls');
-
-  /// Ends the second call and resumes the first.
   Future<void> endSecondCall() => _backend('/end-second-call');
-
-  /// Removes the added conference party.
   Future<void> removeAddedCall() => _backend('/remove-added-call');
 
   // ---------------------------------------------------------------------------
@@ -354,35 +274,34 @@ class VobizClient {
 
   void _wireSip() {
     _sip.onRegistered = () {
-      _reconnectAttempts = 0;
       _registrationState = RegistrationState.registered;
       _connectionState = ConnectionStateStatus.connected;
+      _reconnectAttempts = 0;
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
         message: 'Registered',
       ));
-      _startPolling();
     };
 
-    _sip.onRegistrationFailed = (String reason) {
+    _sip.onRegistrationFailed = (reason) {
       _registrationState = RegistrationState.failed;
       _connectionState = ConnectionStateStatus.failed;
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
-        message: reason,
+        message: 'Registration failed: $reason',
       ));
+      _emitError('registration_failed', reason, null);
     };
 
-    _sip.onSocketError = (String reason) {
-      _stopPolling();
+    _sip.onSocketError = (reason) {
       _registrationState = RegistrationState.unregistered;
       _connectionState = ConnectionStateStatus.disconnected;
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
-        message: reason,
+        message: 'Socket error: $reason',
       ));
       _emitError('socket_error', reason, null);
       if (_config.autoReconnect) _scheduleReconnect();
@@ -395,12 +314,20 @@ class VobizClient {
       _emitCallEvent(id, CallStateStatus.ringing, 'Remote ringing');
     };
 
-    _sip.onCallAnswered = (String sdp) async {
+    _sip.onCallProgress = (sdp) {
+      final id = _callId;
+      if (id == null) return;
+      _callState = CallStateStatus.ringing;
+      _emitCallEvent(id, CallStateStatus.ringing, 'Call progress');
+    };
+
+    _sip.onCallAnswered = (sdp) async {
       final id = _callId;
       if (id == null) return;
       _clearCallSetupTimer();
       try {
-        await _peer.setRemoteDescription(RTCSessionDescription(sdp, 'answer'));
+        await _peer.setRemoteDescription(
+            RTCSessionDescription(sdp, 'answer'));
         _callState = CallStateStatus.active;
         _emitCallEvent(id, CallStateStatus.active, 'Call connected');
       } catch (e) {
@@ -409,25 +336,23 @@ class VobizClient {
       }
     };
 
-    _sip.onIncomingCall = (String callerId, String sdp) {
-      // True SIP INVITE inbound — not the polling path.
-      // We only handle this if the call was not already detected via polling.
+    _sip.onIncomingCall = (callerId, sdp) {
       if (_callState != CallStateStatus.idle) return;
-      final id = 'in_${DateTime.now().millisecondsSinceEpoch}';
-      _callId = id;
+      final callId = 'in_${DateTime.now().millisecondsSinceEpoch}';
+      _callId = callId;
+      _pendingInboundCaller = callerId;
+      _pendingInboundSdp = sdp;
       _callState = CallStateStatus.incoming;
-      _emitCallEvent(id, CallStateStatus.incoming, callerId);
+      _emitCallEvent(callId, CallStateStatus.incoming, callerId);
     };
 
     _sip.onCallEnded = () {
       final id = _callId;
-      if (id == null) return;
-      _cleanupCall(id);
+      if (id != null) _cleanupCall(id);
     };
 
-    _sip.onCallFailed = (String reason) {
+    _sip.onCallFailed = (reason) {
       final id = _callId;
-      _clearCallSetupTimer();
       if (id != null) _cleanupCall(id);
       _emitError('call_failed', reason, null);
     };
@@ -437,9 +362,10 @@ class VobizClient {
     });
   }
 
-  Future<void> _connectWithSip(String username, String password) async {
-    _sipUsername = username;
-    _sipPassword = password;
+  Future<void> _connectWithCredentials(
+      String username, String password) async {
+    _username = username;
+    _password = password;
     _registrationState = RegistrationState.registering;
     _connectionState = ConnectionStateStatus.connecting;
     _connectionEvents.addIfOpen(ConnectionEvent(
@@ -459,120 +385,49 @@ class VobizClient {
         registrationState: _registrationState,
         message: 'Connection failed: $e',
       ));
-      _emitError('connect_failed', 'Could not connect to SIP server', e);
+      _emitError('connect_failed', 'Could not connect', e);
       rethrow;
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Private — reconnection (exponential backoff)
+  // Private — reconnection
   // ---------------------------------------------------------------------------
 
   void _scheduleReconnect() {
-    final username = _sipUsername;
-    final password = _sipPassword;
+    final username = _username;
+    final password = _password;
     if (username == null || password == null) return;
 
     _reconnectTimer?.cancel();
-    // Backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s.
-    final delaySeconds = (_reconnectAttempts < 5)
-        ? (1 << _reconnectAttempts)
-        : 30;
+    final delaySeconds =
+        (_reconnectAttempts < 5) ? (1 << _reconnectAttempts) : 30;
     _reconnectAttempts++;
 
-    _logger.warn('Reconnecting in ${delaySeconds}s (attempt $_reconnectAttempts)');
+    _logger.warn(
+        'Reconnecting in ${delaySeconds}s (attempt $_reconnectAttempts)');
     _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
       if (_connectionState == ConnectionStateStatus.connected) return;
+      _sip.disconnect();
       try {
-        await _sip.connect();
-        _sip.register(username, password);
+        await _connectWithCredentials(username, password);
       } catch (_) {
         if (_config.autoReconnect) _scheduleReconnect();
       }
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Private — inbound conference (polling path)
-  // ---------------------------------------------------------------------------
-
-  void _startPolling() {
-    _stopPolling();
-    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
-      if (!isConnected) return;
-      try {
-        final result = await _backendGet('/pending-call');
-        if (result == null) return;
-
-        // If showing incoming screen and PSTN hung up → revert to idle.
-        if (_callState == CallStateStatus.incoming &&
-            _pendingInboundCaller != null) {
-          if (result['pending'] != true) {
-            _pendingInboundCaller = null;
-            _pendingInboundJoinNumber = null;
-            final id = _callId;
-            if (id != null) await _cleanupCall(id);
-          }
-          return;
-        }
-
-        if (_callState != CallStateStatus.idle) return;
-        if (result['pending'] != true) return;
-
-        final caller = result['caller'] as String? ?? 'Unknown';
-        final joinNumber = result['joinNumber'] as String? ?? '';
-        _pendingInboundCaller = caller;
-        _pendingInboundJoinNumber = joinNumber;
-        final id = 'inbound_${DateTime.now().millisecondsSinceEpoch}';
-        _callId = id;
-        _callState = CallStateStatus.incoming;
-        _emitCallEvent(id, CallStateStatus.incoming, 'Inbound from $caller');
-      } catch (_) {}
-    });
-  }
-
-  void _stopPolling() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
-  }
-
-  Future<void> _answerViaConference(String callId) async {
-    _pendingInboundCaller = null;
-    final joinTarget = _pendingInboundJoinNumber?.isNotEmpty == true
-        ? _pendingInboundJoinNumber!
-        : '';
-    _pendingInboundJoinNumber = null;
-
-    _callState = CallStateStatus.connecting;
-    _emitCallEvent(callId, CallStateStatus.connecting, 'Joining conference');
-
-    try {
-      if (joinTarget.isEmpty) {
-        throw StateError('No join number from server — check CALLER_ID in .env');
-      }
-      await _peer.initialize(callId);
-      final offer = await _peer.createOffer();
-      await _waitForIceGathering(callId);
-      final local = await _peer.peerConnection?.getLocalDescription();
-      final sdp = local?.sdp ?? offer.sdp ?? '';
-
-      await _backend('/answer-inbound');
-      _logger.info('Joining inbound conference via $joinTarget');
-      _sip.call(joinTarget, sdp);
-      _startCallSetupTimer(callId);
-    } catch (e, st) {
-      _logger.error('Inbound conference join failed: $e\n$st');
-      await _cleanupCall(callId);
-      _emitError('inbound_failed', 'Could not join the call', e);
-    }
-  }
-
-  Future<void> _answerSipInvite(String callId) async {
+  Future<void> _answerInvite(String callId) async {
     _callState = CallStateStatus.connecting;
     _emitCallEvent(callId, CallStateStatus.connecting, 'Answering');
 
     try {
       await _peer.initialize(callId);
+      final remoteSdp = _pendingInboundSdp;
+      if (remoteSdp != null && remoteSdp.isNotEmpty) {
+        await _peer.setRemoteDescription(
+            RTCSessionDescription(remoteSdp, 'offer'));
+      }
       final answer = await _peer.createAnswer();
       await _waitForIceGathering(callId);
       final local = await _peer.peerConnection?.getLocalDescription();
@@ -581,7 +436,7 @@ class VobizClient {
       _callState = CallStateStatus.active;
       _emitCallEvent(callId, CallStateStatus.active, 'Call connected');
     } catch (e, st) {
-      _logger.error('SIP answer failed: $e\n$st');
+      _logger.error('Answer failed: $e\n$st');
       await _cleanupCall(callId);
       _emitError('answer_failed', 'Could not answer the call', e);
     }
@@ -593,12 +448,12 @@ class VobizClient {
 
   void _startCallSetupTimer(String callId) {
     _clearCallSetupTimer();
-    _callSetupTimer = Timer(const Duration(seconds: 30), () {
+    _callSetupTimer = Timer(const Duration(seconds: 30), () async {
       if (_callState == CallStateStatus.connecting ||
           _callState == CallStateStatus.ringing) {
         _logger.warn('Call setup timeout for $callId');
         _sip.hangup();
-        _cleanupCall(callId);
+        await _cleanupCall(callId);
         _emitError('call_timeout', 'Call setup timed out', null);
       }
     });
@@ -616,7 +471,6 @@ class VobizClient {
   Future<void> _waitForIceGathering(String callId) async {
     final pc = _peer.peerConnection;
     if (pc == null) return;
-
     final deadline = DateTime.now().add(const Duration(seconds: 8));
     while (DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -633,7 +487,8 @@ class VobizClient {
   Future<void> _cleanupCall(String callId) async {
     _clearCallSetupTimer();
     _pendingInboundCaller = null;
-    _pendingInboundJoinNumber = null;
+    _pendingInboundSdp = null;
+    _activeCallDestination = null;
     _callState = CallStateStatus.ended;
     _emitCallEvent(callId, CallStateStatus.ended, 'Call ended');
     await _peer.disposeCall(callId);
@@ -670,18 +525,6 @@ class VobizClient {
     } catch (e) {
       _logger.warn('Backend $path failed (non-fatal): $e');
     }
-  }
-
-  Future<Map<String, dynamic>?> _backendGet(String path) async {
-    try {
-      final response = await http
-          .get(Uri.parse('${_config.backendUrl}$path'))
-          .timeout(_backendTimeout);
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body) as Map<String, dynamic>;
-      }
-    } catch (_) {}
-    return null;
   }
 
   // ---------------------------------------------------------------------------
