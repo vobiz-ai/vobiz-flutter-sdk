@@ -23,7 +23,7 @@ flutter pub add vobiz_webrtc
 1. Log in to [Vobiz Console](https://app.vobiz.ai)
 2. Go to **Voice** → **Endpoints**
 3. Create or select an endpoint and copy:
-   - **Username** (e.g., `dkvoice312279403969368799244`)
+   - **Username** (e.g., `myendpoint123456789`)
    - **Password** (from endpoint creation)
 
 ### 3. Wire Up the SDK
@@ -132,8 +132,8 @@ await client.connect();
 
 ```dart
 await client.login(
-  username: 'dkvoice312279403969368799244',
-  password: 'your-password-from-vobiz-console',
+  username: 'your-endpoint-username',
+  password: 'your-endpoint-password',
 );
 ```
 
@@ -190,7 +190,7 @@ Your backend must handle `/answer` endpoint:
 ```xml
 <?xml version="1.0"?>
 <Response>
-  <Dial callerId="+918046733542">
+  <Dial callerId="+1xxxxxxxxxx">
     <Number>+1234567890</Number>
   </Dial>
 </Response>
