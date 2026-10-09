@@ -202,6 +202,10 @@ class PlaygroundController extends ChangeNotifier {
   bool _callScreenAccepted = false;
   PushCall? _callScreenPush;
 
+  /// Call screens this app closed itself. The plugin reports closing a screen
+  /// that still rings as a Decline, which must not be taken for the user's.
+  final Set<String> _closingScreens = <String>{};
+
   PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer);
 
   // ── Trace ───────────────────────────────────────────────────────────────────
@@ -446,7 +450,7 @@ class PlaygroundController extends ChangeNotifier {
     final screen = _callScreenId;
     if (screen != null && !_callScreenAccepted) {
       _callScreenId = null;
-      await CallScreen.end(screen);
+      await _closeCallScreen(screen);
     }
     await client.acceptCall();
   }
@@ -799,10 +803,22 @@ class PlaygroundController extends ChangeNotifier {
     _callScreenId = null;
     _callScreenAccepted = false;
     _callScreenPush = null;
-    if (id != null) CallScreen.end(id);
+    if (id != null) _closeCallScreen(id);
+  }
+
+  Future<void> _closeCallScreen(String id) async {
+    _closingScreens.add(id);
+    await CallScreen.end(id);
   }
 
   Future<void> _onCallScreenEvent(ck.CallEvent? event) async {
+    // The echo of a screen this app closed itself: not the user's choice.
+    final closedHere = switch (event) {
+      ck.CallEventActionCallDecline(:final callKitParams) => _closingScreens.remove(callKitParams.id),
+      ck.CallEventActionCallEnded(:final callKitParams) => _closingScreens.remove(callKitParams.id),
+      _ => false,
+    };
+    if (closedHere) return;
     switch (event) {
       case ck.CallEventActionCallAccept(:final callKitParams):
         final pushed = PushCall.fromExtra(callKitParams.extra);
@@ -855,7 +871,7 @@ class PlaygroundController extends ChangeNotifier {
   /// accept, which signs in.
   void _onForegroundPush(PushCall call) {
     if (call.kind == PushKind.callEnded) {
-      CallScreen.end(call.callId);
+      _closeCallScreen(call.callId);
       if (_acceptedCall?.callId == call.callId) {
         _clearAcceptedCall();
         log('📴 The caller hung up before the call connected', LogType.warning);
@@ -890,7 +906,7 @@ class PlaygroundController extends ChangeNotifier {
       if (pushed == null || !active.isAccepted) continue;
       final expires = pushed.expiresAt;
       if (expires != null && DateTime.now().isAfter(expires.add(const Duration(seconds: 30)))) {
-        await CallScreen.end(active.id);
+        await _closeCallScreen(active.id);
         continue;
       }
       _callScreenId = active.id;
@@ -910,7 +926,7 @@ class PlaygroundController extends ChangeNotifier {
           'call would now sign in and connect.', LogType.success);
       _callScreenId = null;
       _callScreenAccepted = false;
-      await CallScreen.end(screenId);
+      await _closeCallScreen(screenId);
       return;
     }
     log('📲 Accepted the call from ${call.caller} on the call screen', LogType.event);

@@ -188,7 +188,13 @@ async function onDialResult(req, res, url, params) {
     await endRinging(call, 'caller_hung_up');
     return sendXml(res, '<Hangup/>');
   }
-  if (status === 'busy' || call.declined) {
+  if (status === 'busy' && !call.declined) {
+    // An endpoint that is offline (the app closed) comes back "busy" at once
+    // too (seen 2026-10-09), so busy alone is not a decline. The app reports
+    // Decline separately: give that a moment to arrive, then keep trying.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  if (call.declined) {
     finish(call, 'declined');
     await endRinging(call, 'declined');
     return sendXml(res, '<Hangup reason="busy"/>');
@@ -358,6 +364,7 @@ async function onAccept(req, res) {
   const body = await readJson(req);
   const call = callFor(body);
   if (!call) return sendJson(res, 404, { error: 'Unknown call' });
+  if (call.finished) return sendJson(res, 200, { ok: true, finished: true });
   call.accepted = true;
   call.deadline = Math.max(call.deadline, call.createdAt + ACCEPTED_GRACE_SECONDS * 1000);
   log('ok', `Call ${short(call.id)} accepted on the phone; waiting for the app to sign in`);
@@ -378,6 +385,9 @@ async function onDecline(req, res) {
       .sort((a, b) => b.createdAt - a.createdAt)[0];
   }
   if (!call) return sendJson(res, 404, { error: 'Unknown call' });
+  // Closing the call screen of a call that has already ended reports a
+  // Decline too: nothing to do.
+  if (call.finished) return sendJson(res, 200, { ok: true, finished: true });
   call.declined = true;
   log('ok', `Call ${short(call.id)} declined on the phone`);
   sendJson(res, 200, { ok: true });
