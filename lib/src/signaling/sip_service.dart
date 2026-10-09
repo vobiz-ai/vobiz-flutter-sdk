@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../core/sip_headers.dart';
 import '../utils/logger.dart';
 
 // ---------------------------------------------------------------------------
@@ -122,6 +123,7 @@ class SipBuilder {
     required String sdp,
     String? authHeaderName,
     String? authHeader,
+    Map<String, String> extraHeaders = const <String, String>{},
   }) {
     final contentLength = utf8.encode(sdp).length;
     final lines = <String>[
@@ -133,9 +135,12 @@ class SipBuilder {
       'CSeq: $cseq INVITE',
       'Contact: <sip:$fromUser@$sipServer;transport=wss>',
       'Max-Forwards: 70',
-      'Allow: INVITE, ACK, CANCEL, BYE, OPTIONS',
+      'Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, INFO',
       'Supported: timer',
       'User-Agent: vobiz_flutter_sdk',
+      // Custom X-VH- headers. Vobiz hands each one to the answer webhook as a
+      // top-level parameter.
+      for (final header in extraHeaders.entries) '${header.key}: ${header.value}',
     ];
     if (authHeaderName != null && authHeader != null) {
       lines.add('$authHeaderName: $authHeader');
@@ -243,6 +248,42 @@ class SipBuilder {
       '',
     ].join('\r\n');
   }
+
+  /// An in-dialog INFO. Used for DTMF, which is how the Vobiz web SDK sends
+  /// keypad tones (JsSIP's default `sendDTMF` transport).
+  static String info({
+    required String requestUri,
+    required String fromUser,
+    required String toHeader,
+    required String sipServer,
+    required String localTag,
+    required String callId,
+    required int cseq,
+    required String contentType,
+    required String body,
+    String? authHeaderName,
+    String? authHeader,
+  }) {
+    return <String>[
+      'INFO $requestUri SIP/2.0',
+      'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bK${_branch()}',
+      'From: <sip:$fromUser@$sipServer>;tag=$localTag',
+      'To: $toHeader',
+      'Call-ID: $callId',
+      'CSeq: $cseq INFO',
+      'Max-Forwards: 70',
+      if (authHeaderName != null && authHeader != null) '$authHeaderName: $authHeader',
+      'Content-Type: $contentType',
+      'Content-Length: ${utf8.encode(body).length}',
+      '',
+      body,
+    ].join('\r\n');
+  }
+
+  /// The body of an `application/dtmf-relay` INFO for one tone, exactly as
+  /// JsSIP writes it.
+  static String dtmfRelayBody(String tone, {int durationMs = 100}) =>
+      'Signal=$tone\r\nDuration=$durationMs';
 
   static String busyHere({
     required SipMessage invite,
@@ -357,6 +398,16 @@ class SIPService {
   SipMessage? _pendingInvite;
   SipMessage? _lastAnsweredInvite;
   String? _lastAnsweredSdp;
+  Map<String, String> _activeExtraHeaders = const <String, String>{};
+
+  // Vobiz's CallUUID for the current (or most recent) call. Kept after the
+  // call ends so the recording can still be matched to it; reset when the next
+  // call starts.
+  String? _callUuid;
+
+  // The DTMF INFO in flight, kept so a 401/407 challenge can be answered once.
+  String? _pendingInfoBody;
+  int _infoAuthAttempts = 0;
 
   WebSocketChannel? _socket;
   Timer? _registrationRefreshTimer;
@@ -371,15 +422,23 @@ class SIPService {
   ValueNotifier<SipRegistrationState> get registrationState =>
       _registrationState;
 
+  /// Vobiz's CallUUID (`X-Calluuid`) for the current or most recent call.
+  String? get callUuid => _callUuid;
+
+  /// Whether an established call (dialog) exists that in-dialog requests,
+  /// such as DTMF, can be sent on.
+  bool get hasActiveDialog => _activeCallId != null && _pendingInvite == null;
+
   // Callbacks wired by VobizClient
   void Function()? onRegistered;
   void Function(String reason)? onRegistrationFailed;
   void Function()? onRemoteRinging;
   void Function(String? sdp)? onCallProgress;
-  void Function(String callerId, String sdp)? onIncomingCall;
+  void Function(String callerId, String sdp, Map<String, String> headers)?
+      onIncomingCall;
   void Function(String sdp)? onCallAnswered;
-  void Function()? onCallEnded;
-  void Function(String reason)? onCallFailed;
+  void Function(String? reason)? onCallEnded;
+  void Function(String reason, int? sipCode)? onCallFailed;
   void Function(String reason)? onSocketError;
 
   Future<void> connect() async {
@@ -422,13 +481,26 @@ class SIPService {
     ));
   }
 
-  void call(String toUser, String sdp) {
+  void call(String toUser, String sdp,
+      {Map<String, String> extraHeaders = const <String, String>{}}) {
     _activeCallId = '${_rand(12)}@vobiz-client';
     _activeToUser = toUser;
     _activeInviteSdp = sdp;
     _activeRemoteTarget = 'sip:$toUser@$sipServer';
     _activeRemotePartyHeader = '<sip:$toUser@$sipServer>';
+    _activeExtraHeaders = Map<String, String>.unmodifiable(extraHeaders);
+    _callUuid = null;
     _sendInvite();
+  }
+
+  /// Sends one DTMF tone on the established call as an `application/dtmf-relay`
+  /// INFO. Returns false when there is no established call to send it on.
+  bool sendDtmf(String tone, {int durationMs = 100}) {
+    if (!hasActiveDialog || _username == null) return false;
+    _infoAuthAttempts = 0;
+    _pendingInfoBody = SipBuilder.dtmfRelayBody(tone, durationMs: durationMs);
+    _sendInfo();
+    return true;
   }
 
   void answer(String sdp) {
@@ -463,7 +535,7 @@ class SIPService {
       cseq: _cseq++,
     ));
     _clearCallState();
-    onCallEnded?.call();
+    onCallEnded?.call('Hung up');
   }
 
   void disconnect() {
@@ -472,6 +544,7 @@ class SIPService {
     _optionsKeepAliveTimer?.cancel();
     _clearCallState();
     _socket?.sink.close();
+    _socket = null;
     _connectionState.value = SipConnectionState.disconnected;
     _registrationState.value = SipRegistrationState.unregistered;
   }
@@ -497,8 +570,32 @@ class SIPService {
       sdp: _activeInviteSdp!,
       authHeaderName: authHeaderName,
       authHeader: authHeader,
+      // The re-sent INVITE after a 407 must carry the same headers, or the
+      // webhook never sees them.
+      extraHeaders: _activeExtraHeaders,
     ));
   }
+
+  void _sendInfo({String? authHeaderName, String? authHeader}) {
+    final body = _pendingInfoBody;
+    if (body == null || _activeCallId == null || _username == null) return;
+    _send(SipBuilder.info(
+      requestUri: _inDialogRequestUri(),
+      fromUser: _username!,
+      toHeader: _activeRemotePartyHeader ?? _buildFallbackToHeader(),
+      sipServer: sipServer,
+      localTag: _localTag,
+      callId: _activeCallId!,
+      cseq: _cseq++,
+      contentType: 'application/dtmf-relay',
+      body: body,
+      authHeaderName: authHeaderName,
+      authHeader: authHeader,
+    ));
+  }
+
+  String _inDialogRequestUri() =>
+      _activeRemoteTarget ?? 'sip:${_activeToUser ?? 'unknown'}@$sipServer';
 
   void _send(String message) {
     _logger.info('SIP >> ${_summarize(message)}');
@@ -512,10 +609,18 @@ class SIPService {
   void _listenToSocket() {
     // Guard so onError + onDone both firing only triggers onSocketError once.
     var errorReported = false;
+    // A sign-in replaces the socket. The old one's close arrives later and
+    // must not be mistaken for the new connection dropping, which would
+    // schedule a reconnect over a healthy session.
+    final socket = _socket!;
+    bool isCurrent() => identical(socket, _socket);
 
-    _socket!.stream.listen(
-      (raw) => _handleMessage(raw.toString()),
+    socket.stream.listen(
+      (raw) {
+        if (isCurrent()) _handleMessage(raw.toString());
+      },
       onError: (Object e) {
+        if (!isCurrent()) return;
         _logger.error('SIP WebSocket error: $e');
         _connectionState.value = SipConnectionState.disconnected;
         _registrationState.value = SipRegistrationState.failed;
@@ -527,6 +632,7 @@ class SIPService {
         }
       },
       onDone: () {
+        if (!isCurrent()) return;
         _logger.warn('SIP WebSocket closed');
         _connectionState.value = SipConnectionState.disconnected;
         _registrationRefreshTimer?.cancel();
@@ -562,14 +668,19 @@ class SIPService {
       case 'CANCEL':
         _replyOk(msg);
         _clearCallState();
-        onCallEnded?.call();
+        onCallEnded?.call(_describeReason(msg.header('Reason')) ?? 'Caller cancelled');
         break;
       case 'ACK':
         break;
       case 'BYE':
         _replyOk(msg);
         _clearCallState();
-        onCallEnded?.call();
+        onCallEnded?.call(_describeReason(msg.header('Reason')) ?? 'Remote party hung up');
+        break;
+      case 'INFO':
+        // Mid-call INFO from the far end (such as a DTMF relay). Acknowledge it
+        // so the dialog is not torn down for an unanswered request.
+        _replyOk(msg);
         break;
     }
   }
@@ -602,6 +713,7 @@ class SIPService {
 
     _pendingInvite = msg;
     _activeCallId = msg.header('Call-ID');
+    _callUuid = _nonEmpty(msg.header('X-Calluuid'));
     final callerId = _extractCallerId(msg);
     final parsedTo = _extractUser(msg.header('To') ?? '');
     _activeToUser = parsedTo == 'Unknown' ? callerId : parsedTo;
@@ -610,9 +722,12 @@ class SIPService {
     _activeRemoteTarget = _extractUri(msg.header('Contact') ?? fromHeader);
     _activeRemotePartyHeader = fromHeader;
 
+    // Custom headers the caller (or <Dial><User sipHeaders="...">) attached.
+    final headers = VobizSipHeaders.pick(msg.headers);
+
     _send(SipBuilder.ringing(invite: msg, localTag: _localTag));
     _logger.info('Incoming call from $callerId');
-    onIncomingCall?.call(callerId, msg.body);
+    onIncomingCall?.call(callerId, msg.body, headers);
   }
 
   void _handleResponse(SipMessage msg) {
@@ -621,7 +736,38 @@ class SIPService {
       _handleRegisterResponse(msg);
     } else if (cseq.contains('INVITE')) {
       _handleInviteResponse(msg);
+    } else if (cseq.contains('INFO')) {
+      _handleInfoResponse(msg);
     }
+  }
+
+  void _handleInfoResponse(SipMessage msg) {
+    final code = msg.statusCode;
+    if ((code == 401 || code == 407) && _infoAuthAttempts == 0 &&
+        _username != null && _password != null) {
+      _infoAuthAttempts++;
+      final challenge = msg.header('Proxy-Authenticate') ??
+          msg.header('WWW-Authenticate') ??
+          '';
+      final auth = SipDigestAuth.buildAuthHeader(
+        wwwAuthenticate: challenge,
+        method: 'INFO',
+        uri: _inDialogRequestUri(),
+        username: _username!,
+        password: _password!,
+      );
+      if (auth != null) {
+        _sendInfo(
+          authHeaderName: code == 407 ? 'Proxy-Authorization' : 'Authorization',
+          authHeader: auth,
+        );
+        return;
+      }
+    }
+    if (code >= 300) {
+      _logger.warn('DTMF INFO refused: $code ${_reasonPhrase(msg)}');
+    }
+    if (code >= 200) _pendingInfoBody = null;
   }
 
   void _handleRegisterResponse(SipMessage msg) {
@@ -678,6 +824,11 @@ class SIPService {
   }
 
   void _handleInviteResponse(SipMessage msg) {
+    // Vobiz names its CallUUID on the provisional and final responses. The
+    // web SDK reads it from the same header, and a transfer needs it.
+    final uuid = _nonEmpty(msg.header('X-Calluuid'));
+    if (uuid != null) _callUuid = uuid;
+
     switch (msg.statusCode) {
       case 100:
         break;
@@ -710,19 +861,48 @@ class SIPService {
         break;
       case 486:
         _clearCallState();
-        onCallFailed?.call('Remote party is busy');
+        onCallFailed?.call(
+            _withDetail('Remote party is busy', msg), msg.statusCode);
         break;
       case 603:
         _clearCallState();
-        onCallFailed?.call('Remote party declined the call');
+        onCallFailed?.call(
+            _withDetail('Remote party declined the call', msg), msg.statusCode);
         break;
       default:
         if (msg.statusCode >= 300) {
           final reason = _reasonPhrase(msg);
           _clearCallState();
-          onCallFailed?.call('Call failed (${msg.statusCode} $reason)');
+          onCallFailed?.call(
+              _withDetail('Call failed (${msg.statusCode} $reason)', msg),
+              msg.statusCode);
         }
     }
+  }
+
+  /// Appends the Q.850 (or SIP) detail from a `Reason` header, when the far end
+  /// sent one, so "Busy" can become "Busy — USER_BUSY (Q.850 17)".
+  String _withDetail(String summary, SipMessage msg) {
+    final detail = _describeReason(msg.header('Reason'));
+    return detail == null ? summary : '$summary — $detail';
+  }
+
+  /// `Q.850;cause=17;text="USER_BUSY"` becomes `USER_BUSY (Q.850 17)`.
+  String? _describeReason(String? header) {
+    if (header == null || header.trim().isEmpty) return null;
+    final protocol = header.split(';').first.trim();
+    final cause = RegExp(r'cause=(\d+)').firstMatch(header)?.group(1);
+    final text = RegExp(r'text="([^"]*)"').firstMatch(header)?.group(1);
+    final parts = <String>[
+      if (text != null && text.isNotEmpty) text,
+      if (cause != null) '($protocol $cause)',
+    ];
+    return parts.isEmpty ? null : parts.join(' ');
+  }
+
+  static String? _nonEmpty(String? value) {
+    final v = value?.trim();
+    return v == null || v.isEmpty ? null : v;
   }
 
   void _handleInviteAuthChallenge(SipMessage msg) {
@@ -735,7 +915,7 @@ class SIPService {
         _activeToUser == null ||
         _activeInviteSdp == null) {
       _clearCallState();
-      onCallFailed?.call('Call authentication failed');
+      onCallFailed?.call('Call authentication failed', msg.statusCode);
       return;
     }
     final auth = SipDigestAuth.buildAuthHeader(
@@ -747,7 +927,8 @@ class SIPService {
     );
     if (auth == null) {
       _clearCallState();
-      onCallFailed?.call('Could not parse call authentication challenge');
+      onCallFailed?.call(
+          'Could not parse call authentication challenge', msg.statusCode);
       return;
     }
     _sendInvite(
@@ -824,6 +1005,8 @@ class SIPService {
     _pendingInvite = null;
     _lastAnsweredInvite = null;
     _lastAnsweredSdp = null;
+    _activeExtraHeaders = const <String, String>{};
+    _pendingInfoBody = null;
   }
 
   // ---------------------------------------------------------------------------

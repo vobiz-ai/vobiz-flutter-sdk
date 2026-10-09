@@ -14,13 +14,22 @@ class CallSession {
     this.state = CallStateStatus.idle,
     Map<String, dynamic> metadata = const <String, dynamic>{},
     this.stats = const CallStats(),
-  }) : metadata = Map<String, dynamic>.from(metadata);
+    this.callUuid,
+    Map<String, String> headers = const <String, String>{},
+  })  : metadata = Map<String, dynamic>.from(metadata),
+        headers = Map<String, String>.unmodifiable(headers);
 
   final String callId;
   final String remoteIdentity;
   final bool isIncoming;
   final String? answerUrl;
   final Map<String, dynamic> metadata;
+
+  /// Vobiz's CallUUID for this leg, once the platform has reported it.
+  final String? callUuid;
+
+  /// Custom `X-VH-` headers sent (outbound) or received (inbound) on the call.
+  final Map<String, String> headers;
   CallStateStatus state;
   CallStats stats;
   bool muted = false;

@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../events/media_event.dart';
+import '../models/call/call_stats.dart';
 import '../utils/logger.dart';
 import '../utils/stream_extensions.dart';
 import 'audio_router.dart';
@@ -311,6 +312,61 @@ class PeerService {
       enabled ? 'Speaker enabled' : 'Speaker disabled',
     );
   }
+
+  // -------------------------------------------------------------------------
+  // Quality
+  // -------------------------------------------------------------------------
+
+  /// Audio quality for the active call, from the peer connection's stats:
+  /// round-trip time, jitter and packet loss. Null when there is no call.
+  /// A field is null when the platform has not measured it yet; nothing is
+  /// estimated.
+  Future<CallStats?> getStats() async {
+    final RTCPeerConnection? pc = peerConnection;
+    if (pc == null) return null;
+
+    final List<StatsReport> reports;
+    try {
+      reports = await pc.getStats();
+    } catch (error) {
+      _logger.warn('getStats failed: $error');
+      return null;
+    }
+
+    double? rttMs;
+    double? jitterMs;
+    double? lossPercent;
+    for (final StatsReport report in reports) {
+      final Map<dynamic, dynamic> v = report.values;
+      switch (report.type) {
+        case 'candidate-pair':
+          final bool selected =
+              v['nominated'] == true || '${v['state']}' == 'succeeded';
+          final double? rtt = _asDouble(v['currentRoundTripTime']);
+          if (selected && rtt != null && rtt > 0) rttMs = rtt * 1000;
+          break;
+        case 'remote-inbound-rtp':
+          final double? rtt = _asDouble(v['roundTripTime']);
+          if (rtt != null && rtt > 0) rttMs ??= rtt * 1000;
+          break;
+        case 'inbound-rtp':
+          if ('${v['kind'] ?? v['mediaType']}' != 'audio') break;
+          final double? jitter = _asDouble(v['jitter']);
+          if (jitter != null) jitterMs = jitter * 1000;
+          final double? lost = _asDouble(v['packetsLost']);
+          final double? received = _asDouble(v['packetsReceived']);
+          if (lost != null && received != null && lost + received > 0) {
+            lossPercent = lost / (lost + received) * 100;
+          }
+          break;
+      }
+    }
+    return CallStats(
+        rttMs: rttMs, jitterMs: jitterMs, packetLossPercent: lossPercent);
+  }
+
+  static double? _asDouble(Object? value) =>
+      value is num ? value.toDouble() : double.tryParse('${value ?? ''}');
 
   // -------------------------------------------------------------------------
   // Disposal
