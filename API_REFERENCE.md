@@ -1,639 +1,167 @@
-# Vobiz WebRTC SDK - Complete API Reference
+# Vobiz WebRTC SDK for Flutter: API reference
 
-This document describes all public APIs in the Vobiz WebRTC SDK for Flutter.
+Everything below is exported by `package:vobiz_webrtc/vobiz_webrtc.dart`.
 
----
+## VobizClient
 
-## Core Classes
-
-### VobizClient
-
-The main entry point for the SDK. Manages SIP registration, call lifecycle, and WebRTC connections.
-
-**Constructor:**
 ```dart
-VobizClient({
-  required SdkConfig config,
-  VobizClientListener? listener,
+VobizClient({SdkConfig config = const SdkConfig(), Logger? logger, http.Client? httpClient})
+```
+
+`httpClient` is for tests; leave it out in an app.
+
+### Signing in
+
+| Method | Mode | Notes |
+|---|---|---|
+| `Future<ZeroConfigSession> connectWithAuthToken({required String authId, required String authToken})` | Zero-Config Setup | Posts to `<backendUrl>/api/setup`, then registers as the returned endpoint. Throws `VobizException` (`setup_failed`) with a readable message when refused, `ArgumentError` when either value is blank |
+| `Future<void> connectWithCredentials(CredentialConfig config)` | SIP Direct | Registers as an existing endpoint |
+| `Future<void> connect(Object credentials)` | SIP Direct | Accepts `CredentialConfig`, or `TokenConfig` whose token is the endpoint password |
+| `Future<void> disconnect()` | | Unregisters, ends any call, and drops the Auth ID and Auth Token |
+| `Future<void> dispose()` | | `disconnect()` and closes the streams |
+
+A new sign-in replaces the previous connection. Registration finishes asynchronously:
+watch `connectionEvents` for `RegistrationState.registered` or `.failed`.
+
+| Getter | Meaning |
+|---|---|
+| `VobizAuthMode authMode` | `none`, `zeroConfig` or `sipDirect` |
+| `String? sipUsername` | The endpoint this client registers as |
+| `bool isConnected` | Socket connected and registered |
+| `RegistrationState registrationState`, `ConnectionStateStatus connectionState` | |
+| `String backendUrl` | The webhook server. Mutable: set it before signing in to use another one |
+
+### Calls
+
+```dart
+Future<String> makeCall(
+  String destination, {        // E.164, such as +919876543210
+  String? callerId,            // sent as X-VH-Caller-ID
+  Map<String, String> headers = const {},  // custom X-VH- headers
+  bool record = false,         // X-VH-Record: true
+  String? dialUser,            // X-VH-DialUser: ring this endpoint instead
 })
 ```
 
-**Methods:**
+Returns the client's call ID. Throws `StateError` when not registered or already in a
+call, and `ArgumentError` naming every invalid header or caller ID before anything is
+dialled.
 
-#### `login()`
-Registers with the SIP server using credentials.
+| Method | Notes |
+|---|---|
+| `Future<void> acceptCall([String? callId])` | Answers the ringing incoming call |
+| `Future<void> rejectCall([String? callId])` | Declines it (486 Busy Here) |
+| `Future<void> hangup([String? callId])` | Ends the call |
+| `Future<void> mute([String? callId])`, `unmute(...)` | Microphone |
+| `Future<void> setSpeakerphone(bool enabled)` | Loudspeaker or earpiece |
+| `Future<void> sendDtmf(String digits)` | `0-9 * # A-D`, sent as `application/dtmf-relay` SIP INFO, 500 ms apart. `StateError` without a connected call |
+| `Future<CallStats?> getCallStats()` | `rttMs`, `jitterMs`, `packetLossPercent` from WebRTC stats; a field is null until measured |
+| `static Map<String, String> buildCallHeaders({...})` | What `makeCall` would send for these options, validated. For checking a form |
+| `static String endpointUsername(String? value)` | `sip:play1@registrar.vobiz.ai` → `play1` |
+
+| Getter | Meaning |
+|---|---|
+| `CallStateStatus callState` | `idle` between calls |
+| `CallDirection? callDirection` | `inbound` or `outbound` |
+| `String? callUuid` | Vobiz's CallUUID for this leg (the `X-Calluuid` header), once reported |
+| `String? lastCallUuid` | The CallUUID of the most recent ended call |
+| `Map<String, String> callHeaders` | Custom headers sent (outbound) or received (inbound) |
+| `bool isMuted` | |
+
+### Transfer and recordings
 
 ```dart
-Future<void> login({
-  required String username,    // SIP username from Vobiz Console
-  required String password,    // SIP password
-  bool autoReconnect = true,   // Auto-reconnect on network drop
+Future<String> transferCall({
+  String? number,                 // E.164: a blind <Dial><Number>
+  String? sipUser,                // an endpoint: <Dial><User> with sipHeaders
+  TransferLeg leg = TransferLeg.aLeg,
+  String? callerId,
+  Map<String, String> sipHeaders = const {},
 })
 ```
 
-**Throws:** `Exception` if registration fails
-
-**Example:**
-```dart
-await client.login(
-  username: 'your-endpoint-username',
-  password: 'your-sip-password',
-);
-```
-
----
-
-#### `logout()`
-Unregisters from SIP server and closes all connections.
-
-```dart
-Future<void> logout()
-```
-
-**Example:**
-```dart
-await client.logout();
-```
-
----
-
-#### `makeCall()`
-Initiates an outbound call to a phone number.
-
-```dart
-Future<OutgoingCall> makeCall(String destination)
-```
-
-**Parameters:**
-- `destination` (String): Phone number in E.164 format (e.g., `+919876543210`)
-
-**Returns:** `OutgoingCall` object to control the call
-
-**Throws:** 
-- `Exception` if call setup fails
-- `Exception` if not logged in
-
-**Example:**
-```dart
-try {
-  final call = await client.makeCall('+919876543210');
-  print('Call initiated, SIP Call-ID: ${call.callId}');
-} catch (e) {
-  print('Call failed: $e');
-}
-```
-
----
-
-#### `answerCall()`
-Answers an incoming call.
-
-```dart
-Future<IncomingCall> answerCall(IncomingCall incomingCall)
-```
-
-**Parameters:**
-- `incomingCall` (IncomingCall): The call object from `onIncomingCall` event
-
-**Returns:** Updated `IncomingCall` with answer status
-
-**Throws:** `Exception` if answer fails
-
-**Example:**
-```dart
-client.onIncomingCall = (call) async {
-  final answered = await client.answerCall(call);
-  print('Call answered: ${answered.callerId}');
-};
-```
-
----
-
-#### `rejectCall()`
-Rejects an incoming call.
-
-```dart
-Future<void> rejectCall(IncomingCall incomingCall)
-```
-
-**Parameters:**
-- `incomingCall` (IncomingCall): The call object from `onIncomingCall` event
-
-**Example:**
-```dart
-await client.rejectCall(incomingCall);
-```
-
----
-
-#### `hangupCall()`
-Ends an active call (outbound or inbound).
-
-```dart
-Future<void> hangupCall({OutgoingCall? call, IncomingCall? incomingCall})
-```
-
-**Parameters:** Either `call` (outbound) OR `incomingCall` (inbound)
-
-**Example:**
-```dart
-// Hangup outbound call
-await client.hangupCall(call: outgoingCall);
-
-// Hangup inbound call
-await client.hangupCall(incomingCall: incomingCall);
-```
-
----
-
-#### `muteAudio()`
-Mutes the microphone during an active call.
-
-```dart
-Future<void> muteAudio(OutgoingCall call)
-```
-
-**Example:**
-```dart
-await client.muteAudio(outgoingCall);
-print('Microphone muted');
-```
-
----
-
-#### `unmuteAudio()`
-Unmutes the microphone during an active call.
-
-```dart
-Future<void> unmuteAudio(OutgoingCall call)
-```
-
-**Example:**
-```dart
-await client.unmuteAudio(outgoingCall);
-print('Microphone unmuted');
-```
-
----
-
-### SdkConfig
-
-Configuration object for initializing VobizClient.
-
-**Constructor:**
-```dart
-SdkConfig({
-  required String wsUrl,           // WebSocket URL of SIP server
-  required String sipServer,       // SIP server hostname
-  required String backendUrl,      // Your Answer URL backend
-  String? callerId,                // PSTN Caller ID (optional)
-  IceConfig? iceConfig,            // ICE/STUN/TURN settings (optional)
-  MediaConstraints? mediaConstraints,  // Audio constraints (optional)
-  bool debug = false,              // Enable debug logging
-})
-```
-
-**Example:**
-```dart
-final config = SdkConfig(
-  wsUrl: 'wss://registrar.vobiz.ai:5063/',
-  sipServer: 'registrar.vobiz.ai',
-  backendUrl: 'https://your-backend.example.com',
-  callerId: '+91XXXXXXXXXX',
-  debug: true,
-);
-
-final client = VobizClient(config: config);
-```
-
----
-
-### IceConfig
-
-Configures STUN/TURN servers for WebRTC media connectivity.
-
-**Constructor:**
-```dart
-IceConfig({
-  List<String> stunServers = const [
-    'stun:stun.l.google.com:19302',
-    'stun:stun1.l.google.com:19302',
-  ],
-  List<Map<String, dynamic>> turnServers = const [],
-  int iceCandidateTimeout = 8000,  // milliseconds
-})
-```
-
-**Example:**
-```dart
-final iceConfig = IceConfig(
-  stunServers: [
-    'stun:stun.l.google.com:19302',
-  ],
-  turnServers: [
-    {
-      'urls': ['turn:your-turn-server.com:3478'],
-      'username': 'user',
-      'credential': 'pass',
-    }
-  ],
-  iceCandidateTimeout: 5000,
-);
-```
-
----
-
-### MediaConstraints
-
-Configures audio capture settings.
-
-**Constructor:**
-```dart
-MediaConstraints({
-  bool audio = true,
-  bool video = false,
-  Map<String, dynamic>? audioConstraints,
-})
-```
-
-**Example:**
-```dart
-final constraints = MediaConstraints(
-  audio: true,
-  video: false,
-  audioConstraints: {
-    'echoCancellation': true,
-    'noiseSuppression': true,
-    'autoGainControl': true,
-  },
-);
-```
-
----
-
-## Data Models
-
-### OutgoingCall
-
-Represents an outbound call.
-
-**Properties:**
-```dart
-String callId              // Unique call ID
-String destination         // Destination phone number
-CallState state            // Current call state
-DateTime startTime         // Call start time
-String? hangupReason       // Reason for termination (if ended)
-CallStats? stats           // Call statistics
-```
-
-**Example:**
-```dart
-final call = await client.makeCall('+919876543210');
-print('Call to: ${call.destination}');
-print('State: ${call.state}');
-```
-
----
-
-### IncomingCall
-
-Represents an inbound call.
-
-**Properties:**
-```dart
-String callId              // Unique call ID
-String callerId            // Caller's phone number
-CallState state            // Current call state
-DateTime receivedTime      // When call was received
-String? hangupReason       // Reason for termination
-```
-
-**Example:**
-```dart
-client.onIncomingCall = (call) {
-  print('Incoming call from: ${call.callerId}');
-  print('Call ID: ${call.callId}');
-};
-```
-
----
-
-### CallStats
-
-Statistics about an active call.
-
-**Properties:**
-```dart
-int audioBytesSent         // Total audio bytes sent
-int audioBytesReceived     // Total audio bytes received
-int rtt                    // Round-trip time (milliseconds)
-String audioCodec          // Codec in use (e.g., "opus")
-int packetsLost            // Total packets lost
-double jitter              // Network jitter (milliseconds)
-```
-
-**Example:**
-```dart
-final stats = call.stats;
-if (stats != null) {
-  print('Audio codec: ${stats.audioCodec}');
-  print('Jitter: ${stats.jitter}ms');
-  print('Packets lost: ${stats.packetsLost}');
-}
-```
-
----
-
-## Enums & State
-
-### CallState
-
-Represents the current state of a call.
-
-```dart
-enum CallState {
-  idle,          // No active call
-  calling,       // Outbound call initiated, waiting for response
-  ringing,       // Remote phone ringing
-  inCall,        // Call connected and media flowing
-  ended,         // Call terminated
-}
-```
-
-**Example:**
-```dart
-if (call.state == CallState.inCall) {
-  print('Call is active');
-}
-```
-
----
-
-### ConnectionState
-
-Represents the connection status with the SIP server.
-
-```dart
-enum ConnectionState {
-  disconnected,  // Not connected
-  connecting,    // Attempting connection
-  connected,     // Successfully connected
-  reconnecting,  // Attempting to reconnect after drop
-}
-```
-
-**Example:**
-```dart
-client.onConnectionStateChanged = (state) {
-  if (state == ConnectionState.connected) {
-    print('✅ Connected to SIP server');
-  }
-};
-```
-
----
-
-### RegistrationState
-
-Represents the SIP registration status.
-
-```dart
-enum RegistrationState {
-  unregistered,  // Not registered
-  registering,   // Registration in progress
-  registered,    // Successfully registered
-  failed,        // Registration failed
-}
-```
-
----
-
-## Event Listeners
-
-VobizClient supports event callbacks for real-time updates.
-
-### Setting Listeners
-
-```dart
-client.onIncomingCall = (call) {
-  print('Incoming call from: ${call.callerId}');
-};
-
-client.onCallStateChanged = (call, state) {
-  print('Call state: $state');
-};
-
-client.onConnectionStateChanged = (state) {
-  print('Connection state: $state');
-};
-
-client.onRegistrationStateChanged = (state) {
-  print('Registration state: $state');
-};
-
-client.onError = (error) {
-  print('Error: $error');
-};
-```
-
----
-
-## Complete Example
-
-```dart
-import 'package:flutter/material.dart';
-import 'package:vobiz_webrtc/vobiz_webrtc.dart';
-
-void main() {
-  runApp(const MyApp());
-}
-
-class MyApp extends StatefulWidget {
-  const MyApp({Key? key}) : super(key: key);
-
-  @override
-  State<MyApp> createState() => _MyAppState();
-}
-
-class _MyAppState extends State<MyApp> {
-  late VobizClient _client;
-  IncomingCall? _incomingCall;
-  OutgoingCall? _outgoingCall;
-
-  @override
-  void initState() {
-    super.initState();
-    _initializeClient();
-  }
-
-  void _initializeClient() {
-    final config = SdkConfig(
-      wsUrl: 'wss://registrar.vobiz.ai:5063/',
-      sipServer: 'registrar.vobiz.ai',
-      backendUrl: 'https://your-backend.example.com',
-      callerId: '+91XXXXXXXXXX',
-      debug: true,
-    );
-
-    _client = VobizClient(config: config);
-
-    // Setup listeners
-    _client.onIncomingCall = (call) {
-      setState(() => _incomingCall = call);
-    };
-
-    _client.onCallStateChanged = (call, state) {
-      print('Call state: $state');
-    };
-
-    _client.onConnectionStateChanged = (state) {
-      print('Connection: $state');
-    };
-
-    // Login
-    _login();
-  }
-
-  Future<void> _login() async {
-    try {
-      await _client.login(
-        username: 'your-endpoint-username',
-        password: 'your-password',
-      );
-      print('✅ Logged in and registered');
-    } catch (e) {
-      print('❌ Login failed: $e');
-    }
-  }
-
-  Future<void> _makeCall(String number) async {
-    try {
-      final call = await _client.makeCall(number);
-      setState(() => _outgoingCall = call);
-    } catch (e) {
-      print('❌ Call failed: $e');
-    }
-  }
-
-  Future<void> _answerIncoming() async {
-    if (_incomingCall != null) {
-      await _client.answerCall(_incomingCall!);
-    }
-  }
-
-  Future<void> _hangup() async {
-    if (_outgoingCall != null) {
-      await _client.hangupCall(call: _outgoingCall);
-    }
-    if (_incomingCall != null) {
-      await _client.hangupCall(incomingCall: _incomingCall);
-    }
-  }
-
-  @override
-  void dispose() {
-    _client.logout();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      home: Scaffold(
-        appBar: AppBar(title: const Text('Vobiz Call')),
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (_incomingCall != null)
-                Column(
-                  children: [
-                    Text('Incoming call from: ${_incomingCall!.callerId}'),
-                    const SizedBox(height: 16),
-                    ElevatedButton(
-                      onPressed: _answerIncoming,
-                      child: const Text('Answer'),
-                    ),
-                  ],
-                )
-              else
-                Column(
-                  children: [
-                    ElevatedButton(
-                      onPressed: () => _makeCall('+919876543210'),
-                      child: const Text('Call'),
-                    ),
-                    const SizedBox(height: 16),
-                    ElevatedButton(
-                      onPressed: _hangup,
-                      child: const Text('Hangup'),
-                    ),
-                  ],
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-```
-
----
-
-## Error Handling
-
-All methods may throw exceptions. Common errors:
-
-| Error | Cause |
-|-------|-------|
-| `"Not logged in"` | Call made before `login()` completed |
-| `"Connection failed"` | Network issue or server unreachable |
-| `"Registration failed"` | Invalid credentials |
-| `"Invalid destination"` | Phone number format invalid |
-| `"WebRTC connection failed"` | Network connectivity issue |
-
-**Best Practice:**
-```dart
-try {
-  await client.makeCall('+919876543210');
-} catch (e) {
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text('Error: $e')),
-  );
-}
-```
-
----
-
-## Troubleshooting
-
-### "SIP registration failed"
-- Check username/password from Vobiz Console
-- Verify endpoint is **Active** in Vobiz Console > Voice > Endpoints
-- Check internet connectivity
-
-### "Call fails immediately after answer"
-- Check RECORD_AUDIO permission is granted
-- Verify Answer URL backend is accessible
-- Check firewall allows WebRTC media ports
-
-### "One-way audio"
-- Check microphone/speaker permissions on device
-- Test with different network (WiFi vs cellular)
-- Verify STUN server is reachable
-
-### "Cannot hear remote"
-- Check speaker volume on device
-- Verify audio codec support (opus recommended)
-- Check firewall blocks RTP ports
-
----
-
-## Support
-
-- [SDK Repository](https://github.com/devlume-in/vobiz-flutter-sdk)
-- [Issue Tracker](https://github.com/devlume-in/vobiz-flutter-sdk/issues)
-- [Vobiz Docs](https://docs.vobiz.ai)
-- Email: support@vobiz.ai
+Zero-Config only, and only on an answered call. Give exactly one of `number` and
+`sipUser`. Headers whose names contain characters other than letters and digits cannot
+travel in XML and are left out (logged). Returns the server's confirmation; throws
+`VobizException` (`transfer_failed`) when the server or Vobiz refuses.
+
+| Method | Notes |
+|---|---|
+| `Future<List<VobizRecording>> fetchRecordings()` | Everything the webhook server has received, most recent first |
+| `Future<VobizRecording?> waitForRecording(String callUuid, {Duration interval, int attempts})` | Polls until the recording for that call arrives (default every 2.5 s, 12 times), or returns null |
+
+### Legacy call control
+
+`hold`, `resume`, `transfer(String to)`, `warmTransferStart`, `warmTransferComplete`,
+`addCall`, `startSecondCall`, `swapCalls`, `mergeCalls`, `endSecondCall` and
+`removeAddedCall` call routes such as `/hold-start` on `backendUrl`. Only the Node
+reference server implements them.
+
+### Events
+
+| Stream | Event |
+|---|---|
+| `connectionEvents` | `ConnectionEvent`: `connectionState`, `registrationState`, `message` |
+| `callEvents` | `CallEvent` (below) |
+| `mediaEvents` | `MediaEvent`: local and remote streams |
+| `errorEvents` | `ErrorEvent`: `code`, `message`, `cause` |
+
+`CallEvent` fields: `callId`, `state`, `message`, `direction`, `remoteIdentity`,
+`callUuid`, `headers`, and on failure `sipCode` and `reason` (with the Q.850 cause when
+the far end gave one, such as `Remote party is busy — USER_BUSY (Q.850 17)`). A failed
+call emits `failed` and then `ended`.
+
+Error codes include `setup_failed`, `registration_failed`, `socket_error`,
+`connect_failed`, `call_failed`, `call_timeout`, `answer_failed`, `make_call_failed`,
+`transfer_failed` and `recordings_failed`.
+
+## SdkConfig
+
+| Field | Default | |
+|---|---|---|
+| `wsUrl` | `wss://registrar.vobiz.ai:5063/` | SIP over WebSocket |
+| `sipServer` | `registrar.vobiz.ai` | SIP domain |
+| `backendUrl` | `SdkConfig.defaultWebhookUrl` = `https://rtc-demo.vobiz.ai` | The webhook server: Zero-Config Setup, transfers, recordings, and the answer URL Vobiz calls |
+| `voiceApiUrl` | `SdkConfig.defaultVoiceApiUrl` = `https://api.vobiz.ai` | The Vobiz API the webhook server calls for you |
+| `autoReconnect` | `true` | Reconnect with backoff (1, 2, 4, 8, 16 s, then every 30 s) |
+| `debug` | `false` | SDK logs to the console |
+| `iceConfig` | Google STUN | Add TURN for restrictive networks |
+| `mediaConstraints` | audio with echo cancellation, noise suppression, AGC | |
+
+## VobizSipHeaders
+
+The custom-header rules, identical to the Vobiz web SDK's:
+
+- Names: `X-VH-` plus 1-19 letters, digits or hyphens; or `X-Vobiz-JWT`.
+- Values: `A-Z a-z 0-9 _ - + ( ) % .`, no spaces, up to 120 characters (500 for the JWT).
+
+| Member | |
+|---|---|
+| `prefix`, `jwt`, `record`, `dialUser`, `callerId` | Header names |
+| `String? validateName(String)`, `String? validateValue(String name, String value)` | A reason, or null when valid |
+| `HeaderCheck check(Map<String, String>)` | `valid` headers and one `errors` line per rejected one (duplicates are case-insensitive) |
+| `Map<String, String> pick(Map<String, String>)` | Only the valid custom headers, as an incoming call reports them |
+| `XmlSipHeaders toXml(Map<String, String>)` | The `sipHeaders` attribute value (`OrderId=A1234,…`) and the headers that cannot be expressed in it |
+
+## Models
+
+| Type | Fields |
+|---|---|
+| `ZeroConfigSession` | `sipUsername`, `sipPassword`, `applicationId`, `message`, `reusedExisting` |
+| `VobizRecording` | `recordingId`, `callUuid`, `url`, `durationSecs`, `endReason`, `receivedAt` |
+| `CallStats` | `rttMs`, `jitterMs`, `packetLossPercent` |
+| `CredentialConfig` | `username`, `password`, `displayName`, `answerUrl` |
+| `TokenConfig` | `token`, `displayName`, `answerUrl` |
+| `VobizException` | `code`, `message`, `statusCode` |
+
+## Enums
+
+| Enum | Values |
+|---|---|
+| `VobizAuthMode` | `none`, `zeroConfig`, `sipDirect` |
+| `CallStateStatus` | `idle`, `incoming`, `outgoing`, `ringing`, `connecting`, `active`, `held`, `ended`, `failed` |
+| `CallDirection` | `inbound`, `outbound` |
+| `TransferLeg` | `aLeg` (`aleg`: move yourself), `bLeg` (`bleg`: move the other party) |
+| `ConnectionStateStatus` | `disconnected`, `connecting`, `connected`, `reconnecting`, `failed` |
+| `RegistrationState` | `unregistered`, `registering`, `registered`, `failed` |
+| `DtmfTone` | `digit0` … `digit9`, `star`, `hash` |

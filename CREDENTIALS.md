@@ -1,152 +1,59 @@
-# Getting Vobiz Credentials
+# Credentials: what to enter, and where to find it
 
-This guide explains how to get the credentials needed to use the Vobiz WebRTC SDK.
+Nothing is compiled into the SDK or the example app. Whoever uses the app enters their
+own values, in one of two ways.
 
----
+## Zero-Config Setup: Auth ID and Auth Token
 
-## Step 1: Create a Vobiz Account
+1. Sign in to the Vobiz Console.
+2. Copy the **Auth ID** (it looks like `MA_XXXXXXXX`) and the **Auth Token** from the
+   dashboard. The Auth Token is not your login password.
+3. Enter both on the Zero-Config Setup tab, or pass them to
+   `connectWithAuthToken(authId:, authToken:)`.
 
-1. Visit [Vobiz Console](https://app.vobiz.ai)
-2. Sign up or log in
-3. Complete account verification
+The webhook server then finds or creates two things on your account and the SDK signs
+in as the endpoint:
 
----
+| Created on your account | Name |
+|---|---|
+| Application, answer URL `<webhook>/api/answer` | `Vobiz WebRTC Playground` |
+| SIP endpoint attached to it, with a new password each sign-in | alias `Vobiz WebRTC Playground Endpoint`, username `play…` |
 
-## Step 2: Purchase a Phone Number
+These are the same ones the web Playground uses. Signing in from the app therefore
+gives the endpoint a new password, and a session elsewhere that signed in with the old
+one stops working at its next refresh.
 
-1. Go to **Voice** → **Numbers**
-2. Click **"Buy Number"**
-3. Choose your country and area code
-4. Confirm purchase
-5. **Copy the phone number** (e.g., `+91XXXXXXXXXX`)
+## SIP Direct: an endpoint's username and password
 
-This is your **CALLER_ID**.
+1. In the Vobiz Console, open **Voice → Endpoints** and create (or pick) an endpoint.
+2. Attach it to an application whose answer URL decides what calls do. The
+   application Zero-Config creates (`Vobiz WebRTC Playground`, answer URL
+   `https://rtc-demo.vobiz.ai/api/answer`) works.
+3. Save the password when you create the endpoint: it is shown once.
+4. Enter the username (such as `play123456…`) and password on the SIP Direct tab, or
+   pass them in a `CredentialConfig`.
 
----
+SIP Direct sends no account credentials anywhere, and so cannot transfer calls.
 
-## Step 3: Create a SIP Endpoint
+## Caller ID
 
-1. Go to **Voice** → **Endpoints**
-2. Click **"Create Endpoint"**
-3. Enter a name (e.g., `My Flutter App`)
-4. Vobiz generates:
-   - **SIP Username** (e.g., `your-endpoint-username`)
-   - **SIP Password** (shown once, save it!)
-5. The endpoint URL is: `sip:{username}@registrar.vobiz.ai`
+Calls to phones need a caller ID the account owns: a number bought from Vobiz
+(**Voice → Numbers**) or your trial number, in E.164 form such as `+918000000000`.
+A number the account does not own fails at once, with no B leg.
 
-**Save these credentials:**
-- `username` = your SIP username
-- `password` = your SIP password
-- `sipServer` = `registrar.vobiz.ai`
+## Receiving calls
 
----
+1. In **Voice → Numbers**, attach your number to the `Vobiz WebRTC Playground`
+   application.
+2. Sign in with **Zero-Config Setup** at least once. The hosted server learns which
+   endpoint to ring for your account at that moment, and keeps it in memory: after the
+   server restarts, sign in with Zero-Config again before expecting incoming calls.
 
-## Step 4: Get Your API Keys (Optional, for backend)
+## Keep them out of source control
 
-1. Go to **Settings** → **API Keys**
-2. Copy:
-   - **Account SID** (e.g., `MA_XXXXXXXX`)
-   - **Auth Token** (e.g., `your-auth-token`)
+Never commit an Auth Token, an endpoint password or a real number. If an Auth Token
+has been committed or shared, rotate it in the Vobiz Console: removing it from the
+files does not remove it from git history.
 
-These are needed for your Answer URL backend server.
-
----
-
-## Step 5: Configure Your Backend
-
-Your Answer URL backend needs:
-- **CALLER_ID** = Your purchased phone number (from Step 2)
-- **SIP_ENDPOINT** = Full SIP URI from Step 3
-- **VOBIZ_ACCOUNT_SID** & **VOBIZ_AUTH_TOKEN** = From Step 4
-
-See [vobiz-rtc-demo](https://github.com/devlume-in/vobiz-rtc-demo) for server setup.
-
----
-
-## Step 6: Create Your Voice Application
-
-1. Go to **Voice** → **Applications**
-2. Click **"Create Application"**
-3. Enter a name (e.g., `My Flutter App`)
-4. Set:
-   - **Answer URL**: `https://your-public-url.ngrok-free.dev/answer` (your backend)
-   - **Hangup URL**: `https://your-public-url.ngrok-free.dev/hangup`
-5. Link your phone number from Step 2
-6. Save
-
----
-
-## Step 7: Use Credentials in Your Flutter App
-
-```dart
-import 'package:vobiz_webrtc/vobiz_webrtc.dart';
-
-final client = VobizClient(
-  config: SdkConfig(
-    wsUrl: 'wss://registrar.vobiz.ai:5063/',
-    sipServer: 'registrar.vobiz.ai',
-    backendUrl: 'https://your-backend.example.com',
-  ),
-);
-
-// Login with credentials from Step 3
-await client.login(
-  username: 'your-endpoint-username',  // From Step 3
-  password: 'your-password-here',             // From Step 3
-);
-```
-
----
-
-## Testing
-
-To test your setup:
-
-1. ✅ Run your Flutter app
-2. ✅ Check if it says "Registered"
-3. ✅ Call your phone number from Step 2 using another phone
-4. ✅ Your app should show an incoming call
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| "Endpoint not found" | Make sure endpoint is **Active** in Vobiz Console |
-| "Authentication failed" | Double-check username and password from Step 3 |
-| "No incoming calls" | Verify phone number is linked to application in Step 6 |
-| "Answer URL not called" | Check Answer URL in Step 6 is publicly accessible (use ngrok for testing) |
-
----
-
-## Security Best Practices
-
-⚠️ **Never commit credentials to your code!**
-
-Use environment variables or secure storage:
-
-```dart
-// ❌ BAD
-await client.login(
-  username: 'your-endpoint-username',
-  password: 'your-password-here',
-);
-
-// ✅ GOOD
-final username = dotenv.env['SIP_USERNAME'];
-final password = dotenv.env['SIP_PASSWORD'];
-await client.login(username: username!, password: password!);
-```
-
-Use packages like:
-- [flutter_dotenv](https://pub.dev/packages/flutter_dotenv) - For .env files
-- [flutter_secure_storage](https://pub.dev/packages/flutter_secure_storage) - For encrypted storage
-
----
-
-## Support
-
-- [Vobiz Documentation](https://docs.vobiz.ai)
-- [GitHub Issues](https://github.com/devlume-in/vobiz-flutter-sdk/issues)
-- Email: support@vobiz.ai
+The live sign-in test (`example/integration_test`) takes its credentials from
+`--dart-define-from-file`, never from the code. See [example/README.md](example/README.md).

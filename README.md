@@ -1,301 +1,221 @@
 # Vobiz WebRTC SDK for Flutter
 
-Make and receive voice calls in your Flutter app using Vobiz — a SIP-based calling platform with WebRTC media.
+Make and receive Vobiz voice calls from a Flutter app on Android and iOS: SIP over
+WebSocket for signalling, WebRTC for the audio.
 
-- 📞 **Make outbound calls** to phone numbers (PSTN)
-- 📲 **Receive inbound calls** automatically
-- 🎙️ **Crystal clear audio** via WebRTC
-- 🔌 **Auto-reconnect** on network issues
-- 📱 **Works on Android & iOS**
+It signs in and calls the same way as the [Vobiz WebRTC Playground](https://rtc-demo.vobiz.ai),
+against the same hosted webhook server, so an app built on it needs **no backend of
+its own and no credentials compiled in**. Whoever uses the app signs in with their
+own account.
+
+- **Two ways to sign in:** Zero-Config Setup (Auth ID + Auth Token) or SIP Direct
+  (an endpoint's username and password)
+- **Outbound calls** to phone numbers, with a caller ID, custom `X-VH-` SIP headers,
+  call recording and Dial-User (ring a SIP endpoint)
+- **Inbound calls**, with the caller's custom headers
+- **In call:** mute, speaker, DTMF keypad, transfer, live latency
+- **Auto-reconnect** when the network drops
+
+The [`example/`](example) app is a full Playground for Flutter that uses all of it.
 
 ---
 
-## 🚀 Quick Start (5 Minutes)
+## Sign in: the two modes
 
-### 1. Install the SDK
+| | **Zero-Config Setup** | **SIP Direct** |
+|---|---|---|
+| You enter | Auth ID and Auth Token (Vobiz Console dashboard) | An endpoint's SIP username and password (Console → Voice → Endpoints) |
+| What happens | The webhook server finds or creates the application "Vobiz WebRTC Playground" and the endpoint "Vobiz WebRTC Playground Endpoint" on **your** account, points the application at its answer URL, gives the endpoint a fresh password, and the SDK registers as it | The SDK registers as that endpoint. Nothing is provisioned |
+| Credentials on the device | Auth ID and Auth Token, in memory only until `disconnect()` | The endpoint's password only |
+| Transfer | Yes | No (it needs the account credentials) |
 
-```bash
-flutter pub add vobiz_webrtc
+Zero-Config Setup sends the Auth ID and Auth Token to the webhook server once, exactly
+as the web Playground does. Signing in this way gives the shared Playground endpoint a
+new password, so a web Playground session on the same account that signed in with the
+old one stops working at its next refresh.
+
+## Quick start
+
+```yaml
+# pubspec.yaml
+dependencies:
+  vobiz_webrtc:
+    git:
+      url: https://github.com/vobiz-ai/vobiz-flutter-sdk.git
 ```
-
-### 2. Get Your Vobiz Credentials
-
-1. Log in to [Vobiz Console](https://app.vobiz.ai)
-2. Go to **Voice** → **Endpoints**
-3. Create or select an endpoint and copy:
-   - **Username** (e.g., `myendpoint123456789`)
-   - **Password** (from endpoint creation)
-
-### 3. Wire Up the SDK
 
 ```dart
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
-// Create client
-final client = VobizClient(
-  config: SdkConfig(
-    wsUrl: 'wss://registrar.vobiz.ai:5063/',
-    sipServer: 'registrar.vobiz.ai',
-    backendUrl: 'https://your-backend.example.com',
-  ),
+final client = VobizClient(); // defaults to the hosted webhook server
+
+// Zero-Config Setup
+final session = await client.connectWithAuthToken(
+  authId: authIdTheUserTyped,
+  authToken: authTokenTheUserTyped,
 );
 
-// Connect
-await client.connect();
-
-// Login
-await client.login(
-  username: 'your-endpoint-username',
-  password: 'your-endpoint-password',
+// …or SIP Direct
+await client.connectWithCredentials(
+  CredentialConfig(username: sipUsername, password: sipPassword),
 );
 
-// Listen for calls
-client.state.listen((state) {
-  print('Call: ${state.call}');
+// Registration finishes asynchronously.
+client.connectionEvents.listen((e) {
+  if (e.registrationState == RegistrationState.registered) print('Ready');
+});
+```
+
+### Place a call
+
+```dart
+await client.makeCall(
+  '+919876543210',               // destination, E.164
+  callerId: '+918000000000',     // a number your account owns → X-VH-Caller-ID
+  headers: {'X-VH-Order-Id': 'A1234'},
+  record: true,                  // → X-VH-Record: true
+);
+```
+
+Invalid headers are refused **before** anything is dialled, with a reason for each
+(`ArgumentError`). The rules match the Vobiz web SDK exactly and are public as
+`VobizSipHeaders`, so a form can check them as the user types.
+
+To ring a SIP endpoint instead of the number, add `dialUser: 'play123'`. A destination
+number is still needed: it is what gets the call to the webhook.
+
+### Answer, control and end calls
+
+```dart
+client.callEvents.listen((e) {
+  switch (e.state) {
+    case CallStateStatus.incoming:
+      print('Call from ${e.remoteIdentity}, headers ${e.headers}');
+    case CallStateStatus.active:
+      print('Connected, CallUUID ${e.callUuid}');
+    case CallStateStatus.failed:
+      print('Failed: ${e.reason} (SIP ${e.sipCode})');
+    case CallStateStatus.ended:
+      print('Ended: ${e.reason}');
+    default:
+  }
 });
 
-// Make a call
-await client.makeCall('+1234567890');
-
-// Answer incoming call
-await client.answer();
-
-// Hang up
+await client.acceptCall();     // or rejectCall()
+await client.mute();           // unmute()
+await client.setSpeakerphone(true);
+await client.sendDtmf('1');    // SIP INFO, as the web SDK sends it
+final stats = await client.getCallStats(); // rttMs, jitterMs, packetLossPercent
 await client.hangup();
 ```
 
+### Transfer (Zero-Config only)
+
+```dart
+await client.transferCall(number: '+919876543211');               // blind
+await client.transferCall(sipUser: 'play123',                      // to an endpoint,
+    sipHeaders: {'X-VH-OrderId': 'A1234'});                        // with context
+await client.transferCall(number: '+919876543211', leg: TransferLeg.bLeg);
+```
+
+`TransferLeg.aLeg` (default) moves you onto the target and drops the other party;
+`TransferLeg.bLeg` moves the other party and drops you. Transfers go through the Vobiz
+Redirect API, never SIP REFER.
+
+### Recordings
+
+```dart
+// After a call placed with record: true has ended:
+final recording = await client.waitForRecording(client.lastCallUuid!);
+print(recording?.url);
+```
+
+The recordings list on the hosted server is shared by everyone who uses it, so match by
+CallUUID, as `waitForRecording` does, rather than taking the newest entry.
+
 ---
 
-## ⚙️ Platform Setup
+## The webhook server
 
-### Android Setup
+`SdkConfig.backendUrl` defaults to `https://rtc-demo.vobiz.ai`, the hosted Playground
+server (the web Playground's "production webhook callback"). It serves:
 
-Add permissions to `android/app/src/main/AndroidManifest.xml`:
+| Route | Used for | Called by |
+|---|---|---|
+| `POST /api/setup` | Zero-Config Setup | the SDK |
+| `GET/POST /api/answer` | what each call does: dial the number or user, apply caller ID, recording and headers | Vobiz |
+| `POST /api/transfer`, `/api/transfer-xml` | transfer through the Redirect API | the SDK, then Vobiz |
+| `GET /api/recording?list=1`, `POST /api/recording` | recording results | the SDK, Vobiz |
+| `POST /api/dial-status` | the result of each `<Dial>` | Vobiz |
+
+To use your own deployment of the Playground server, or an https tunnel to one while
+developing, set `backendUrl`. It must be public HTTPS: Vobiz calls it.
+
+```dart
+final client = VobizClient(
+  config: const SdkConfig(backendUrl: 'https://playground.example.com'),
+);
+```
+
+The older call-control methods (`hold`, `resume`, `transfer(String)`, `addCall`,
+`swapCalls`, `mergeCalls`, `warmTransferStart`…) call routes such as `/hold-start` that
+only the Node reference server implements. They are unchanged; against the Playground
+server they only log a warning. Use `transferCall` for transfers.
+
+## Platform setup
+
+Android (`android/app/src/main/AndroidManifest.xml`):
 
 ```xml
 <uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
 <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 ```
 
-Request microphone permission at runtime:
-
-```dart
-import 'package:permission_handler/permission_handler.dart';
-
-await Permission.microphone.request();
-```
-
-### iOS Setup
-
-Add to `ios/Runner/Info.plist`:
+iOS (`ios/Runner/Info.plist`):
 
 ```xml
 <key>NSMicrophoneUsageDescription</key>
-<string>We need microphone access to make and receive calls</string>
-<key>NSLocalNetworkUsageDescription</key>
-<string>We need local network access for calling</string>
+<string>The microphone carries your voice on calls.</string>
+<key>UIBackgroundModes</key>
+<array><string>audio</string></array>
 ```
 
-Request permissions:
+The microphone permission is requested when the first call starts. More detail in
+[PLATFORM_SETUP.md](PLATFORM_SETUP.md).
 
-```dart
-import 'package:permission_handler/permission_handler.dart';
+## Run the example
 
-await Permission.microphone.request();
+```bash
+cd example
+flutter run
 ```
 
----
+Sign in on the **Identity** tab, dial on the **Dialer** tab, and watch every step on
+the **Trace** tab. See [example/README.md](example/README.md).
 
-## 📖 Full Guide
+## Troubleshooting
 
-### 1. Setup Backend
+| What you see | What it means |
+|---|---|
+| "Vobiz did not accept that Auth ID and Auth Token" | Zero-Config was refused. Both values are on the Vobiz Console dashboard; the Auth Token is not your login password |
+| "Wrong credentials (403 Forbidden)" / "Authentication failed" | SIP Direct: the endpoint username or password is wrong, or Zero-Config ran again elsewhere and rotated it |
+| A call fails at once with no B leg | The caller ID is not a number your account owns |
+| "Transfer needs Zero-Config Setup" | Signed in with SIP Direct |
+| No audio on an emulator | Use a real device, or enable the emulator's host microphone |
 
-You need an Answer URL server. See [vobiz-rtc-demo](https://github.com/devlume-in/vobiz-rtc-demo) for Node.js reference.
+## Requirements
 
-### 2. Connect to SIP
+Flutter 3.19+, Dart 3.3+, Android 5.0+ (API 21) or iOS 13+ (the minimums of
+`flutter_webrtc`).
 
-```dart
-final client = VobizClient(
-  config: SdkConfig(
-    wsUrl: 'wss://registrar.vobiz.ai:5063/',
-    sipServer: 'registrar.vobiz.ai',
-    backendUrl: 'https://your-backend.example.com',
-  ),
-);
+## Licence
 
-await client.connect();
-```
-
-### 3. Login with Credentials
-
-```dart
-await client.login(
-  username: 'your-endpoint-username',
-  password: 'your-endpoint-password',
-);
-```
-
-### 4. Make Outbound Calls
-
-```dart
-await client.makeCall('+1234567890');
-
-// Listen for state changes
-client.state.listen((state) {
-  if (state.call == CallState.inCall) {
-    print('Call connected!');
-  }
-});
-```
-
-### 5. Handle Inbound Calls
-
-```dart
-client.state.listen((state) {
-  if (state.call == CallState.incoming) {
-    print('Incoming from: ${state.callerId}');
-    // Show accept/reject UI
-  }
-});
-
-// Accept
-await client.answer();
-
-// Or reject
-await client.reject();
-```
-
-### 6. Call Control
-
-```dart
-// Mute microphone
-await client.setMuted(true);
-
-// Unmute
-await client.setMuted(false);
-
-// End call
-await client.hangup();
-```
-
----
-
-## 🔗 Answer URL Contract
-
-Your backend must handle `/answer` endpoint:
-
-**Outbound (SDK initiates):**
-```xml
-<?xml version="1.0"?>
-<Response>
-  <Dial callerId="+1xxxxxxxxxx">
-    <Number>+1234567890</Number>
-  </Dial>
-</Response>
-```
-
-**Inbound (PSTN calls your number):**
-```xml
-<?xml version="1.0"?>
-<Response>
-  <Dial>
-    <User>sip:your-endpoint@registrar.vobiz.ai</User>
-  </Dial>
-</Response>
-```
-
-See [vobiz-rtc-demo/server.js](https://github.com/devlume-in/vobiz-rtc-demo/blob/main/server.js) for full implementation.
-
----
-
-## 📚 API Reference
-
-### VobizClient
-
-```dart
-// Connection
-Future<void> connect()
-Future<void> login(String username, String password)
-Future<void> disconnect()
-
-// Outbound
-Future<void> makeCall(String destination)
-
-// Inbound
-Future<void> answer()
-Future<void> reject()
-
-// Control
-Future<void> hangup()
-Future<void> setMuted(bool muted)
-
-// State
-Stream<VobizState> get state
-```
-
-### VobizState
-
-```dart
-ClientConnectionState connection   // disconnected/connecting/connected
-RegistrationState registration     // unregistered/registering/registered/failed
-CallState call                     // idle/calling/incoming/inCall/ended
-String? callerId                   // Incoming caller ID
-String? errorMessage               // Error if any
-bool isMuted                       // Microphone muted?
-```
-
----
-
-## 📄 Features
-
-- ✅ SIP registration with digest auth
-- ✅ Outbound calls to PSTN numbers
-- ✅ Inbound call detection
-- ✅ WebRTC audio
-- ✅ Mute/Unmute
-- ✅ Hold/Resume
-- ✅ Blind transfer
-- ✅ Three-way conference
-- ✅ Auto-reconnect
-
----
-
-## 🐛 Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| "SIP socket closed" | Check internet, verify credentials, endpoint must be Active |
-| No audio | Use physical device, not emulator; grant microphone permissions |
-| Inbound calls don't arrive | Verify app is registered; check Answer URL is correct in Vobiz Console |
-
----
-
-## 📦 Requirements
-
-- Flutter 3.19.0+
-- Dart 3.3.0+
-- Android 5.0+ or iOS 11.0+
-
----
-
-## 📚 Resources
-
-- [Vobiz Console](https://app.vobiz.ai)
-- [Example App](https://github.com/devlume-in/vobiz-flutter-sdk/tree/main/example)
-- [Demo Backend](https://github.com/devlume-in/vobiz-rtc-demo)
-- [GitHub Issues](https://github.com/devlume-in/vobiz-flutter-sdk/issues)
-
----
-
-## 📄 License
-
-MIT License — See LICENSE file
-
----
+MIT. See [LICENSE](LICENSE).
 
 ## Support
 
-- Email: support@vobiz.ai
-- GitHub: [devlume-in/vobiz-flutter-sdk](https://github.com/devlume-in/vobiz-flutter-sdk)
+support@vobiz.ai

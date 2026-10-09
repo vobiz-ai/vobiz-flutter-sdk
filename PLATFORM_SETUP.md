@@ -143,7 +143,7 @@ end
 ```
 
 In `ios/Runner.xcodeproj/project.pbxproj` (or use Xcode):
-- **Minimum Deployment Target**: iOS 11.0+
+- **Minimum Deployment Target**: iOS 13.0+ (required by flutter_webrtc)
 
 ### Step 2: Add Privacy Descriptions
 
@@ -192,7 +192,7 @@ In Xcode:
 1. Open `ios/Runner.xcworkspace` (NOT `.xcodeproj`)
 2. Select **Runner** → **Build Settings**
 3. Search for **`IPHONEOS_DEPLOYMENT_TARGET`**
-4. Set to **11.0** or higher
+4. Set to **13.0** or higher
 
 ### Step 5: Install Dependencies
 
@@ -276,7 +276,7 @@ print('Network: $netStatus');
 |---------|----------|
 | "Record Audio permission denied" | Grant permission in Android Settings > Apps > Your App > Permissions |
 | "Cannot connect to SIP server" | Check INTERNET permission, verify firewall allows port 5063 |
-| "WebRTC connection fails on iOS" | Ensure minimum iOS 11.0, rebuild Pods: `cd ios && pod install && cd ..` |
+| "WebRTC connection fails on iOS" | Ensure minimum iOS 13.0, rebuild Pods: `cd ios && pod install && cd ..` |
 | "No audio on device" | Check RECORD_AUDIO & MODIFY_AUDIO_SETTINGS permissions |
 | "App crashes on startup" | Verify minSdkVersion is 21+ on Android |
 
@@ -285,7 +285,7 @@ print('Network: $netStatus');
 ## Quick Verification Checklist
 
 - [ ] Android minSdkVersion = 21+
-- [ ] iOS minimum deployment target = 11.0+
+- [ ] iOS minimum deployment target = 13.0+
 - [ ] `RECORD_AUDIO` permission added
 - [ ] `INTERNET` permission added
 - [ ] `NSMicrophoneUsageDescription` added (iOS)
@@ -301,4 +301,4 @@ print('Network: $netStatus');
 - [Flutter Permissions](https://pub.dev/packages/permission_handler)
 - [Flutter WebRTC](https://pub.dev/packages/flutter_webrtc)
 - [Vobiz Documentation](https://docs.vobiz.ai)
-- GitHub Issues: [vobiz-flutter-sdk](https://github.com/devlume-in/vobiz-flutter-sdk/issues)
+- GitHub Issues: [vobiz-flutter-sdk](https://github.com/vobiz-ai/vobiz-flutter-sdk/issues)
