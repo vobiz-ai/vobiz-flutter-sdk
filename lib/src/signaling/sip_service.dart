@@ -27,11 +27,38 @@ class SipMessage {
     required this.firstLine,
     required this.headers,
     required this.body,
+    this.headerLines = const <MapEntry<String, String>>[],
   });
 
   final String firstLine;
+
+  /// One value per header name; for a name that repeats, the last one.
   final Map<String, String> headers;
   final String body;
+
+  /// Every header line, in the order received. Repeated headers such as Via
+  /// and Record-Route only survive here.
+  final List<MapEntry<String, String>> headerLines;
+
+  /// Every value of [name] in the order received (compact forms included),
+  /// for headers that repeat. A response must copy all of a request's Via
+  /// headers, and a dialog's route set comes from all of its Record-Routes.
+  List<String> headerValues(String name) {
+    final key = name.toLowerCase();
+    final compact = _compactForms[key];
+    return <String>[
+      for (final line in headerLines)
+        if (line.key.toLowerCase() == key || line.key.toLowerCase() == compact) line.value,
+    ];
+  }
+
+  static const Map<String, String> _compactForms = <String, String>{
+    'via': 'v',
+    'contact': 'm',
+    'from': 'f',
+    'to': 't',
+    'call-id': 'i',
+  };
 
   bool get isRequest => !firstLine.startsWith('SIP/');
   String get method => firstLine.split(' ').first;
@@ -64,12 +91,15 @@ class SipParser {
     final lines = headerSection.split(RegExp(r'\r?\n'));
     final firstLine = lines[0].trim();
     final headers = <String, String>{};
+    final headerLines = <MapEntry<String, String>>[];
 
     for (int i = 1; i < lines.length; i++) {
       final colon = lines[i].indexOf(':');
       if (colon == -1) continue;
-      headers[lines[i].substring(0, colon).trim()] =
-          lines[i].substring(colon + 1).trim();
+      final name = lines[i].substring(0, colon).trim();
+      final value = lines[i].substring(colon + 1).trim();
+      headers[name] = value;
+      headerLines.add(MapEntry<String, String>(name, value));
     }
 
     final contentLength =
@@ -80,7 +110,34 @@ class SipParser {
     }
 
     body = body.replaceAll('\u0000', '');
-    return SipMessage(firstLine: firstLine, headers: headers, body: body);
+    return SipMessage(
+      firstLine: firstLine,
+      headers: headers,
+      body: body,
+      headerLines: List<MapEntry<String, String>>.unmodifiable(headerLines),
+    );
+  }
+
+  /// Splits a header value that lists several addresses
+  /// (`<sip:a;lr>, <sip:b;lr>`), ignoring commas inside `<…>` or quotes.
+  static List<String> splitAddressList(String value) {
+    final parts = <String>[];
+    final current = StringBuffer();
+    var inAngle = false;
+    var inQuote = false;
+    for (final char in value.split('')) {
+      if (char == '"') inQuote = !inQuote;
+      if (!inQuote && char == '<') inAngle = true;
+      if (!inQuote && char == '>') inAngle = false;
+      if (char == ',' && !inAngle && !inQuote) {
+        if (current.toString().trim().isNotEmpty) parts.add(current.toString().trim());
+        current.clear();
+      } else {
+        current.write(char);
+      }
+    }
+    if (current.toString().trim().isNotEmpty) parts.add(current.toString().trim());
+    return parts;
   }
 }
 
@@ -157,6 +214,42 @@ class SipBuilder {
     return lines.join('\r\n');
   }
 
+  /// A response to [request] (RFC 3261 8.2.6.2): every Via in the order
+  /// received, since each proxy matches its transaction on the top one and
+  /// forwards on the next. With [recordRoute] (a 1xx or 2xx that sets up a
+  /// dialog) it also copies every Record-Route, so the far end keeps routing
+  /// the call through Vobiz's registrar (RFC 3261 12.1.1). [localTag] is added
+  /// to To when the request had none.
+  static String response({
+    required SipMessage request,
+    required int code,
+    required String reason,
+    String? localTag,
+    bool recordRoute = false,
+    List<String> headers = const <String>[],
+    String? contentType,
+    String body = '',
+  }) {
+    final to = request.header('To') ?? '';
+    final taggedTo =
+        localTag == null || to.contains('tag=') ? to : '$to;tag=$localTag';
+    return <String>[
+      'SIP/2.0 $code $reason',
+      for (final via in request.headerValues('Via')) 'Via: $via',
+      if (recordRoute)
+        for (final route in request.headerValues('Record-Route')) 'Record-Route: $route',
+      'From: ${request.header('From') ?? ''}',
+      'To: $taggedTo',
+      'Call-ID: ${request.header('Call-ID') ?? ''}',
+      'CSeq: ${request.header('CSeq') ?? ''}',
+      ...headers,
+      if (contentType != null) 'Content-Type: $contentType',
+      'Content-Length: ${utf8.encode(body).length}',
+      '',
+      body,
+    ].join('\r\n');
+  }
+
   static String ok200({
     required SipMessage invite,
     required String contactUri,
@@ -164,46 +257,44 @@ class SipBuilder {
     required String localTag,
     required String sdp,
   }) {
-    final contentLength = utf8.encode(sdp).length;
-    final inviteTo = invite.header('To') ?? '';
-    final taggedTo =
-        inviteTo.contains('tag=') ? inviteTo : '$inviteTo;tag=$localTag';
-    return <String>[
-      'SIP/2.0 200 OK',
-      'Via: ${invite.header('Via') ?? ''}',
-      'From: ${invite.header('From') ?? ''}',
-      'To: $taggedTo',
-      'Call-ID: ${invite.header('Call-ID') ?? ''}',
-      'CSeq: ${invite.header('CSeq') ?? ''}',
-      'Contact: <$contactUri>',
-      'Allow: INVITE, ACK, CANCEL, BYE, OPTIONS',
-      'Supported: timer',
-      'User-Agent: vobiz_flutter_sdk',
-      'Content-Type: application/sdp',
-      'Content-Length: $contentLength',
-      '',
-      sdp,
-    ].join('\r\n');
+    return response(
+      request: invite,
+      code: 200,
+      reason: 'OK',
+      localTag: localTag,
+      recordRoute: true,
+      headers: <String>[
+        'Contact: <$contactUri>',
+        'Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, INFO',
+        'Supported: timer',
+        'User-Agent: vobiz_flutter_sdk',
+      ],
+      contentType: 'application/sdp',
+      body: sdp,
+    );
   }
 
   static String ringing({
     required SipMessage invite,
     required String localTag,
+    String? contactUri,
   }) {
-    final inviteTo = invite.header('To') ?? '';
-    final taggedTo =
-        inviteTo.contains('tag=') ? inviteTo : '$inviteTo;tag=$localTag';
-    return <String>[
-      'SIP/2.0 180 Ringing',
-      'Via: ${invite.header('Via') ?? ''}',
-      'From: ${invite.header('From') ?? ''}',
-      'To: $taggedTo',
-      'Call-ID: ${invite.header('Call-ID') ?? ''}',
-      'CSeq: ${invite.header('CSeq') ?? ''}',
-      'Content-Length: 0',
-      '',
-      '',
-    ].join('\r\n');
+    return response(
+      request: invite,
+      code: 180,
+      reason: 'Ringing',
+      localTag: localTag,
+      recordRoute: true,
+      headers: <String>[if (contactUri != null) 'Contact: <$contactUri>'],
+    );
+  }
+
+  /// The final answer to an INVITE the caller cancelled (RFC 3261 9.2).
+  static String requestTerminated({
+    required SipMessage invite,
+    required String localTag,
+  }) {
+    return response(request: invite, code: 487, reason: 'Request Terminated', localTag: localTag);
   }
 
   static String ack({
@@ -214,10 +305,12 @@ class SipBuilder {
     required String localTag,
     required String callId,
     required int cseq,
+    List<String> routes = const <String>[],
   }) {
     return <String>[
       'ACK $requestUri SIP/2.0',
       'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bK${_branch()}',
+      for (final route in routes) 'Route: $route',
       'From: <sip:$fromUser@$sipServer>;tag=$localTag',
       'To: $toHeader',
       'Call-ID: $callId',
@@ -237,10 +330,12 @@ class SipBuilder {
     required String localTag,
     required String callId,
     required int cseq,
+    List<String> routes = const <String>[],
   }) {
     return <String>[
       'BYE $requestUri SIP/2.0',
       'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bK${_branch()}',
+      for (final route in routes) 'Route: $route',
       'From: <sip:$fromUser@$sipServer>;tag=$localTag',
       'To: $toHeader',
       'Call-ID: $callId',
@@ -266,10 +361,12 @@ class SipBuilder {
     required String body,
     String? authHeaderName,
     String? authHeader,
+    List<String> routes = const <String>[],
   }) {
     return <String>[
       'INFO $requestUri SIP/2.0',
       'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bK${_branch()}',
+      for (final route in routes) 'Route: $route',
       'From: <sip:$fromUser@$sipServer>;tag=$localTag',
       'To: $toHeader',
       'Call-ID: $callId',
@@ -292,20 +389,7 @@ class SipBuilder {
     required SipMessage invite,
     required String localTag,
   }) {
-    final inviteTo = invite.header('To') ?? '';
-    final taggedTo =
-        inviteTo.contains('tag=') ? inviteTo : '$inviteTo;tag=$localTag';
-    return <String>[
-      'SIP/2.0 486 Busy Here',
-      'Via: ${invite.header('Via') ?? ''}',
-      'From: ${invite.header('From') ?? ''}',
-      'To: $taggedTo',
-      'Call-ID: ${invite.header('Call-ID') ?? ''}',
-      'CSeq: ${invite.header('CSeq') ?? ''}',
-      'Content-Length: 0',
-      '',
-      '',
-    ].join('\r\n');
+    return response(request: invite, code: 486, reason: 'Busy Here', localTag: localTag);
   }
 
   static String _branch() =>
@@ -415,6 +499,12 @@ class SIPService {
   SipMessage? _pendingInvite;
   SipMessage? _lastAnsweredInvite;
   String? _lastAnsweredSdp;
+
+  // The current call's route set (RFC 3261 12.1): the Route headers its
+  // in-dialog requests (ACK, BYE, INFO) carry, so they follow the call back
+  // through Vobiz's registrar. Answering: the INVITE's Record-Routes in
+  // order. Calling: the response's Record-Routes reversed.
+  List<String> _routeSet = const <String>[];
   Map<String, String> _activeExtraHeaders = const <String, String>{};
 
   // Vobiz's CallUUID for the current (or most recent) call. Kept after the
@@ -551,6 +641,7 @@ class SIPService {
       localTag: _localTag,
       callId: _activeCallId!,
       cseq: _cseq++,
+      routes: _routeSet,
     ));
     _clearCallState();
     onCallEnded?.call('Hung up');
@@ -610,6 +701,7 @@ class SIPService {
       body: body,
       authHeaderName: authHeaderName,
       authHeader: authHeader,
+      routes: _routeSet,
     ));
   }
 
@@ -618,8 +710,17 @@ class SIPService {
 
   void _send(String message) {
     _logger.info('SIP >> ${_summarize(message)}');
+    debugOnSend?.call(message);
     _socket?.sink.add(message);
   }
+
+  /// Test seam: sees every message this service sends.
+  @visibleForTesting
+  void Function(String message)? debugOnSend;
+
+  /// Test seam: handles [raw] as if it had arrived on the WebSocket.
+  @visibleForTesting
+  void debugReceive(String raw) => _handleMessage(raw);
 
   // ---------------------------------------------------------------------------
   // Private — receiving
@@ -686,6 +787,13 @@ class SIPService {
         break;
       case 'CANCEL':
         _replyOk(msg);
+        if (!_isCurrentCall(msg)) break;
+        // The cancelled INVITE still needs its own final answer, or the
+        // registrar and media server keep its transaction open.
+        final cancelled = _pendingInvite;
+        if (cancelled != null) {
+          _send(SipBuilder.requestTerminated(invite: cancelled, localTag: _localTag));
+        }
         _clearCallState();
         onCallEnded?.call(_describeReason(msg.header('Reason')) ?? 'Caller cancelled');
         break;
@@ -693,6 +801,7 @@ class SIPService {
         break;
       case 'BYE':
         _replyOk(msg);
+        if (!_isCurrentCall(msg)) break;
         _clearCallState();
         onCallEnded?.call(_describeReason(msg.header('Reason')) ?? 'Remote party hung up');
         break;
@@ -712,7 +821,7 @@ class SIPService {
           incomingCallId != null && incomingCallId == _activeCallId;
       if (isSameDialog) {
         if (_pendingInvite != null) {
-          _send(SipBuilder.ringing(invite: msg, localTag: _localTag));
+          _send(SipBuilder.ringing(invite: msg, localTag: _localTag, contactUri: _contactUri));
           return;
         }
         if (_lastAnsweredInvite != null && _lastAnsweredSdp != null) {
@@ -740,11 +849,12 @@ class SIPService {
     _activeRemoteTag = _extractTag(fromHeader);
     _activeRemoteTarget = _extractUri(msg.header('Contact') ?? fromHeader);
     _activeRemotePartyHeader = fromHeader;
+    _routeSet = msg.headerValues('Record-Route');
 
     // Custom headers the caller (or <Dial><User sipHeaders="...">) attached.
     final headers = VobizSipHeaders.pick(msg.headers);
 
-    _send(SipBuilder.ringing(invite: msg, localTag: _localTag));
+    _send(SipBuilder.ringing(invite: msg, localTag: _localTag, contactUri: _contactUri));
     _logger.info('Incoming call from $callerId');
     onIncomingCall?.call(callerId, msg.body, headers);
   }
@@ -844,6 +954,10 @@ class SIPService {
   }
 
   void _handleInviteResponse(SipMessage msg) {
+    // A late response for a call that has already ended (or for another
+    // call) has no dialog to update here.
+    if (_activeCallId == null || msg.header('Call-ID') != _activeCallId) return;
+
     // Vobiz names its CallUUID on the provisional and final responses. The
     // web SDK reads it from the same header, and a transfer needs it.
     final uuid = _nonEmpty(msg.header('X-Calluuid'));
@@ -872,6 +986,7 @@ class SIPService {
           callId: _activeCallId!,
           cseq: _activeInviteCSeq ??
               _extractCSeqNumber(msg.header('CSeq')),
+          routes: _routeSet,
         ));
         onCallAnswered?.call(msg.body);
         break;
@@ -959,17 +1074,7 @@ class SIPService {
   }
 
   void _replyOk(SipMessage msg) {
-    _send(<String>[
-      'SIP/2.0 200 OK',
-      'Via: ${msg.header('Via') ?? ''}',
-      'From: ${msg.header('From') ?? ''}',
-      'To: ${msg.header('To') ?? ''}',
-      'Call-ID: ${msg.header('Call-ID') ?? ''}',
-      'CSeq: ${msg.header('CSeq') ?? ''}',
-      'Content-Length: 0',
-      '',
-      '',
-    ].join('\r\n'));
+    _send(SipBuilder.response(request: msg, code: 200, reason: 'OK'));
   }
 
   void _updateDialog(SipMessage msg) {
@@ -978,6 +1083,13 @@ class SIPService {
         _extractUri(msg.header('Contact') ?? msg.header('To') ?? '');
     _activeRemotePartyHeader =
         msg.header('To') ?? _activeRemotePartyHeader;
+    // Calling out: the route set is the response's Record-Routes, reversed.
+    final recordRoutes = msg.headerValues('Record-Route');
+    if (recordRoutes.isNotEmpty) {
+      _routeSet = <String>[
+        for (final line in recordRoutes) ...SipParser.splitAddressList(line),
+      ].reversed.toList(growable: false);
+    }
   }
 
   void _startRegistrationRefresh() {
@@ -1027,6 +1139,15 @@ class SIPService {
     _lastAnsweredSdp = null;
     _activeExtraHeaders = const <String, String>{};
     _pendingInfoBody = null;
+    _routeSet = const <String>[];
+  }
+
+  /// Whether [msg] belongs to the current call. A CANCEL or BYE for some
+  /// other call (an earlier attempt, a retry that was turned away) must not
+  /// end this one.
+  bool _isCurrentCall(SipMessage msg) {
+    final callId = msg.header('Call-ID');
+    return callId != null && callId == _activeCallId;
   }
 
   // ---------------------------------------------------------------------------

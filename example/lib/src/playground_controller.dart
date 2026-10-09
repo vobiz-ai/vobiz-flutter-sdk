@@ -832,9 +832,15 @@ class PlaygroundController extends ChangeNotifier {
         if (_acceptedCall?.callId == callKitParams.id) {
           _clearAcceptedCall();
           log('📴 The caller hung up before the call connected', LogType.warning);
-        } else if (callKitParams.id == _callScreenId && client.callState != CallStateStatus.idle) {
-          // "Hang up" on the ongoing-call notification.
-          await hangup();
+        } else if (callKitParams.id == _callScreenId) {
+          if (client.callState == CallStateStatus.incoming) {
+            // Still ringing (the caller gave up): decline it; a call that was
+            // never answered cannot be hung up.
+            await client.rejectCall();
+          } else if (client.callState != CallStateStatus.idle) {
+            // "Hang up" on the ongoing-call notification.
+            await hangup();
+          }
         }
       case ck.CallEventActionCallTimeout(:final id):
         if (_acceptedCall?.callId == id) _clearAcceptedCall();
@@ -853,6 +859,14 @@ class PlaygroundController extends ChangeNotifier {
       if (_acceptedCall?.callId == call.callId) {
         _clearAcceptedCall();
         log('📴 The caller hung up before the call connected', LogType.warning);
+      }
+      // The caller gave up while this call still rings here: the bridge knows
+      // before the SIP CANCEL arrives (or if it is lost), so stop it now.
+      if (call.reason != 'completed' &&
+          client.callState == CallStateStatus.incoming &&
+          pushRefFromHeaders(client.callHeaders) == call.callId) {
+        log('📴 The caller hung up', LogType.warning);
+        client.rejectCall();
       }
       return;
     }

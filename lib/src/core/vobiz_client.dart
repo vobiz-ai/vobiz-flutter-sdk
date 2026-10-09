@@ -347,6 +347,12 @@ class VobizClient {
       await _peer.initialize(callId);
       final offer = await _peer.createOffer();
       await _waitForIceGathering(callId);
+      // Hung up while the call was being prepared: send nothing.
+      if (_callId != callId) {
+        _logger.info('Call $callId ended before it was placed');
+        await _peer.disposeCall(callId);
+        return callId;
+      }
       final local = await _peer.peerConnection?.getLocalDescription();
       final sdp = local?.sdp ?? offer.sdp ?? '';
       _sip.call(target, sdp, extraHeaders: outgoing);
@@ -839,6 +845,14 @@ class VobizClient {
       }
       final answer = await _peer.createAnswer();
       await _waitForIceGathering(callId);
+      // Answering takes a moment (microphone, ICE). If the caller cancelled
+      // or the user hung up meanwhile, the call is gone: marking it active
+      // now would leave a call on screen that nothing can end.
+      if (_callId != callId) {
+        _logger.info('Call $callId ended while it was being answered');
+        await _peer.disposeCall(callId);
+        return;
+      }
       final local = await _peer.peerConnection?.getLocalDescription();
       final sdp = local?.sdp ?? answer.sdp ?? '';
       _sip.answer(sdp);
@@ -877,14 +891,22 @@ class VobizClient {
   // Private — WebRTC helpers
   // ---------------------------------------------------------------------------
 
+  /// Waits until the offer or answer can carry a candidate the media server
+  /// can reach: gathering complete, or a server-reflexive or relay candidate
+  /// (from STUN or TURN) already gathered. Android seldom reports gathering
+  /// complete, and waiting out a long timeout kept the caller hearing ringing
+  /// for 8 s after the user had answered.
   Future<void> _waitForIceGathering(String callId) async {
     final pc = _peer.peerConnection;
     if (pc == null) return;
-    final deadline = DateTime.now().add(const Duration(seconds: 8));
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
     while (DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(const Duration(milliseconds: 100));
+      if (_callId != callId) return;
       final state = await pc.getIceGatheringState();
       if (state == RTCIceGatheringState.RTCIceGatheringStateComplete) return;
+      final sdp = (await pc.getLocalDescription())?.sdp ?? '';
+      if (sdp.contains(' typ srflx') || sdp.contains(' typ relay')) return;
     }
     _logger.warn('ICE gathering timeout — proceeding with available candidates');
   }
