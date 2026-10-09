@@ -102,7 +102,7 @@ void main() {
 
       expect(config.wsUrl, equals('wss://registrar.vobiz.ai:5063/'));
       expect(config.sipServer, equals('registrar.vobiz.ai'));
-      expect(config.backendUrl, equals('http://10.0.2.2:3000'));
+      expect(config.backendUrl, equals('https://rtc-demo.vobiz.ai'));
       expect(config.autoReconnect, isTrue);
       expect(config.debug, isFalse);
     });

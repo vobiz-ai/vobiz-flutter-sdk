@@ -20,7 +20,7 @@ class SdkConfig {
   const SdkConfig({
     this.wsUrl = 'wss://registrar.vobiz.ai:5063/',
     this.sipServer = 'registrar.vobiz.ai',
-    this.backendUrl = 'http://10.0.2.2:3000',
+    this.backendUrl = 'https://rtc-demo.vobiz.ai',
     this.answerUrl,
     this.autoReconnect = true,
     this.debug = false,

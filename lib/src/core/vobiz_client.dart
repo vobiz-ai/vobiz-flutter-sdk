@@ -36,7 +36,8 @@ class VobizClient {
           iceConfig: config.iceConfig,
           mediaConstraints: config.mediaConstraints,
           logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
-        ) {
+        ),
+        backendUrl = config.backendUrl {
     _wireSip();
   }
 
@@ -44,6 +45,9 @@ class VobizClient {
   final Logger _logger;
   final SIPService _sip;
   final PeerService _peer;
+
+  // Mutable so callers can update it at login time without recreating the client.
+  String backendUrl;
 
   // Internal state
   String? _callId;
@@ -386,6 +390,9 @@ class VobizClient {
         message: 'Connection failed: $e',
       ));
       _emitError('connect_failed', 'Could not connect', e);
+      // SIPService no longer calls onSocketError on connect failure, so we
+      // schedule the reconnect here for both initial and retry code paths.
+      if (_config.autoReconnect) _scheduleReconnect();
       rethrow;
     }
   }
@@ -412,7 +419,8 @@ class VobizClient {
       try {
         await _connectWithCredentials(username, password);
       } catch (_) {
-        if (_config.autoReconnect) _scheduleReconnect();
+        // _connectWithCredentials already called _scheduleReconnect() on
+        // failure, so no action needed here.
       }
     });
   }
@@ -508,7 +516,7 @@ class VobizClient {
     String method = 'POST',
     Map<String, String>? body,
   }) async {
-    final url = Uri.parse('${_config.backendUrl}$path');
+    final url = Uri.parse('$backendUrl$path');
     try {
       final response = body != null
           ? await http
