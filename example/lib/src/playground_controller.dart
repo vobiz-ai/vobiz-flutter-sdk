@@ -3,16 +3,24 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
+import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
 import 'countries.dart';
+import 'push/call_screen.dart';
+import 'push/push_bridge_api.dart';
+import 'push/push_call.dart';
+import 'push/push_service.dart';
 
 /// The two ways to sign in, as on the web Playground.
 enum AuthTab { zeroConfig, sipDirect }
 
 enum PhoneStatus { offline, connecting, online, ringing, inCall, error }
+
+/// Whether the push bridge knows this phone.
+enum PushState { off, registering, ready, failed }
 
 enum LogType { info, success, warning, error, event }
 
@@ -83,12 +91,16 @@ class CallHeaderRecord {
 /// modes, the same checks before dialling, and the same trace messages, so the
 /// two can be compared side by side.
 class PlaygroundController extends ChangeNotifier {
-  PlaygroundController({VobizClient? client, FlutterSecureStorage? secureStorage})
+  PlaygroundController({VobizClient? client, FlutterSecureStorage? secureStorage, PushService? push})
       : client = client ?? VobizClient(),
-        _secure = secureStorage ?? const FlutterSecureStorage();
+        _secure = secureStorage ?? const FlutterSecureStorage(),
+        push = push ?? PushService.unavailable('Push is not set up in this build.');
 
   final VobizClient client;
   final FlutterSecureStorage _secure;
+
+  /// Firebase push, which wakes the app for calls when it is closed.
+  final PushService push;
   SharedPreferences? _prefs;
   final List<StreamSubscription<Object?>> _subs = <StreamSubscription<Object?>>[];
 
@@ -162,6 +174,36 @@ class PlaygroundController extends ChangeNotifier {
   TransferStatus transferStatus = TransferStatus.idle;
   String transferError = '';
 
+  // ── Incoming calls (push bridge) ────────────────────────────────────────────
+  /// The line the push bridge prints: `https://<tunnel>#key=<key>`.
+  String pushServer = '';
+
+  /// Register with the push bridge after signing in, so calls to the Vobiz
+  /// number ring this phone (also when closed, with Firebase set up).
+  bool receiveCalls = false;
+  PushState pushState = PushState.off;
+  String pushDetail = '';
+
+  /// Android 13+ notification permission; null while unknown.
+  bool? notificationsAllowed;
+
+  /// Android 14+ permission to take over the lock screen; null while unknown.
+  bool? fullScreenAllowed;
+
+  bool _inForeground = true;
+
+  /// A call accepted on the call screen whose INVITE has not arrived yet.
+  PushCall? _acceptedCall;
+  Timer? _acceptedTimer;
+
+  /// The call screen showing the current call, and whether Accept was
+  /// tapped there (it then becomes the ongoing-call notification).
+  String? _callScreenId;
+  bool _callScreenAccepted = false;
+  PushCall? _callScreenPush;
+
+  PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer);
+
   // ── Trace ───────────────────────────────────────────────────────────────────
   final List<LogEntry> logs = <LogEntry>[];
   static const int _maxLogs = 500;
@@ -180,6 +222,8 @@ class PlaygroundController extends ChangeNotifier {
   static const String _kAuthToken = 'vobiz_auth_token';
   static const String _kSipUser = 'vobiz_sip_username';
   static const String _kSipPass = 'vobiz_sip_password';
+  static const String _kPushServer = 'vobiz_push_server';
+  static const String _kReceiveCalls = 'vobiz_playground_receive_calls';
 
   Future<void> init() async {
     try {
@@ -189,10 +233,16 @@ class PlaygroundController extends ChangeNotifier {
       log('Could not read saved settings: $e', LogType.warning);
     }
     await _loadSavedCredentials();
+    await _loadPushServer();
     _subs.add(client.connectionEvents.listen(_onConnection));
     _subs.add(client.callEvents.listen(_onCall));
     _subs.add(client.errorEvents.listen(_onError));
+    _subs.add(CallScreen.events.listen(_onCallScreenEvent, onError: (Object _) {}));
+    _subs.add(push.foregroundCalls.listen(_onForegroundPush));
+    _subs.add(push.tokenRefresh.listen((_) => _registerWithBridge(quiet: true)));
     notifyListeners();
+    await refreshCallPermissions();
+    await _resumeAcceptedCall();
   }
 
   @override
@@ -202,6 +252,7 @@ class PlaygroundController extends ChangeNotifier {
     }
     _stopCallTimers();
     _loginTimeout?.cancel();
+    _acceptedTimer?.cancel();
     client.dispose();
     super.dispose();
   }
@@ -281,6 +332,8 @@ class PlaygroundController extends ChangeNotifier {
     _loginTimeout?.cancel();
     _reconnecting = false;
     log('Logging out...', LogType.info);
+    // Signing out means "stop ringing this phone"; closing the app does not.
+    await _unregisterFromBridge(client.sipUsername ?? connectedAs);
     await client.disconnect();
     connectedAs = null;
     _resetCallState(registered: false);
@@ -389,6 +442,12 @@ class PlaygroundController extends ChangeNotifier {
     showIncoming = false;
     log('Answering incoming call...', LogType.info);
     notifyListeners();
+    // Answered in the app: a call screen still ringing for it has to stop.
+    final screen = _callScreenId;
+    if (screen != null && !_callScreenAccepted) {
+      _callScreenId = null;
+      await CallScreen.end(screen);
+    }
     await client.acceptCall();
   }
 
@@ -396,7 +455,11 @@ class PlaygroundController extends ChangeNotifier {
     showIncoming = false;
     log('Rejecting incoming call...', LogType.warning);
     notifyListeners();
+    // Read before rejecting: the call-ended event clears them.
+    final caller = remoteParty;
+    final pushed = _callScreenPush;
     await client.rejectCall();
+    await _tellBridgeDeclined(caller, pushed);
   }
 
   Future<void> toggleMute() async {
@@ -517,6 +580,371 @@ class PlaygroundController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ── Incoming calls: push bridge and call screen ─────────────────────────────
+  //
+  // The push bridge (example/push_bridge) answers the Vobiz number. It rings
+  // this app's SIP endpoint and, when Firebase is set up, sends a push that
+  // wakes the app and shows the system call screen. Accepting there opens
+  // the app, which signs in with the saved credentials and answers the
+  // call when the bridge rings it again.
+
+  /// The app moved to or from the foreground.
+  void setForeground(bool foreground) => _inForeground = foreground;
+
+  /// Saves the line the bridge printed. Returns a problem to show, or null.
+  Future<String?> setPushServer(String value) async {
+    final text = value.trim();
+    if (text.isNotEmpty && PushBridgeConfig.parse(text) == null) {
+      return 'Paste the whole line the bridge printed: https://…#key=…';
+    }
+    pushServer = text;
+    try {
+      if (text.isEmpty) {
+        await _secure.delete(key: _kPushServer);
+      } else {
+        await _secure.write(key: _kPushServer, value: text);
+      }
+    } catch (e) {
+      log('Could not save the push server on this device: $e', LogType.warning);
+    }
+    if (text.isEmpty && receiveCalls) await setReceiveCalls(false);
+    notifyListeners();
+    if (receiveCalls) await _registerWithBridge();
+    return null;
+  }
+
+  /// Turns "ring this phone for my Vobiz number" on or off.
+  Future<void> setReceiveCalls(bool on) async {
+    if (on && bridgeConfig == null) {
+      log('Paste the push server line first (the bridge prints it when it starts)', LogType.error);
+      return;
+    }
+    receiveCalls = on;
+    await _prefs?.setBool(_kReceiveCalls, on);
+    notifyListeners();
+    if (on) {
+      await requestCallPermissions();
+      if (!rememberMe) {
+        log('⚠️ Tick "Remember me" and sign in again: with the app closed, a call can only '
+            'be answered if the app can sign itself in.', LogType.warning);
+      }
+      if (client.isConnected) {
+        await _registerWithBridge();
+      } else {
+        pushDetail = 'Connect to register this phone with the push server.';
+        notifyListeners();
+      }
+    } else {
+      await _unregisterFromBridge(client.sipUsername);
+      pushState = PushState.off;
+      pushDetail = '';
+      notifyListeners();
+    }
+  }
+
+  /// Reads the notification and full-screen permissions without asking.
+  Future<void> refreshCallPermissions() async {
+    notificationsAllowed = await push.notificationsAllowed();
+    fullScreenAllowed = await CallScreen.canUseFullScreen();
+    notifyListeners();
+  }
+
+  /// Asks for what the call screen needs: notifications (Android 13+) and,
+  /// when missing, full-screen notifications (Android 14+, opens Settings).
+  Future<void> requestCallPermissions() async {
+    notificationsAllowed = await push.requestNotificationPermission();
+    fullScreenAllowed = await CallScreen.canUseFullScreen();
+    if (fullScreenAllowed == false) await CallScreen.requestFullScreen();
+    notifyListeners();
+  }
+
+  /// Asks the bridge for a pretend call in ten seconds: time to press Home or
+  /// swipe the app away, then watch the call screen appear.
+  Future<void> sendTestCall() async {
+    final config = bridgeConfig;
+    final user = client.sipUsername;
+    if (config == null || user == null || pushState != PushState.ready) {
+      log('Turn on "Receive calls" and connect first', LogType.error);
+      return;
+    }
+    if (!push.available) {
+      log('Test calls need Firebase: ${push.problem}', LogType.error);
+      return;
+    }
+    final api = PushBridgeApi(config);
+    try {
+      await api.sendTestCall(username: user, delaySeconds: 10);
+      log('🧪 Test call in 10 s. Press Home, or swipe the app away from Recents, and wait '
+          'for the call screen.', LogType.event);
+    } on PushBridgeException catch (e) {
+      log('❌ Test call: ${e.message}', LogType.error);
+    } finally {
+      api.close();
+    }
+  }
+
+  Future<void> _registerWithBridge({bool quiet = false}) async {
+    final config = bridgeConfig;
+    final user = client.sipUsername;
+    if (!receiveCalls || config == null || user == null || !client.isConnected) return;
+    pushState = PushState.registering;
+    notifyListeners();
+    final api = PushBridgeApi(config);
+    try {
+      final token = await push.token();
+      final registration = await api.register(
+        username: user,
+        token: token,
+        app: 'vobiz_webrtc_example',
+      );
+      pushState = PushState.ready;
+      pushDetail = registration.push
+          ? 'Calls to your Vobiz number ring this phone, also in the background and after '
+              'the app is swiped away.'
+          : 'Calls ring this app while it is open. ${push.problem ?? 'Firebase gave no token.'}';
+      if (!quiet) {
+        log(registration.push
+            ? '📲 Push server: $user rings this phone, even with the app closed'
+            : '📲 Push server: $user rings this app while it is open (no push token)',
+            LogType.success);
+      }
+      if (!config.isHttps) {
+        log('⚠️ The push server address is not https; Vobiz cannot reach it.', LogType.warning);
+      }
+      if (registration.warning != null) log('⚠️ ${registration.warning}', LogType.warning);
+    } on PushBridgeException catch (e) {
+      pushState = PushState.failed;
+      pushDetail = e.message;
+      log('❌ Push server: ${e.message}', LogType.error);
+    } finally {
+      api.close();
+    }
+    notifyListeners();
+  }
+
+  Future<void> _unregisterFromBridge(String? user) async {
+    final config = bridgeConfig;
+    if (!receiveCalls || config == null || user == null || user.isEmpty) return;
+    final api = PushBridgeApi(config);
+    try {
+      await api.unregister(username: user, token: await push.token());
+      pushState = PushState.off;
+      pushDetail = 'Signed out: calls no longer ring this phone.';
+      log('📴 Push server: $user no longer rings this phone', LogType.info);
+    } on PushBridgeException catch (e) {
+      log('⚠️ Push server: ${e.message}', LogType.warning);
+    } finally {
+      api.close();
+    }
+  }
+
+  /// A declined call should end for the caller now, not when ringing times out.
+  Future<void> _tellBridgeDeclined(String caller, PushCall? pushed) async {
+    try {
+      if (pushed != null) {
+        await PushBridgeApi.decline(pushed);
+        return;
+      }
+      final config = bridgeConfig;
+      final user = client.sipUsername;
+      if (!receiveCalls || config == null || user == null) return;
+      final api = PushBridgeApi(config);
+      try {
+        await api.declineByCaller(username: user, caller: caller);
+      } finally {
+        api.close();
+      }
+    } catch (_) {
+      // Not a bridge call, or the bridge is gone: the SIP 486 still ends it.
+    }
+  }
+
+  /// Whether an INVITE is the call the user already accepted on the call screen.
+  bool _isAcceptedCall(CallEvent e) {
+    final accepted = _acceptedCall;
+    return accepted != null &&
+        inviteMatchesPush(accepted, headers: e.headers, from: e.remoteIdentity);
+  }
+
+  /// A call rings over SIP while the app is in the background: show it on the
+  /// call screen, joining a push for the same call if one is already showing.
+  Future<void> _showCallScreenForSip(CallEvent e) async {
+    final ref = pushRefFromHeaders(e.headers);
+    for (final active in await CallScreen.active()) {
+      final pushed = PushCall.fromExtra(active.extra);
+      if (pushed == null || !inviteMatchesPush(pushed, headers: e.headers, from: e.remoteIdentity)) {
+        continue;
+      }
+      _callScreenId = active.id;
+      _callScreenPush = pushed;
+      if (active.isAccepted) {
+        _callScreenAccepted = true;
+        await answer();
+      }
+      return;
+    }
+    final id = ref ?? 'sip-${e.callId}';
+    _callScreenId = id;
+    _callScreenAccepted = false;
+    _callScreenPush = null;
+    await CallScreen.showIncoming(
+      id: id,
+      caller: remoteParty,
+      extra: <String, dynamic>{'source': 'sip', 'call': e.callId},
+    );
+  }
+
+  void _endCallScreen() {
+    final id = _callScreenId;
+    _callScreenId = null;
+    _callScreenAccepted = false;
+    _callScreenPush = null;
+    if (id != null) CallScreen.end(id);
+  }
+
+  Future<void> _onCallScreenEvent(ck.CallEvent? event) async {
+    switch (event) {
+      case ck.CallEventActionCallAccept(:final callKitParams):
+        final pushed = PushCall.fromExtra(callKitParams.extra);
+        _callScreenId = callKitParams.id;
+        _callScreenAccepted = true;
+        _callScreenPush = pushed;
+        if (client.callState == CallStateStatus.incoming) {
+          log('📲 Accepted on the call screen', LogType.event);
+          onTabRequest?.call(1);
+          if (pushed != null && !pushed.isTest) unawaited(_quietly(() => PushBridgeApi.accept(pushed)));
+          await answer();
+        } else if (pushed != null) {
+          await _takeAcceptedCall(pushed, callKitParams.id);
+        }
+      case ck.CallEventActionCallDecline(:final callKitParams):
+        final pushed = PushCall.fromExtra(callKitParams.extra);
+        if (_acceptedCall?.callId == callKitParams.id) _clearAcceptedCall();
+        if (client.callState == CallStateStatus.incoming && callKitParams.id == _callScreenId) {
+          _callScreenPush = pushed;
+          await reject();
+        } else if (pushed != null) {
+          log('📵 Declined ${pushed.isTest ? 'the test call' : 'the call from ${pushed.caller}'}',
+              LogType.warning);
+          if (!pushed.isTest) await _quietly(() => PushBridgeApi.decline(pushed));
+        }
+      case ck.CallEventActionCallEnded(:final callKitParams):
+        if (_acceptedCall?.callId == callKitParams.id) {
+          _clearAcceptedCall();
+          log('📴 The caller hung up before the call connected', LogType.warning);
+        } else if (callKitParams.id == _callScreenId && client.callState != CallStateStatus.idle) {
+          // "Hang up" on the ongoing-call notification.
+          await hangup();
+        }
+      case ck.CallEventActionCallTimeout(:final id):
+        if (_acceptedCall?.callId == id) _clearAcceptedCall();
+        log('📵 Missed call: nobody answered the call screen', LogType.warning);
+      default:
+        break;
+    }
+  }
+
+  /// A push while the app is open. Signed in, the call also rings over SIP,
+  /// so only the trace notes it; signed out, the call screen offers to
+  /// accept, which signs in.
+  void _onForegroundPush(PushCall call) {
+    if (call.kind == PushKind.callEnded) {
+      CallScreen.end(call.callId);
+      if (_acceptedCall?.callId == call.callId) {
+        _clearAcceptedCall();
+        log('📴 The caller hung up before the call connected', LogType.warning);
+      }
+      return;
+    }
+    if (call.isExpired) return;
+    if (client.isConnected && !call.isTest) {
+      log('📲 Push received for a call from ${call.caller}; it rings here over SIP', LogType.info);
+      return;
+    }
+    CallScreen.showIncoming(
+      id: call.callId,
+      caller: call.isTest ? 'Test call' : call.caller,
+      subtitle: call.isTest ? 'The push reached this phone. Nothing will connect.' : 'Vobiz call',
+      extra: call.toExtra(),
+    );
+  }
+
+  /// Opened by Accept on the call screen while the app was closed: take it.
+  Future<void> _resumeAcceptedCall() async {
+    for (final active in await CallScreen.active()) {
+      final pushed = PushCall.fromExtra(active.extra);
+      if (pushed == null || !active.isAccepted) continue;
+      final expires = pushed.expiresAt;
+      if (expires != null && DateTime.now().isAfter(expires.add(const Duration(seconds: 30)))) {
+        await CallScreen.end(active.id);
+        continue;
+      }
+      _callScreenId = active.id;
+      _callScreenAccepted = true;
+      _callScreenPush = pushed;
+      await _takeAcceptedCall(pushed, active.id);
+      return;
+    }
+  }
+
+  /// The user accepted a pushed call. Sign in if needed, then answer when
+  /// the bridge rings this endpoint again.
+  Future<void> _takeAcceptedCall(PushCall call, String screenId) async {
+    onTabRequest?.call(1);
+    if (call.isTest) {
+      log('✅ Test call accepted. The push woke this phone and the call screen worked; a real '
+          'call would now sign in and connect.', LogType.success);
+      _callScreenId = null;
+      _callScreenAccepted = false;
+      await CallScreen.end(screenId);
+      return;
+    }
+    log('📲 Accepted the call from ${call.caller} on the call screen', LogType.event);
+    unawaited(_quietly(() => PushBridgeApi.accept(call)));
+    if (client.callState == CallStateStatus.incoming) {
+      await answer();
+      return;
+    }
+    _acceptedCall = call;
+    _acceptedTimer?.cancel();
+    _acceptedTimer = Timer(const Duration(seconds: 60), () {
+      if (_acceptedCall == null) return;
+      _clearAcceptedCall();
+      log('❌ The accepted call never arrived. Is the push bridge still running?', LogType.error);
+      _endCallScreen();
+    });
+    if (client.isConnected) {
+      log('Waiting for the call to arrive...', LogType.info);
+      return;
+    }
+    final saved = authTab == AuthTab.zeroConfig
+        ? authId.isNotEmpty && authToken.isNotEmpty
+        : sipUsername.isNotEmpty && sipPassword.isNotEmpty;
+    if (!saved) {
+      log('❌ Cannot take the call: no saved sign-in. Tick "Remember me" and connect once.',
+          LogType.error);
+      _clearAcceptedCall();
+      _endCallScreen();
+      return;
+    }
+    log('Signing in to take the call...', LogType.info);
+    await connect();
+  }
+
+  void _clearAcceptedCall() {
+    _acceptedTimer?.cancel();
+    _acceptedTimer = null;
+    _acceptedCall = null;
+  }
+
+  Future<void> _quietly(Future<void> Function() action) async {
+    try {
+      await action();
+    } catch (e) {
+      log('⚠️ Could not reach the push server: $e', LogType.warning);
+    }
+  }
+
   // ── SIP header editor ───────────────────────────────────────────────────────
 
   void addHeaderRow({String name = VobizSipHeaders.prefix, String value = ''}) {
@@ -596,6 +1024,8 @@ class PlaygroundController extends ChangeNotifier {
         log('Registered successfully as ${client.sipUsername ?? connectedAs}', LogType.success);
         _setStatus(PhoneStatus.online, 'Registered');
         onTabRequest?.call(1);
+        _registerWithBridge();
+        if (_acceptedCall != null) log('Waiting for the accepted call to arrive...', LogType.info);
       }
       return;
     }
@@ -623,14 +1053,26 @@ class PlaygroundController extends ChangeNotifier {
   void _onCall(CallEvent e) {
     switch (e.state) {
       case CallStateStatus.incoming:
-        remoteParty = e.remoteIdentity ?? e.message ?? 'Unknown';
+        // The push bridge's caller ID can be the Vobiz number; it passes the
+        // real caller in a header.
+        remoteParty = callerFromHeaders(e.headers) ?? e.remoteIdentity ?? e.message ?? 'Unknown';
         _failedCallId = null;
         log('📲 Incoming call from: $remoteParty', LogType.event);
         activeHeaders = null;
         _recordHeaders('incoming call', e);
+        if (_isAcceptedCall(e)) {
+          log('📲 This is the call you accepted on the call screen — answering', LogType.event);
+          _acceptedTimer?.cancel();
+          _acceptedCall = null;
+          _setStatus(PhoneStatus.ringing, 'Answering...');
+          onTabRequest?.call(1);
+          answer();
+          break;
+        }
         showIncoming = true;
         _setStatus(PhoneStatus.ringing, 'Incoming Call');
         onTabRequest?.call(1);
+        if (!_inForeground) _showCallScreenForSip(e);
         break;
       case CallStateStatus.connecting:
         _failedCallId = null;
@@ -651,6 +1093,9 @@ class PlaygroundController extends ChangeNotifier {
         _recordHeaders('answer', e);
         _setStatus(PhoneStatus.inCall, 'In Call');
         _startCallTimers();
+        // Accepted on the call screen: it becomes the ongoing-call
+        // notification, whose service keeps the call alive in the background.
+        if (_callScreenId != null && _callScreenAccepted) CallScreen.connected(_callScreenId!);
         break;
       case CallStateStatus.failed:
         _failedCallId = e.callId;
@@ -676,6 +1121,7 @@ class PlaygroundController extends ChangeNotifier {
                 'cannot be matched.', LogType.warning);
           }
         }
+        _endCallScreen();
         _resetCallState();
         break;
       case CallStateStatus.idle:
@@ -801,6 +1247,7 @@ class PlaygroundController extends ChangeNotifier {
     authTab = prefs.getString(_kMode) == 'sip' ? AuthTab.sipDirect : AuthTab.zeroConfig;
     webhookUrl = prefs.getString(_kWebhook) ?? SdkConfig.defaultWebhookUrl;
     rememberMe = prefs.getBool(_kRemember) ?? true;
+    receiveCalls = prefs.getBool(_kReceiveCalls) ?? false;
     final cli = prefs.getString(_kCallerId);
     if (cli != null && cli.startsWith('+')) {
       final split = splitE164(cli);
@@ -834,6 +1281,17 @@ class PlaygroundController extends ChangeNotifier {
         'transferHeaders': sendHeadersOnTransfer,
       }),
     );
+  }
+
+  /// The push bridge line carries the bridge's key, so it lives in secure
+  /// storage too.
+  Future<void> _loadPushServer() async {
+    try {
+      pushServer = await _secure.read(key: _kPushServer) ?? '';
+    } catch (e) {
+      log('Could not read the saved push server: $e', LogType.warning);
+    }
+    if (bridgeConfig == null) receiveCalls = false;
   }
 
   Future<void> _loadSavedCredentials() async {

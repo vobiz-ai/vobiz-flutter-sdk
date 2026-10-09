@@ -19,3 +19,13 @@ example/android/.gradle/
 example/ios/Pods/
 example/ios/Flutter/Generated.xcconfig
 example/ios/Flutter/flutter_export_environment.sh
+
+# Example app: Firebase config from your own Firebase project
+example/android/app/google-services.json
+example/ios/Runner/GoogleService-Info.plist
+
+# Push bridge: secrets and runtime state (also in example/push_bridge/.gitignore)
+example/push_bridge/.env
+example/push_bridge/bridge-state.json
+example/push_bridge/*service-account*.json
+example/push_bridge/serviceAccountKey*.json

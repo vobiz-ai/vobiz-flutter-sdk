@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vobiz_webrtc_example/src/app.dart';
 import 'package:vobiz_webrtc_example/src/playground_controller.dart';
+import 'package:vobiz_webrtc_example/src/screens/identity_panel.dart';
 
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
@@ -12,6 +13,14 @@ void main() {
     tester.view.physicalSize = const Size(1236, 2745);
     tester.view.devicePixelRatio = 3.0;
     addTearDown(tester.view.reset);
+  }
+
+  /// The Identity list builds lazily: scroll back to its top, where the
+  /// sign-in form is, before looking for the form's buttons.
+  Future<void> scrollIdentityToTop(WidgetTester tester) async {
+    final list = find.descendant(of: find.byType(IdentityPanel), matching: find.byType(Scrollable)).first;
+    tester.state<ScrollableState>(list).position.jumpTo(0);
+    await tester.pumpAndSettle();
   }
 
   testWidgets('offers both sign-in modes and nothing is pre-filled', (tester) async {
@@ -49,6 +58,7 @@ void main() {
 
     controller.setAuthTab(AuthTab.sipDirect);
     await tester.pumpAndSettle();
+    await scrollIdentityToTop(tester);
     await tester.ensureVisible(find.byKey(const Key('connect')));
     await tester.tap(find.byKey(const Key('connect')));
     await tester.pumpAndSettle();

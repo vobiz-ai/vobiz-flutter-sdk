@@ -157,6 +157,18 @@ final client = VobizClient(
 );
 ```
 
+### Receiving calls when the app is closed
+
+The SDK registers over a WebSocket, and Vobiz drops that registration as soon as the
+socket closes, so an app that Android has closed cannot be rung directly. The
+example app shows the usual way round it: a small server answers your Vobiz number,
+sends a Firebase push that wakes the app and shows the system call screen, and rings
+the endpoint again until the app has signed back in. See
+[example/push_bridge](example/push_bridge/README.md) and the example app's
+*Incoming calls* panel. The SDK needs nothing extra: `CallEvent.headers` carries the
+`X-VH-` headers the server puts on the INVITE, which the app uses to match the call to
+its push.
+
 The older call-control methods (`hold`, `resume`, `transfer(String)`, `addCall`,
 `swapCalls`, `mergeCalls`, `warmTransferStart`…) call routes such as `/hold-start` that
 only the Node reference server implements. They are unchanged; against the Playground

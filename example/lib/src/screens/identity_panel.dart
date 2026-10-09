@@ -5,6 +5,7 @@ import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import '../playground_controller.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
+import '../widgets/push_panel.dart';
 import '../widgets/vobiz_logo.dart';
 
 /// Sign in: Zero-Config Setup (Auth ID + Auth Token) or SIP Direct (an
@@ -117,6 +118,8 @@ class _IdentityPanelState extends State<IdentityPanel> {
               padding: EdgeInsets.zero,
               children: <Widget>[
                 if (!c.isSignedIn) ..._signInForm(c, pg, connecting) else _connected(c, pg),
+                const SizedBox(height: 18),
+                PushPanel(controller: c),
                 const SizedBox(height: 28),
                 _faq(pg),
               ],
@@ -402,6 +405,10 @@ class _IdentityPanelState extends State<IdentityPanel> {
         qa('What does Zero-Config Setup create?',
             'An application named "Vobiz WebRTC Playground" and an endpoint aliased "Vobiz WebRTC Playground Endpoint" on your account — '
             'the same ones the web Playground uses, so signing in here gives that endpoint a new password.'),
+        qa('How do calls to my Vobiz number reach this phone?',
+            'The push bridge in example/push_bridge answers the number. It rings this app over SIP and sends a '
+            'Firebase push that wakes it when it is in the background or closed. Accept on the call screen opens '
+            'the app, which signs in and answers.'),
       ],
     );
   }

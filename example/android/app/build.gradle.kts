@@ -5,6 +5,13 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Push notifications use Firebase, configured by google-services.json from
+// your own Firebase project (it is git-ignored). Without the file the app
+// still builds and rings for calls while it is open.
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
+}
+
 android {
     namespace = "ai.vobiz.vobiz_webrtc_example"
     compileSdk = flutter.compileSdkVersion

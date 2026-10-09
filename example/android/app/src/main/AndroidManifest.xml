@@ -11,10 +11,14 @@
         android:label="Vobiz Playground"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- singleInstance: Accept on the incoming-call screen re-opens this
+             activity from the call screen's own task. With singleTop that made
+             a second activity (and a second Flutter engine with its own SIP
+             connection); singleInstance hands the running one the intent. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
+            android:launchMode="singleInstance"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"

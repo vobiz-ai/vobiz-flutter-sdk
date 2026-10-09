@@ -30,6 +30,9 @@ restarts it and `q` quits.
 - *Remember me* keeps what you typed in the platform's secure storage (Keychain or
   Keystore). Unticked, anything saved before is removed.
 - Once connected: the SIP username (copy), the sign-in mode, and *Disconnect*.
+- *Incoming calls*: connects the app to the push bridge, so calls to your Vobiz number
+  ring this phone in the foreground, in the background and after it is swiped away.
+  See below.
 
 **Dialer**
 - *Caller ID Override* and *Destination Target*, each with a searchable country-code
@@ -52,6 +55,33 @@ scroll up.
 
 The theme switch (light, dark, system) is on the Identity tab. On a wide screen the
 three tabs sit side by side, as on the web.
+
+## Incoming calls, also when the app is closed
+
+Calls to a Vobiz number reach the app through the push bridge in
+[push_bridge/](push_bridge/README.md): it answers the number, rings the app's endpoint,
+and sends a Firebase push that wakes the app when it is in the background or swiped
+away. The system call screen (flutter_callkit_incoming) rings, full screen on a
+locked phone. *Accept* opens the app, which signs in with the saved credentials and
+answers when the bridge rings it again. *Decline* makes the caller hear busy.
+
+To set it up (Android):
+
+1. In a Firebase project, add an Android app with package name
+   `ai.vobiz.vobiz_webrtc_example`, and save its `google-services.json` as
+   `android/app/google-services.json` (git-ignored). Without it the app builds and
+   rings while open, but cannot be woken.
+2. Run the push bridge behind an https tunnel, as its README describes.
+3. In the app: sign in with *Remember me* ticked, then on the Identity tab under
+   *Incoming calls* paste the line the bridge printed, switch on *Receive calls
+   through the push server* and allow notifications.
+4. *Send a test call in 10 s*, then press Home or swipe the app away: the call screen
+   appears.
+
+`MainActivity` uses `launchMode="singleInstance"`: *Accept* re-opens the app from the
+call screen's own task, and with `singleTop` that started a second copy of the app
+(and a second SIP connection). It also shows over the lock screen when, and only
+when, it is opened by *Accept*.
 
 ## Tests
 

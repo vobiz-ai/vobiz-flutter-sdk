@@ -28,6 +28,12 @@ backend of its own and no credentials compiled in.
   `reason` (with the Q.850 cause). `callState`, `callUuid`, `lastCallUuid`,
   `callDirection` and `callHeaders` on the client.
 - `sendDtmf` (SIP INFO, as the web SDK sends it), `setSpeakerphone`, `getCallStats`.
+- **Example: inbound calls in the background and after the app is swiped away.**
+  `example/push_bridge` (Node, no dependencies) answers a Vobiz number, wakes the app
+  with a Firebase push and rings its endpoint until it is back online. The example app
+  shows the system call screen (flutter_callkit_incoming), signs itself in on *Accept*,
+  answers the call when it arrives, and tells the bridge about *Decline*. Firebase is
+  optional at build time: without `google-services.json` the app still rings while open.
 - `transferCall(number: | sipUser:, leg:, sipHeaders:)` through the Redirect API
   (Zero-Config only).
 - `fetchRecordings` and `waitForRecording(callUuid)`.
