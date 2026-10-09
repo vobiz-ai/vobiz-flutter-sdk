@@ -136,10 +136,73 @@ void main() {
   // ── SIP messages ─────────────────────────────────────────────────────────────
 
   group('SipBuilder', () {
+    // Vobiz's registrar (lua preserve_source_ip) rewrites the REGISTER Contact
+    // with this exact expression; only a contact it matches can be rung.
+    final registrarRewrite = RegExp(r'@[a-z0-9]+.invalid;');
+
+    test('registers a JsSIP-style .invalid contact the registrar can rewrite', () {
+      final service = SIPService(wsUrl: 'wss://registrar.vobiz.ai:5063', sipServer: 'registrar.vobiz.ai');
+      final contact = service.contactUri;
+      expect(contact, matches(RegExp(r'^sip:[a-z0-9]{8}@[a-z0-9]{12}\.invalid;transport=ws$')));
+      expect(registrarRewrite.hasMatch(contact), isTrue);
+      expect(contact, isNot(contains('registrar.vobiz.ai')));
+
+      final register = SipParser.parse(SipBuilder.register(
+        sipServer: 'registrar.vobiz.ai',
+        username: 'play1',
+        contactUri: contact,
+        localTag: 'tag1',
+        callId: 'reg1',
+        cseq: 1,
+      ));
+      expect(register.header('Contact'), '<$contact>');
+      expect(register.header('To'), '<sip:play1@registrar.vobiz.ai>');
+      expect(register.header('User-Agent'), 'vobiz_flutter_sdk');
+    });
+
+    test('each client gets its own contact', () {
+      final a = SIPService(wsUrl: 'wss://x', sipServer: 'registrar.vobiz.ai').contactUri;
+      final b = SIPService(wsUrl: 'wss://x', sipServer: 'registrar.vobiz.ai').contactUri;
+      expect(a, isNot(b));
+    });
+
+    test('INVITE and 200 OK carry the registered contact', () {
+      const contact = 'sip:abcd1234@abcdefgh1234.invalid;transport=ws';
+      final invite = SipParser.parse(SipBuilder.invite(
+        sipServer: 'registrar.vobiz.ai',
+        fromUser: 'play1',
+        contactUri: contact,
+        toUser: '+919876543210',
+        localTag: 'tag1',
+        callId: 'call1',
+        cseq: 2,
+        sdp: 'v=0',
+      ));
+      expect(invite.header('Contact'), '<$contact>');
+      expect(invite.header('From'), '<sip:play1@registrar.vobiz.ai>;tag=tag1');
+
+      final incoming = SipParser.parse('INVITE sip:abcd1234@203.0.113.5:40000;transport=ws SIP/2.0\r\n'
+          'Via: SIP/2.0/WSS 10.0.0.1;branch=z9hG4bKx\r\n'
+          'From: <sip:+918000000000@registrar.vobiz.ai>;tag=far\r\n'
+          'To: <sip:play1@registrar.vobiz.ai>\r\n'
+          'Call-ID: in1\r\n'
+          'CSeq: 1 INVITE\r\n'
+          'Content-Length: 0\r\n\r\n');
+      final ok = SipParser.parse(SipBuilder.ok200(
+        invite: incoming,
+        contactUri: contact,
+        sipServer: 'registrar.vobiz.ai',
+        localTag: 'tag1',
+        sdp: 'v=0',
+      ));
+      expect(ok.header('Contact'), '<$contact>');
+    });
+
     test('INVITE carries the custom headers ahead of the body', () {
       final invite = SipBuilder.invite(
         sipServer: 'registrar.vobiz.ai',
         fromUser: 'play1',
+        contactUri: 'sip:abcd1234@abcdefgh1234.invalid;transport=ws',
         toUser: '+919876543210',
         localTag: 'tag1',
         callId: 'call1',
@@ -162,6 +225,7 @@ void main() {
       final invite = SipBuilder.invite(
         sipServer: 'registrar.vobiz.ai',
         fromUser: 'play1',
+        contactUri: 'sip:abcd1234@abcdefgh1234.invalid;transport=ws',
         toUser: '+919876543210',
         localTag: 'tag1',
         callId: 'call1',

@@ -119,6 +119,7 @@ the real caller to the app in a SIP header as well.
 |---|---|---|
 | `POST /answer` | Vobiz | An inbound call: push, then dial the endpoint |
 | `POST /dial-result` | Vobiz | One dial attempt ended: dial again, or hang up |
+| `POST /dial-events` | Vobiz | Live events for the leg ringing the app. Only an answer event here counts as answered: Vobiz can report `DialStatus=completed` for a ring nobody picked up |
 | `POST /hangup` | Vobiz | The caller's leg ended: stop the phone ringing |
 | `GET /ringback.wav` | Vobiz | Three seconds of ringback, played between attempts |
 | `POST /push/register`, `/push/unregister` | the app | Ring this endpoint on this device (needs the bridge key) |

@@ -79,6 +79,7 @@ const routes = {
   'POST /answer': vobiz(onAnswer),
   'GET /answer': vobiz(onAnswer),
   'POST /dial-result': vobiz(onDialResult),
+  'POST /dial-events': vobiz(onDialEvent),
   'POST /hangup': vobiz(onHangup),
   'GET /hangup': vobiz(onHangup),
   // The app
@@ -148,6 +149,7 @@ async function onAnswer(req, res, url, params) {
     attempts: 0,
     accepted: false,
     declined: false,
+    bridged: false,
     finished: null,
     endedPushSent: false,
   };
@@ -170,9 +172,16 @@ async function onDialResult(req, res, url, params) {
   const left = Math.round((call.deadline - Date.now()) / 1000);
   log('..', `Call ${short(id)} attempt ${call.attempts}: ${status || 'no status'}${cause ? ` (${cause})` : ''}, ${Math.max(left, 0)} s left`);
 
-  if (status === 'completed') {
+  // "completed" is documented as "bridged, then ended", but Vobiz also sends it
+  // when the app was rung and never answered (seen 2026-10-09: a 10 s
+  // unanswered B-leg reported as completed / NORMAL_CLEARING). Only a
+  // DialAnswer or DialConnected event on callbackUrl proves the app answered.
+  if (status === 'completed' && call.bridged) {
     finish(call, 'answered');
     return sendXml(res, '<Hangup/>');
+  }
+  if (status === 'completed') {
+    log('!!', `Call ${short(id)}: Vobiz reported "completed" but the app never answered; trying again`);
   }
   if (status === 'cancel') {
     finish(call, 'caller hung up');
@@ -194,6 +203,26 @@ async function onDialResult(req, res, url, params) {
   return sendXml(res, dialXml(call, { ringback: true }));
 }
 
+/**
+ * Live events for the leg that rings the app (the Dial's callbackUrl). An
+ * answer or connected event is the only reliable proof the app picked up.
+ */
+async function onDialEvent(req, res, url, params) {
+  const call = calls.get(url.searchParams.get('call') || params.DialALegUUID || params.CallUUID);
+  const event = String(params.Event || '');
+  const action = String(params.DialAction || '').toLowerCase();
+  if (call) {
+    if (action === 'answer' || action === 'connected' || event === 'DialAnswer' || event === 'DialConnected') {
+      if (!call.bridged) log('ok', `Call ${short(call.id)}: the app answered`);
+      call.bridged = true;
+    } else if (action === 'hangup' || event === 'DialHangup') {
+      const cause = params.DialBLegHangupCauseName || params.DialBLegHangupCause || '';
+      log('..', `Call ${short(call.id)}: ringing the app ended${cause ? ` (${cause})` : ''}`);
+    }
+  }
+  sendText(res, 200, 'OK');
+}
+
 /** The caller's leg has ended. Stop the phone ringing if it still is. */
 async function onHangup(req, res, url, params) {
   const call = calls.get(params.CallUUID);
@@ -209,6 +238,7 @@ function dialXml(call, { ringback }) {
   const base = publicBase();
   const ringFor = Math.max(10, Math.round((call.deadline - Date.now()) / 1000));
   const action = `${base}/dial-result?call=${encodeURIComponent(call.id)}`;
+  const events = `${base}/dial-events?call=${encodeURIComponent(call.id)}`;
   const callerId = config.callerIdMode === 'number' && call.to ? ` callerId="${esc(call.to)}"` : '';
   const users = call.targets
     .map((user) => `    <User sipHeaders="${esc(sipHeaders(call))}">sip:${esc(user)}@registrar.vobiz.ai</User>`)
@@ -216,7 +246,7 @@ function dialXml(call, { ringback }) {
   const pre = ringback
     ? `  <PreAnswer><Play>${esc(base)}/ringback.wav</Play></PreAnswer>\n`
     : '';
-  return `${pre}  <Dial${callerId} timeout="${ringFor}" timeLimit="14400" action="${esc(action)}" method="POST" redirect="true">\n${users}\n  </Dial>`;
+  return `${pre}  <Dial${callerId} timeout="${ringFor}" timeLimit="14400" action="${esc(action)}" method="POST" redirect="true" callbackUrl="${esc(events)}" callbackMethod="POST">\n${users}\n  </Dial>`;
 }
 
 /**

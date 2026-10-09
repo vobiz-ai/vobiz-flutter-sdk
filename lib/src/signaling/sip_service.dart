@@ -92,13 +92,14 @@ class SipBuilder {
   static String register({
     required String sipServer,
     required String username,
+    required String contactUri,
     required String localTag,
     required String callId,
     required int cseq,
     String? authHeader,
   }) {
     final from = 'sip:$username@$sipServer';
-    final contact = '<sip:$username@$sipServer;transport=wss>';
+    final contact = '<$contactUri>';
     final buf = StringBuffer()
       ..writeln('Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bK${_branch()}')
       ..writeln('From: <$from>;tag=$localTag')
@@ -107,6 +108,7 @@ class SipBuilder {
       ..writeln('CSeq: $cseq REGISTER')
       ..writeln('Contact: $contact')
       ..writeln('Max-Forwards: 70')
+      ..writeln('User-Agent: vobiz_flutter_sdk')
       ..writeln('Expires: 3600')
       ..writeln('Content-Length: 0');
     if (authHeader != null) buf.writeln('Authorization: $authHeader');
@@ -116,6 +118,7 @@ class SipBuilder {
   static String invite({
     required String sipServer,
     required String fromUser,
+    required String contactUri,
     required String toUser,
     required String localTag,
     required String callId,
@@ -133,7 +136,7 @@ class SipBuilder {
       'To: <sip:$toUser@$sipServer>',
       'Call-ID: $callId',
       'CSeq: $cseq INVITE',
-      'Contact: <sip:$fromUser@$sipServer;transport=wss>',
+      'Contact: <$contactUri>',
       'Max-Forwards: 70',
       'Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, INFO',
       'Supported: timer',
@@ -156,7 +159,7 @@ class SipBuilder {
 
   static String ok200({
     required SipMessage invite,
-    required String fromUser,
+    required String contactUri,
     required String sipServer,
     required String localTag,
     required String sdp,
@@ -172,7 +175,7 @@ class SipBuilder {
       'To: $taggedTo',
       'Call-ID: ${invite.header('Call-ID') ?? ''}',
       'CSeq: ${invite.header('CSeq') ?? ''}',
-      'Contact: <sip:$fromUser@$sipServer;transport=wss>',
+      'Contact: <$contactUri>',
       'Allow: INVITE, ACK, CANCEL, BYE, OPTIONS',
       'Supported: timer',
       'User-Agent: vobiz_flutter_sdk',
@@ -373,7 +376,8 @@ class SIPService {
     Logger? logger,
   })  : _logger = logger ?? Logger(),
         _localTag = _rand(8),
-        _registerCallId = '${_rand(12)}@vobiz-client';
+        _registerCallId = '${_rand(12)}@vobiz-client',
+        _contactUri = 'sip:${_rand(8)}@${_rand(12)}.invalid;transport=ws';
 
   final String wsUrl;
   final String sipServer;
@@ -381,6 +385,19 @@ class SIPService {
 
   final String _localTag;
   final String _registerCallId;
+
+  /// Where this client says it can be reached. A WebSocket client has no
+  /// address of its own, so, as JsSIP does (RFC 7118), it registers a made-up
+  /// `<random>.invalid` host. Vobiz's registrar swaps that host for the
+  /// connection's real address when it saves the registration, which is how
+  /// an inbound INVITE finds its way back down this WebSocket. A real host
+  /// here (`@registrar.vobiz.ai`) was saved as it was, so inbound calls were
+  /// sent to the registrar itself and timed out unanswered.
+  final String _contactUri;
+
+  /// The Contact this client registers and puts on its calls.
+  @visibleForTesting
+  String get contactUri => _contactUri;
 
   String? _username;
   String? _password;
@@ -475,6 +492,7 @@ class SIPService {
     _send(SipBuilder.register(
       sipServer: sipServer,
       username: username,
+      contactUri: _contactUri,
       localTag: _localTag,
       callId: _registerCallId,
       cseq: _cseq++,
@@ -509,7 +527,7 @@ class SIPService {
     _lastAnsweredSdp = sdp;
     _send(SipBuilder.ok200(
       invite: _pendingInvite!,
-      fromUser: _username!,
+      contactUri: _contactUri,
       sipServer: sipServer,
       localTag: _localTag,
       sdp: sdp,
@@ -563,6 +581,7 @@ class SIPService {
     _send(SipBuilder.invite(
       sipServer: sipServer,
       fromUser: _username!,
+      contactUri: _contactUri,
       toUser: _activeToUser!,
       localTag: _localTag,
       callId: _activeCallId!,
@@ -699,7 +718,7 @@ class SIPService {
         if (_lastAnsweredInvite != null && _lastAnsweredSdp != null) {
           _send(SipBuilder.ok200(
             invite: _lastAnsweredInvite!,
-            fromUser: _username!,
+            contactUri: _contactUri,
             sipServer: sipServer,
             localTag: _localTag,
             sdp: _lastAnsweredSdp!,
@@ -807,6 +826,7 @@ class SIPService {
         _send(SipBuilder.register(
           sipServer: sipServer,
           username: _username!,
+          contactUri: _contactUri,
           localTag: _localTag,
           callId: _registerCallId,
           cseq: _cseq++,
