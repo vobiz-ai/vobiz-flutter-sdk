@@ -36,7 +36,7 @@ Future<void> login({
 **Example:**
 ```dart
 await client.login(
-  username: 'dkvoice312279403969368799244',
+  username: 'your-endpoint-username',
   password: 'your-sip-password',
 );
 ```
@@ -76,7 +76,7 @@ Future<OutgoingCall> makeCall(String destination)
 **Example:**
 ```dart
 try {
-  final call = await client.makeCall('+919686142855');
+  final call = await client.makeCall('+919876543210');
   print('Call initiated, SIP Call-ID: ${call.callId}');
 } catch (e) {
   print('Call failed: $e');
@@ -199,7 +199,7 @@ final config = SdkConfig(
   wsUrl: 'wss://registrar.vobiz.ai:5063/',
   sipServer: 'registrar.vobiz.ai',
   backendUrl: 'https://your-backend.example.com',
-  callerId: '+918046733542',
+  callerId: '+91XXXXXXXXXX',
   debug: true,
 );
 
@@ -289,7 +289,7 @@ CallStats? stats           // Call statistics
 
 **Example:**
 ```dart
-final call = await client.makeCall('+919686142855');
+final call = await client.makeCall('+919876543210');
 print('Call to: ${call.destination}');
 print('State: ${call.state}');
 ```
@@ -472,7 +472,7 @@ class _MyAppState extends State<MyApp> {
       wsUrl: 'wss://registrar.vobiz.ai:5063/',
       sipServer: 'registrar.vobiz.ai',
       backendUrl: 'https://your-backend.example.com',
-      callerId: '+918046733542',
+      callerId: '+91XXXXXXXXXX',
       debug: true,
     );
 
@@ -498,7 +498,7 @@ class _MyAppState extends State<MyApp> {
   Future<void> _login() async {
     try {
       await _client.login(
-        username: 'dkvoice312279403969368799244',
+        username: 'your-endpoint-username',
         password: 'your-password',
       );
       print('✅ Logged in and registered');
@@ -561,7 +561,7 @@ class _MyAppState extends State<MyApp> {
                 Column(
                   children: [
                     ElevatedButton(
-                      onPressed: () => _makeCall('+919686142855'),
+                      onPressed: () => _makeCall('+919876543210'),
                       child: const Text('Call'),
                     ),
                     const SizedBox(height: 16),
@@ -597,7 +597,7 @@ All methods may throw exceptions. Common errors:
 **Best Practice:**
 ```dart
 try {
-  await client.makeCall('+919686142855');
+  await client.makeCall('+919876543210');
 } catch (e) {
   ScaffoldMessenger.of(context).showSnackBar(
     SnackBar(content: Text('Error: $e')),

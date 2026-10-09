@@ -18,7 +18,7 @@ This guide explains how to get the credentials needed to use the Vobiz WebRTC SD
 2. Click **"Buy Number"**
 3. Choose your country and area code
 4. Confirm purchase
-5. **Copy the phone number** (e.g., `+918046733542`)
+5. **Copy the phone number** (e.g., `+91XXXXXXXXXX`)
 
 This is your **CALLER_ID**.
 
@@ -30,7 +30,7 @@ This is your **CALLER_ID**.
 2. Click **"Create Endpoint"**
 3. Enter a name (e.g., `My Flutter App`)
 4. Vobiz generates:
-   - **SIP Username** (e.g., `dkvoice312279403969368799244`)
+   - **SIP Username** (e.g., `your-endpoint-username`)
    - **SIP Password** (shown once, save it!)
 5. The endpoint URL is: `sip:{username}@registrar.vobiz.ai`
 
@@ -45,8 +45,8 @@ This is your **CALLER_ID**.
 
 1. Go to **Settings** → **API Keys**
 2. Copy:
-   - **Account SID** (e.g., `MA_BV3RYVAA`)
-   - **Auth Token** (e.g., `cJTB5IPQzOFQiOvMuy4xL...`)
+   - **Account SID** (e.g., `MA_XXXXXXXX`)
+   - **Auth Token** (e.g., `your-auth-token`)
 
 These are needed for your Answer URL backend server.
 
@@ -91,7 +91,7 @@ final client = VobizClient(
 
 // Login with credentials from Step 3
 await client.login(
-  username: 'dkvoice312279403969368799244',  // From Step 3
+  username: 'your-endpoint-username',  // From Step 3
   password: 'your-password-here',             // From Step 3
 );
 ```
@@ -129,7 +129,7 @@ Use environment variables or secure storage:
 ```dart
 // ❌ BAD
 await client.login(
-  username: 'dkvoice312279403969368799244',
+  username: 'your-endpoint-username',
   password: 'your-password-here',
 );
 
