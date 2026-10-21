@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 
+import '../audio/audio_route.dart';
+import '../audio/proximity.dart';
 import '../backend/webhook_server_api.dart';
 import '../calls/call_session.dart';
 import '../errors/vobiz_exception.dart';
@@ -12,6 +14,9 @@ import '../events/call_event.dart';
 import '../events/connection_event.dart';
 import '../events/error_event.dart';
 import '../events/media_event.dart';
+import '../media/audio_interruption.dart';
+import '../media/call_media_event.dart';
+import '../media/dtmf_transport.dart';
 import '../models/auth/auth_mode.dart';
 import '../models/auth/credential_config.dart';
 import '../models/auth/token_config.dart';
@@ -45,22 +50,34 @@ class VobizClient {
     SdkConfig config = const SdkConfig(),
     Logger? logger,
     http.Client? httpClient,
+    @visibleForTesting SIPService? sipService,
+    @visibleForTesting PeerService? peerService,
   })  : _config = config,
         _logger = logger ?? Logger(writer: config.debug ? debugPrint : null),
-        _sip = SIPService(
-          wsUrl: config.wsUrl,
-          sipServer: config.sipServer,
-          logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
-        ),
-        _peer = PeerService(
-          iceConfig: config.iceConfig,
-          mediaConstraints: config.mediaConstraints,
-          logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
-        ),
+        _sip = sipService ??
+            SIPService(
+              wsUrl: config.wsUrl,
+              sipServer: config.sipServer,
+              logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
+            ),
+        _peer = peerService ??
+            PeerService(
+              iceConfig: config.iceConfig,
+              mediaConstraints: config.mediaConstraints,
+              logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
+            ),
         _http = httpClient ?? http.Client(),
         _ownsHttp = httpClient == null,
         backendUrl = config.backendUrl {
     _api = WebhookServerApi(client: _http);
+    _interruptions = AudioInterruptionHandler(
+      isCallActive: () => _callState == CallStateStatus.active ||
+          _callState == CallStateStatus.held,
+      isHeld: () => _callState == CallStateStatus.held,
+      hold: hold,
+      resume: resume,
+      logger: _logger,
+    );
     _wireSip();
   }
 
@@ -71,6 +88,8 @@ class VobizClient {
   final http.Client _http;
   final bool _ownsHttp;
   late final WebhookServerApi _api;
+  late final AudioInterruptionHandler _interruptions;
+  bool _holdInProgress = false;
 
   /// Public base URL of the webhook server (see [SdkConfig.backendUrl]).
   ///
@@ -84,7 +103,6 @@ class VobizClient {
   CallStateStatus _callState = CallStateStatus.idle;
   RegistrationState _registrationState = RegistrationState.unregistered;
   ConnectionStateStatus _connectionState = ConnectionStateStatus.disconnected;
-  bool _isMuted = false;
 
   // Sign-in. The Auth ID and Auth Token exist only for Zero-Config Setup and
   // only in memory, for transfers; disconnect() drops them.
@@ -121,6 +139,24 @@ class VobizClient {
   Stream<CallEvent> get callEvents => _callEvents.stream;
   Stream<MediaEvent> get mediaEvents => _mediaEvents.stream;
   Stream<ErrorEvent> get errorEvents => _errorEvents.stream;
+
+  /// Typed media updates for the current call: [MuteChangedEvent],
+  /// [HoldChangedEvent], [EarlyMediaEvent], [AudioRouteChangedEvent] and
+  /// [CallQualityEvent] (every 2 s once media flows; show a "poor network"
+  /// warning when `levelChanged` and the level is poor).
+  Stream<CallMediaEvent> get callMediaEvents => _peer.callMediaEvents;
+
+  /// Call audio outputs: list them, pick earpiece, speaker, Bluetooth or a
+  /// wired headset, and watch for changes. Set
+  /// [AudioRouteController.bluetoothPermissionRequester] so Bluetooth
+  /// headsets work on Android 12+.
+  AudioRouteController get audioRoutes => _peer.audioRoutes;
+
+  /// Turns the screen off at the ear while a call is on the earpiece. The SDK
+  /// has no platform code, so the app supplies the switch; see
+  /// [ProximityController]. Does nothing by default.
+  ProximityController get proximity => _peer.proximity;
+  set proximity(ProximityController value) => _peer.proximity = value;
 
   RegistrationState get registrationState => _registrationState;
   ConnectionStateStatus get connectionState => _connectionState;
@@ -361,6 +397,11 @@ class VobizClient {
       _startCallSetupTimer(callId);
       return callId;
     } catch (e, st) {
+      // Hung up while the microphone or ICE was being set up: not a failure.
+      if (_callId != callId) {
+        await _peer.disposeCall(callId);
+        return callId;
+      }
       _logger.error('makeCall failed: $e\n$st');
       await _cleanupCall(callId);
       _emitError('make_call_failed', 'Could not start the call', e);
@@ -433,27 +474,35 @@ class VobizClient {
   // Audio control
   // ---------------------------------------------------------------------------
 
-  Future<void> mute([String? callId]) async {
-    await _peer.setMuted(true);
-    _isMuted = true;
-  }
+  /// Mutes the microphone on the current call. Asked while the call is still
+  /// connecting, it applies as soon as the microphone opens; it survives
+  /// hold and resume. A new call starts unmuted. Each change is a
+  /// [MuteChangedEvent].
+  Future<void> mute([String? callId]) => _peer.setMuted(true);
 
-  Future<void> unmute([String? callId]) async {
-    await _peer.setMuted(false);
-    _isMuted = false;
-  }
+  Future<void> unmute([String? callId]) => _peer.setMuted(false);
 
-  bool get isMuted => _isMuted;
+  /// Whether the current call's microphone is muted. False between calls.
+  bool get isMuted => _peer.isMuted;
 
-  /// Routes call audio to the loudspeaker (true) or the earpiece (false).
+  /// Routes call audio to the loudspeaker (true) or back to the earpiece or
+  /// a connected headset (false). Each call starts off the loudspeaker.
   Future<void> setSpeakerphone(bool enabled) => _peer.enableSpeaker(enabled);
+
+  /// Whether call audio is on the loudspeaker.
+  bool get isSpeakerOn => _peer.audioRoutes.isSpeakerOn;
 
   /// Sends DTMF on the connected call: keypad presses for an IVR.
   ///
-  /// Accepts `0-9`, `*`, `#` and `A-D`. Each tone goes as a SIP INFO
-  /// (`application/dtmf-relay`), the way the Vobiz web SDK sends them, and
-  /// several digits are sent one after another with JsSIP's default gap.
-  Future<void> sendDtmf(String digits) async {
+  /// Accepts `0-9`, `*`, `#` and `A-D`. With [DtmfTransport.auto] (the
+  /// default) the tones go as RFC 4733 telephone-events in the audio when
+  /// the media server negotiated `telephone-event`, otherwise each one as a
+  /// SIP INFO (`application/dtmf-relay`, the way the Vobiz web SDK sends
+  /// them) with JsSIP's default gap between digits.
+  Future<void> sendDtmf(
+    String digits, {
+    DtmfTransport transport = DtmfTransport.auto,
+  }) async {
     final tones = digits.trim().toUpperCase();
     if (tones.isEmpty) return;
     if (!RegExp(r'^[0-9*#A-D]+$').hasMatch(tones)) {
@@ -461,6 +510,12 @@ class VobizClient {
     }
     if (_callState != CallStateStatus.active || !_sip.hasActiveDialog) {
       throw StateError('DTMF needs a connected call');
+    }
+    if (transport != DtmfTransport.sipInfo) {
+      if (await _peer.insertDtmf(tones)) return;
+      if (transport == DtmfTransport.rfc4733) {
+        throw StateError('This call did not negotiate RFC 4733 telephone-event');
+      }
     }
     for (var i = 0; i < tones.length; i++) {
       if (i > 0) await Future<void>.delayed(const Duration(milliseconds: 500));
@@ -586,33 +641,71 @@ class VobizClient {
   }
 
   // ---------------------------------------------------------------------------
+  // Hold
+  // ---------------------------------------------------------------------------
+
+  /// Puts the connected call on hold with a re-INVITE offering
+  /// `a=sendonly`, so the media server plays hold music to the other party
+  /// instead of dead air. The microphone is silenced while held; the user's
+  /// mute choice is kept for [resume].
+  ///
+  /// Throws [StateError] without a connected call, and [VobizException]
+  /// (`hold_failed`) when the far end refuses; the call then carries on as
+  /// it was.
+  Future<void> hold([String? callId]) async {
+    final id = _requireCurrentCall(callId);
+    if (_callState != CallStateStatus.active) {
+      throw StateError('Hold needs a connected call');
+    }
+    await _renegotiateHold(id, true);
+    if (_callId != id) return;
+    _callState = CallStateStatus.held;
+    _emitCallEvent(id, CallStateStatus.held, 'On hold');
+  }
+
+  /// Takes the call off hold (re-INVITE with `a=sendrecv`). The microphone
+  /// comes back muted if the user had muted it.
+  Future<void> resume([String? callId]) async {
+    final id = _requireCurrentCall(callId);
+    if (_callState != CallStateStatus.held) {
+      throw StateError('The call is not on hold');
+    }
+    await _renegotiateHold(id, false);
+    _interruptions.reset();
+    if (_callId != id) return;
+    _callState = CallStateStatus.active;
+    _emitCallEvent(id, CallStateStatus.active, 'Resumed');
+  }
+
+  /// Tell the SDK another app's call (a SIM, WhatsApp or other VoIP call)
+  /// took the microphone: Android audio-focus loss, an iOS
+  /// `AVAudioSession` interruption, or a Telecom/CallKit hold. The SDK
+  /// cannot detect these itself. It holds the connected call so the other
+  /// party hears hold music instead of dead air.
+  ///
+  /// ```dart
+  /// final session = await AudioSession.instance; // package:audio_session
+  /// session.interruptionEventStream.listen((e) => e.begin
+  ///     ? client.audioInterruptionBegan()
+  ///     : client.audioInterruptionEnded());
+  /// ```
+  Future<void> audioInterruptionBegan() => _interruptions.began();
+
+  /// The interruption is over. Resumes the call if
+  /// [audioInterruptionBegan] held it and [shouldResume] is true; a call
+  /// the user held stays held.
+  Future<void> audioInterruptionEnded({bool shouldResume = true}) =>
+      _interruptions.ended(shouldResume: shouldResume);
+
+  // ---------------------------------------------------------------------------
   // Legacy call control — Node reference backend only
   // ---------------------------------------------------------------------------
   //
-  // These call routes such as /hold-start on [backendUrl]. The Node reference
+  // These call routes such as /add-call on [backendUrl]. The Node reference
   // server (Vobiz-RTC-demo in the vobiz_inbound monorepo) implements them;
-  // the Playground server does not, so against it they only log a warning.
-  // For a transfer that works with the Playground server, use transferCall().
-
-  Future<void> hold([String? callId]) async {
-    await _peer.setMuted(true);
-    await _backend('/hold-start');
-    final id = callId ?? _callId;
-    if (id != null) {
-      _callState = CallStateStatus.held;
-      _emitCallEvent(id, CallStateStatus.held, 'On hold');
-    }
-  }
-
-  Future<void> resume([String? callId]) async {
-    await _peer.setMuted(false);
-    await _backend('/resume');
-    final id = callId ?? _callId;
-    if (id != null) {
-      _callState = CallStateStatus.active;
-      _emitCallEvent(id, CallStateStatus.active, 'Resumed');
-    }
-  }
+  // the Playground server does not, so against it they throw
+  // UnsupportedError rather than appear to work. For a transfer that works
+  // with the Playground server, use transferCall().
 
   Future<void> transfer(String to) =>
       _backend('/transfer', body: {'to': to});
@@ -633,6 +726,39 @@ class VobizClient {
   Future<void> mergeCalls() => _backend('/merge-calls');
   Future<void> endSecondCall() => _backend('/end-second-call');
   Future<void> removeAddedCall() => _backend('/remove-added-call');
+
+  String _requireCurrentCall(String? callId) {
+    final id = _callId;
+    if (id == null || (callId != null && callId != id)) {
+      throw StateError('No such call');
+    }
+    return id;
+  }
+
+  Future<void> _renegotiateHold(String id, bool hold) async {
+    if (_holdInProgress) {
+      throw StateError('A hold or resume is already in progress');
+    }
+    _holdInProgress = true;
+    try {
+      final offer = await _peer.beginHold(hold);
+      try {
+        final answer = await _sip.reInvite(offer);
+        if (_callId != id) return;
+        await _peer.completeHold(answer);
+      } catch (e) {
+        if (_callId != id) return; // the call ended meanwhile
+        await _peer.abortHold();
+        final code = hold ? 'hold_failed' : 'resume_failed';
+        final message = 'Could not ${hold ? 'hold' : 'resume'} the call: $e';
+        _emitError(code, message, e);
+        throw VobizException(code, message,
+            statusCode: e is SipRequestFailed ? e.statusCode : null);
+      }
+    } finally {
+      _holdInProgress = false;
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Private — SIP wiring
@@ -687,6 +813,10 @@ class VobizClient {
       _callUuid = _sip.callUuid ?? _callUuid;
       _callState = CallStateStatus.ringing;
       _emitCallEvent(id, CallStateStatus.ringing, 'Call progress');
+      // 183 with SDP: play the ringback or carrier announcement it carries.
+      if (sdp != null && sdp.trim().isNotEmpty) {
+        unawaited(_peer.applyProvisionalAnswer(sdp));
+      }
     };
 
     _sip.onCallAnswered = (sdp) async {
@@ -695,8 +825,8 @@ class VobizClient {
       _clearCallSetupTimer();
       _callUuid = _sip.callUuid ?? _callUuid;
       try {
-        await _peer.setRemoteDescription(
-            RTCSessionDescription(sdp, 'answer'));
+        // A 200 without SDP confirms the 183's early-media SDP.
+        await _peer.applyRemoteAnswer(sdp);
         _callState = CallStateStatus.active;
         _emitCallEvent(id, CallStateStatus.active, 'Call connected');
       } catch (e) {
@@ -859,6 +989,10 @@ class VobizClient {
       _callState = CallStateStatus.active;
       _emitCallEvent(callId, CallStateStatus.active, 'Call connected');
     } catch (e, st) {
+      if (_callId != callId) {
+        await _peer.disposeCall(callId);
+        return;
+      }
       _logger.error('Answer failed: $e\n$st');
       await _cleanupCall(callId, reason: 'Answer failed');
       _emitError('answer_failed', 'Could not answer the call', e);
@@ -896,20 +1030,14 @@ class VobizClient {
   /// (from STUN or TURN) already gathered. Android seldom reports gathering
   /// complete, and waiting out a long timeout kept the caller hearing ringing
   /// for 8 s after the user had answered.
-  Future<void> _waitForIceGathering(String callId) async {
-    final pc = _peer.peerConnection;
-    if (pc == null) return;
-    final deadline = DateTime.now().add(const Duration(seconds: 3));
-    while (DateTime.now().isBefore(deadline)) {
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-      if (_callId != callId) return;
-      final state = await pc.getIceGatheringState();
-      if (state == RTCIceGatheringState.RTCIceGatheringStateComplete) return;
-      final sdp = (await pc.getLocalDescription())?.sdp ?? '';
-      if (sdp.contains(' typ srflx') || sdp.contains(' typ relay')) return;
-    }
-    _logger.warn('ICE gathering timeout — proceeding with available candidates');
-  }
+  ///
+  /// With a TURN server configured it waits for the relay candidate rather
+  /// than returning at the first srflx one; see
+  /// [PeerService.waitForIceGathering].
+  Future<void> _waitForIceGathering(String callId) => _peer.waitForIceGathering(
+        callId,
+        cancelled: () => _callId != callId,
+      );
 
   // ---------------------------------------------------------------------------
   // Private — cleanup
@@ -917,9 +1045,23 @@ class VobizClient {
 
   /// Ends [callId] once. A local hangup reaches here twice — from hangup()
   /// and from the SIP layer's onCallEnded — so the second arrival is ignored
-  /// instead of reporting the call as ended twice.
-  Future<void> _cleanupCall(String callId, {String? reason}) async {
-    if (_callId != callId) return;
+  /// instead of reporting the call as ended twice. The second arrival waits
+  /// for the first to release the media, so `await hangup()` returns with the
+  /// microphone, PeerConnection and audio route released.
+  Future<void> _cleanupCall(String callId, {String? reason}) {
+    if (_callId != callId) return _releasing[callId] ?? Future<void>.value();
+    // A block body: remove() returns this very future, and whenComplete
+    // would wait on it.
+    final done = _endCall(callId, reason).whenComplete(() {
+      _releasing.remove(callId);
+    });
+    _releasing[callId] = done;
+    return done;
+  }
+
+  final Map<String, Future<void>> _releasing = <String, Future<void>>{};
+
+  Future<void> _endCall(String callId, String? reason) async {
     _callId = null;
     _clearCallSetupTimer();
     _callUuid = _sip.callUuid ?? _callUuid;
@@ -934,7 +1076,8 @@ class VobizClient {
     _callUuid = null;
     _callHeaders = const <String, String>{};
     _callState = CallStateStatus.idle;
-    _isMuted = false;
+    _interruptions.reset();
+    _holdInProgress = false;
     await _peer.disposeCall(callId);
   }
 
@@ -960,11 +1103,23 @@ class VobizClient {
           : method == 'DELETE'
               ? await _http.delete(url).timeout(_backendTimeout)
               : await _http.post(url).timeout(_backendTimeout);
-      if (response.statusCode >= 400) {
-        _logger.warn('Backend $path returned ${response.statusCode}');
+      final status = response.statusCode;
+      if (status == 404 || status == 405 || status == 501) {
+        throw UnsupportedError(
+            'The webhook server at $backendUrl does not implement $path '
+            '(HTTP $status). Only the Node reference server has the legacy '
+            'call-control routes; use transferCall() for transfers.');
       }
+      if (status >= 400) {
+        throw VobizException('backend_failed',
+            'The webhook server refused $path', statusCode: status);
+      }
+    } on UnsupportedError {
+      rethrow;
+    } on VobizException {
+      rethrow;
     } catch (e) {
-      _logger.warn('Backend $path failed (non-fatal): $e');
+      throw VobizException('backend_failed', 'Could not reach $path: $e');
     }
   }
 

@@ -110,7 +110,9 @@ class FakePeer extends RTCPeerConnection {
   final List<RTCIceCandidate> addedCandidates = <RTCIceCandidate>[];
   List<FakeTransceiver> transceivers_ = <FakeTransceiver>[FakeTransceiver()];
   List<StatsReport> stats = <StatsReport>[];
-  String offerSdp = audioSdp;
+  /// Already carries a srflx candidate, as a gathered offer would.
+  String offerSdp =
+      '${audioSdp}a=candidate:1 1 udp 1 203.0.113.1 4000 typ srflx raddr 0.0.0.0 rport 0\r\n';
   Completer<void>? addTrackGate;
   bool failRemote = false;
 

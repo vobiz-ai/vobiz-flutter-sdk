@@ -57,6 +57,7 @@ class _PeerCallState {
 
   /// The SDP of a 183 applied as a provisional answer.
   String? provisionalSdp;
+  String? provisionalPending;
 
   bool gatheringComplete = false;
   final Set<String> candidateTypes = <String>{};
@@ -403,10 +404,13 @@ class PeerService {
     if (callId == null || state == null || sdp.trim().isEmpty) return false;
     final RTCPeerConnection? peer = state.peerConnection;
     if (peer == null) return false;
+    // A 200 without SDP can arrive while this is still being applied.
+    state.provisionalPending = sdp;
     try {
       await peer.setRemoteDescription(RTCSessionDescription(sdp, 'pranswer'));
     } catch (e) {
       _logger.warn('Could not play early media for $callId: $e');
+      if (identical(state.provisionalPending, sdp)) state.provisionalPending = null;
       return false;
     }
     if (!_isLive(callId, state)) return false;
@@ -425,7 +429,9 @@ class PeerService {
   Future<void> applyRemoteAnswer(String? sdp) async {
     final _PeerCallState? state = _activeState;
     final String? effective =
-        (sdp == null || sdp.trim().isEmpty) ? state?.provisionalSdp : sdp;
+        (sdp == null || sdp.trim().isEmpty)
+            ? (state?.provisionalSdp ?? state?.provisionalPending)
+            : sdp;
     if (effective == null || effective.trim().isEmpty) {
       throw StateError('The answer carried no SDP');
     }

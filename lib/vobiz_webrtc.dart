@@ -10,6 +10,14 @@ export 'src/errors/vobiz_exception.dart';
 export 'src/webrtc/ice_config.dart';
 export 'src/webrtc/media_constraints.dart';
 
+// ── Media and audio ───────────────────────────────────────────────────────────
+export 'src/audio/audio_route.dart'
+    show AudioRoute, AudioRouteDevice, AudioRouteController, BluetoothPermissionRequester;
+export 'src/audio/proximity.dart' show ProximityController, NoProximityController;
+export 'src/media/call_media_event.dart';
+export 'src/media/call_quality.dart' show CallQualityLevel, CallQualitySample;
+export 'src/media/dtmf_transport.dart';
+
 // ── Authentication ────────────────────────────────────────────────────────────
 export 'src/models/auth/auth_mode.dart';
 export 'src/models/auth/credential_config.dart';
