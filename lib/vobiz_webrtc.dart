@@ -15,6 +15,7 @@ export 'src/network/connectivity_monitor.dart';
 export 'src/network/keep_alive.dart' show KeepAliveConfig;
 export 'src/network/network_event.dart';
 export 'src/network/reconnect_policy.dart';
+export 'src/network/turn_servers.dart';
 
 // ── Authentication ────────────────────────────────────────────────────────────
 export 'src/models/auth/auth_mode.dart';
