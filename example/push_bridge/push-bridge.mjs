@@ -489,6 +489,13 @@ export function createBridge(options = {}) {
 
   // ── Push messages (Firebase Cloud Messaging HTTP v1) ─────────────────────────
 
+  /**
+   * The incoming-call push. The phone's clock may be off, so the time left is
+   * sent as a duration (ttl_ms, from when the bridge sends it): the app
+   * stops ringing ttl_ms after the push arrives, or after FCM's sent time
+   * when it has one. expires_at is the bridge's clock and is kept only for
+   * older app builds; do not compare it with the phone's clock.
+   */
   function incomingPayload(call) {
     return {
       type: 'incoming_call',
@@ -498,6 +505,7 @@ export function createBridge(options = {}) {
       callee: call.to,
       server: publicBase(),
       sent_at: String(Date.now()),
+      ttl_ms: String(Math.max(0, call.deadline - Date.now())),
       expires_at: String(call.deadline),
       ...(call.test ? { test: '1' } : {}),
     };
@@ -510,6 +518,11 @@ export function createBridge(options = {}) {
   }
 
   async function pushToTargets(call, data) {
+    // FCM drops an incoming-call push that cannot arrive before the caller
+    // gives up; "call ended" pushes only matter for a minute.
+    const ttlSeconds = data.type === 'incoming_call'
+      ? Math.max(1, Math.ceil((call.deadline - Date.now()) / 1000))
+      : 60;
     const devices = devicesOf(call.targets).filter((d) => d.token && (!call.onlyDevice || d.id === call.onlyDevice));
     if (!devices.length) return;
     if (!firebase.ready && !deps.sendPush) {
@@ -517,7 +530,7 @@ export function createBridge(options = {}) {
       return;
     }
     await Promise.all(devices.map(async (device) => {
-      const result = await sendPush(device.token, data);
+      const result = await sendPush(device.token, data, { ttlSeconds });
       if (result.ok) {
         log('ok', `Push ${data.type} sent for call ${short(call.id)} to ${mask(device.token)}`);
       } else {
@@ -576,7 +589,7 @@ export function createBridge(options = {}) {
 
   async function sendPush(token, data, opts = {}) {
     if (deps.sendPush) return deps.sendPush(token, data, opts);
-    const { validateOnly = false } = opts;
+    const { validateOnly = false, ttlSeconds = config.ringSeconds } = opts;
     try {
       const accessToken = await googleAccessToken();
       const response = await fetch(`https://fcm.googleapis.com/v1/projects/${firebase.projectId}/messages:send`, {
@@ -589,7 +602,7 @@ export function createBridge(options = {}) {
             data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
             // Data-only and high priority: Android wakes the app even when it
             // is closed, and the app draws the call screen itself.
-            android: { priority: 'HIGH', ttl: `${config.ringSeconds}s` },
+            android: { priority: 'HIGH', ttl: `${ttlSeconds}s` },
           },
         }),
         signal: AbortSignal.timeout(8000),
