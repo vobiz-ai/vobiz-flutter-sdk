@@ -218,7 +218,6 @@ class _DialerPanelState extends State<DialerPanel> {
     final tone = live ? pg.success : pg.warning;
     final headers = c.activeHeaders;
     String two(int v) => v.toString().padLeft(2, '0');
-    final d = c.callDuration;
 
     return Column(
       children: <Widget>[
@@ -244,20 +243,30 @@ class _DialerPanelState extends State<DialerPanel> {
                   style: TextStyle(fontFamily: 'monospace', fontSize: 24, color: pg.text)),
               if (live) ...<Widget>[
                 const SizedBox(height: 12),
-                Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: pg.field,
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: pg.accent.withValues(alpha: 0.2)),
-                    ),
-                    child: Text('${two(d.inMinutes)}:${two(d.inSeconds % 60)}',
-                        style: TextStyle(fontFamily: 'monospace', fontSize: 18, color: pg.accent)),
-                  ),
+                // The clock and the chart tick every second; only they rebuild.
+                ListenableBuilder(
+                  listenable: c.callTicker,
+                  builder: (context, _) {
+                    final d = c.callDuration;
+                    return Column(children: <Widget>[
+                      Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: pg.field,
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(color: pg.accent.withValues(alpha: 0.2)),
+                          ),
+                          child: Text('${two(d.inMinutes)}:${two(d.inSeconds % 60)}',
+                              key: const Key('callClock'),
+                              style: TextStyle(fontFamily: 'monospace', fontSize: 18, color: pg.accent)),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Center(child: LatencyChart(samples: List<double?>.of(c.latency))),
+                    ]);
+                  },
                 ),
-                const SizedBox(height: 12),
-                Center(child: LatencyChart(samples: c.latency)),
               ],
               if (headers != null && headers.headers.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 16),

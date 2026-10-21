@@ -192,6 +192,11 @@ class PlaygroundController extends ChangeNotifier {
   final List<double?> latency = List<double?>.filled(20, null, growable: true);
   Timer? _callTimer;
   Timer? _statsTimer;
+
+  /// Ticks once a second during a call, for the call clock and the latency
+  /// chart. Only the widgets showing those listen; the timers no longer
+  /// notify the whole controller (which rebuilt every screen).
+  final ChangeNotifier callTicker = ChangeNotifier();
   bool _recordRequested = false;
   String? _failedCallId;
 
@@ -243,7 +248,11 @@ class PlaygroundController extends ChangeNotifier {
   static const int _maxLogs = 500;
 
   // ── Theme ───────────────────────────────────────────────────────────────────
-  ThemeMode themeMode = ThemeMode.system;
+  /// The theme on its own listenable: the app's root rebuilds only when it
+  /// changes, not on every log line or call-timer tick.
+  final ValueNotifier<ThemeMode> theme = ValueNotifier<ThemeMode>(ThemeMode.system);
+
+  ThemeMode get themeMode => theme.value;
 
   // Storage keys. Header rows use the web Playground's key and shape.
   static const String _kHeaders = 'vobiz_playground_headers';
@@ -288,6 +297,8 @@ class PlaygroundController extends ChangeNotifier {
     _loginTimeout?.cancel();
     _acceptedTimer?.cancel();
     client.dispose();
+    theme.dispose();
+    callTicker.dispose();
     super.dispose();
   }
 
@@ -1125,7 +1136,7 @@ class PlaygroundController extends ChangeNotifier {
   // ── Theme ───────────────────────────────────────────────────────────────────
 
   void setThemeMode(ThemeMode mode) {
-    themeMode = mode;
+    theme.value = mode;
     _prefs?.setString(_kTheme, mode.name);
     notifyListeners();
   }
@@ -1317,15 +1328,18 @@ class PlaygroundController extends ChangeNotifier {
       ..addAll(List<double?>.filled(20, null));
     _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       callDuration += const Duration(seconds: 1);
-      notifyListeners();
+      _tick();
     });
     _statsTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
       final stats = await client.getCallStats();
       if (latency.isNotEmpty) latency.removeAt(0);
       latency.add(stats?.rttMs);
-      notifyListeners();
+      _tick();
     });
   }
+
+  // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
+  void _tick() => callTicker.notifyListeners();
 
   void _stopCallTimers() {
     _callTimer?.cancel();
@@ -1367,7 +1381,7 @@ class PlaygroundController extends ChangeNotifier {
     final prefs = _prefs;
     if (prefs == null) return;
     final theme = prefs.getString(_kTheme);
-    themeMode = ThemeMode.values.where((m) => m.name == theme).firstOrNull ?? ThemeMode.system;
+    this.theme.value = ThemeMode.values.where((m) => m.name == theme).firstOrNull ?? ThemeMode.system;
     authTab = prefs.getString(_kMode) == 'sip' ? AuthTab.sipDirect : AuthTab.zeroConfig;
     webhookUrl = prefs.getString(_kWebhook) ?? SdkConfig.defaultWebhookUrl;
     rememberMe = prefs.getBool(_kRemember) ?? true;

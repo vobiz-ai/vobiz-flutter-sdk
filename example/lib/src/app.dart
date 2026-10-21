@@ -45,16 +45,18 @@ class _PlaygroundAppState extends State<PlaygroundApp> {
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: _controller,
-      builder: (context, _) => MaterialApp(
+    // Only the theme rebuilds the app; each screen listens for what it shows.
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: _controller.theme,
+      builder: (context, mode, home) => MaterialApp(
         title: 'Vobiz Playground',
         debugShowCheckedModeBanner: false,
-        themeMode: _controller.themeMode,
+        themeMode: mode,
         theme: buildTheme(Brightness.light),
         darkTheme: buildTheme(Brightness.dark),
-        home: HomeShell(controller: _controller),
+        home: home,
       ),
+      child: HomeShell(controller: _controller),
     );
   }
 }
