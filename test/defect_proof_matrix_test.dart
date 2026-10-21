@@ -26,16 +26,21 @@ Object _open(String issue) => const bool.fromEnvironment('PROVE_DEFECTS')
     : 'Open defect $issue (vobiz-ai/vobiz-flutter-sdk): passes once it is fixed';
 
 void main() {
-  test('N2: an inbound INVITE the app never answers/rejects (answer failed) blocks the NEXT call with 486', () {
+  test('N2 (#38): a failed answer declines the INVITE, so the NEXT call rings instead of getting 486', () {
     final sent = <String>[];
     final s = _svc(sent);
     s.debugReceive(_inv('first'));
-    // VobizClient._answerInvite failed (e.g. mic denied) -> _cleanupCall only; no SIP call made.
+    // VobizClient._answerInvite failed (e.g. mic denied): it now declines the
+    // INVITE with a final response (see call_lifecycle_test.dart).
+    s.reject(480, 'Temporarily Unavailable');
+    expect(sent.map((m) => m.split('\r\n').first), contains('SIP/2.0 480 Temporarily Unavailable'));
     sent.clear();
     s.debugReceive(_inv('second', branch: 'z9hG4bKb'));
-    expect(sent.map((m) => m.split('\r\n').first), isNot(contains('SIP/2.0 486 Busy Here')),
+    final lines = sent.map((m) => m.split('\r\n').first);
+    expect(lines, isNot(contains('SIP/2.0 486 Busy Here')),
         reason: 'second caller was refused busy because the failed first INVITE is still pending');
-  }, skip: _open('#38'));
+    expect(lines, contains('SIP/2.0 180 Ringing'));
+  });
 
   test('N21: reject() on an answered call sends BYE', () {
     final sent = <String>[];
@@ -45,7 +50,7 @@ void main() {
     sent.clear();
     s.reject();
     expect(sent.map((m) => m.split(' ').first), contains('BYE'), reason: 'sent: $sent');
-  }, skip: _open('#52'));
+  });
 
   test('N18: overlapping DTMF INFOs: a 407 on the first re-sends the FIRST digit', () {
     final sent = <String>[];
