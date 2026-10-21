@@ -20,6 +20,9 @@ import '../models/call/call_direction.dart';
 import '../models/call/call_stats.dart';
 import '../models/call/recording.dart';
 import '../models/call/transfer_leg.dart';
+import '../network/connection_supervisor.dart';
+import '../network/connectivity_monitor.dart';
+import '../network/network_event.dart';
 import '../signaling/sip_service.dart';
 import '../state/call_state.dart';
 import '../state/connection_state.dart';
@@ -45,6 +48,7 @@ class VobizClient {
     SdkConfig config = const SdkConfig(),
     Logger? logger,
     http.Client? httpClient,
+    ConnectivityMonitor? connectivityMonitor,
   })  : _config = config,
         _logger = logger ?? Logger(writer: config.debug ? debugPrint : null),
         _sip = SIPService(
@@ -62,6 +66,18 @@ class VobizClient {
         _ownsHttp = httpClient == null,
         backendUrl = config.backendUrl {
     _api = WebhookServerApi(client: _http);
+    _supervisor = ConnectionSupervisor(
+      policy: config.reconnectPolicy,
+      monitor: connectivityMonitor ??
+          (config.watchNetwork
+              ? PlatformConnectivityMonitor()
+              : _AlwaysOnlineMonitor()),
+      reconnect: _reconnectOnce,
+      onEvent: _onNetworkEvent,
+      hasActiveCall: () => _callId != null,
+      onHandover: _onNetworkHandover,
+      logger: _logger,
+    );
     _wireSip();
   }
 
@@ -72,6 +88,7 @@ class VobizClient {
   final http.Client _http;
   final bool _ownsHttp;
   late final WebhookServerApi _api;
+  late final ConnectionSupervisor _supervisor;
 
   /// Public base URL of the webhook server (see [SdkConfig.backendUrl]).
   ///
@@ -97,10 +114,6 @@ class VobizClient {
   String? _username;
   String? _password;
 
-  // Reconnection
-  int _reconnectAttempts = 0;
-  Timer? _reconnectTimer;
-
   // Inbound call state
   String? _pendingInboundCaller;
   String? _pendingInboundSdp;
@@ -117,11 +130,23 @@ class VobizClient {
   final _callEvents = StreamController<CallEvent>.broadcast();
   final _mediaEvents = StreamController<MediaEvent>.broadcast();
   final _errorEvents = StreamController<ErrorEvent>.broadcast();
+  final _networkEvents = StreamController<NetworkEvent>.broadcast();
 
   Stream<ConnectionEvent> get connectionEvents => _connectionEvents.stream;
   Stream<CallEvent> get callEvents => _callEvents.stream;
   Stream<MediaEvent> get mediaEvents => _mediaEvents.stream;
   Stream<ErrorEvent> get errorEvents => _errorEvents.stream;
+
+  /// Network changes (offline, online, Wi-Fi to mobile) and reconnect
+  /// progress (`reconnecting`, `reconnected`, `reconnectFailed`). Each event
+  /// carries a [SignalingQuality] for a connection indicator.
+  Stream<NetworkEvent> get networkEvents => _networkEvents.stream;
+
+  /// The device's network as last reported, once signed in.
+  NetworkStatus? get network => _supervisor.network;
+
+  /// How usable the signalling connection is right now.
+  SignalingQuality get signalingQuality => _supervisor.quality;
 
   RegistrationState get registrationState => _registrationState;
   ConnectionStateStatus get connectionState => _connectionState;
@@ -260,10 +285,15 @@ class VobizClient {
     return _connectWithCredentials(config.username, config.password);
   }
 
+  /// Reconnects and re-registers now, resetting the retry backoff.
+  ///
+  /// Call it when the app returns to the foreground or a push arrives, or
+  /// from a "retry" button after a `reconnect_failed` error. Does nothing when
+  /// signed out; while offline it waits for the network.
+  void reconnect() => _supervisor.reconnectNow();
+
   Future<void> disconnect() async {
-    _reconnectTimer?.cancel();
-    _reconnectTimer = null;
-    _reconnectAttempts = 0;
+    _supervisor.stop();
     _clearCallSetupTimer();
     _sip.disconnect();
     await _peer.disposeAllCalls();
@@ -292,6 +322,7 @@ class VobizClient {
     await _callEvents.close();
     await _mediaEvents.close();
     await _errorEvents.close();
+    await _networkEvents.close();
     await _peer.dispose();
     if (_ownsHttp) _http.close();
   }
@@ -322,6 +353,9 @@ class VobizClient {
     bool record = false,
     String? dialUser,
   }) async {
+    if (_supervisor.isOffline) {
+      throw StateError('No network connection');
+    }
     if (!isConnected) throw StateError('Not registered — call connect() first');
     if (_callState != CallStateStatus.idle) {
       throw StateError('Already in a call');
@@ -643,7 +677,7 @@ class VobizClient {
     _sip.onRegistered = () {
       _registrationState = RegistrationState.registered;
       _connectionState = ConnectionStateStatus.connected;
-      _reconnectAttempts = 0;
+      _supervisor.connected();
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
@@ -652,6 +686,8 @@ class VobizClient {
     };
 
     _sip.onRegistrationFailed = (reason) {
+      // Wrong credentials are not a network problem: retrying cannot help.
+      _supervisor.stop();
       _registrationState = RegistrationState.failed;
       _connectionState = ConnectionStateStatus.failed;
       _connectionEvents.addIfOpen(ConnectionEvent(
@@ -671,7 +707,7 @@ class VobizClient {
         message: 'Socket error: $reason',
       ));
       _emitError('socket_error', reason, null);
-      if (_config.autoReconnect) _scheduleReconnect();
+      if (_config.autoReconnect) _scheduleReconnect(reason);
     };
 
     _sip.onRemoteRinging = () {
@@ -750,27 +786,30 @@ class VobizClient {
   /// A new sign-in replaces the old connection rather than opening a second
   /// socket next to it.
   void _closeExistingConnection() {
-    _reconnectTimer?.cancel();
-    _reconnectTimer = null;
-    _reconnectAttempts = 0;
+    _supervisor.stop();
     if (_sip.connectionState.value != SipConnectionState.disconnected) {
       _sip.disconnect();
     }
   }
 
-  Future<void> _connectWithCredentials(
-      String username, String password) async {
+  Future<void> _connectWithCredentials(String username, String password,
+      {bool reconnecting = false}) async {
     _username = username;
     _password = password;
     _registrationState = RegistrationState.registering;
-    _connectionState = ConnectionStateStatus.connecting;
+    _connectionState = reconnecting
+        ? ConnectionStateStatus.reconnecting
+        : ConnectionStateStatus.connecting;
     _connectionEvents.addIfOpen(ConnectionEvent(
       connectionState: _connectionState,
       registrationState: _registrationState,
-      message: 'Connecting',
+      message: reconnecting ? 'Reconnecting' : 'Connecting',
     ));
 
     try {
+      if (_config.autoReconnect && !_supervisor.isRunning) {
+        await _supervisor.start();
+      }
       await _sip.connect();
       _sip.register(username, password);
     } catch (e) {
@@ -784,7 +823,7 @@ class VobizClient {
       _emitError('connect_failed', 'Could not connect', e);
       // SIPService no longer calls onSocketError on connect failure, so we
       // schedule the reconnect here for both initial and retry code paths.
-      if (_config.autoReconnect) _scheduleReconnect();
+      if (_config.autoReconnect) _scheduleReconnect('Could not connect: $e');
       rethrow;
     }
   }
@@ -809,28 +848,62 @@ class VobizClient {
   // Private — reconnection
   // ---------------------------------------------------------------------------
 
-  void _scheduleReconnect() {
+  /// Hands a drop to the supervisor, which applies [SdkConfig.reconnectPolicy]
+  /// backoff, gives up after its last attempt, and waits while offline.
+  void _scheduleReconnect([String reason = 'Connection lost']) {
+    if (_username == null || _password == null) return;
+    _supervisor.connectionLost(reason);
+  }
+
+  /// One reconnect attempt for the supervisor: a fresh socket and REGISTER.
+  Future<void> _reconnectOnce() async {
     final username = _username;
     final password = _password;
     if (username == null || password == null) return;
+    _sip.disconnect();
+    await _connectWithCredentials(username, password, reconnecting: true);
+  }
 
-    _reconnectTimer?.cancel();
-    final delaySeconds =
-        (_reconnectAttempts < 5) ? (1 << _reconnectAttempts) : 30;
-    _reconnectAttempts++;
+  void _onNetworkEvent(NetworkEvent event) {
+    _networkEvents.addIfOpen(event);
+    if (_username == null) return;
+    switch (event.type) {
+      case NetworkEventType.offline:
+      case NetworkEventType.reconnecting:
+        // Not connected until REGISTER succeeds again: makeCall fails fast
+        // instead of writing an INVITE to a dead socket.
+        _connectionState = ConnectionStateStatus.reconnecting;
+        if (event.type == NetworkEventType.offline) {
+          _registrationState = RegistrationState.unregistered;
+        }
+        _connectionEvents.addIfOpen(ConnectionEvent(
+          connectionState: _connectionState,
+          registrationState: _registrationState,
+          message: event.reason ?? 'Reconnecting',
+        ));
+        break;
+      case NetworkEventType.reconnectFailed:
+        _connectionState = ConnectionStateStatus.failed;
+        _registrationState = RegistrationState.failed;
+        _connectionEvents.addIfOpen(ConnectionEvent(
+          connectionState: _connectionState,
+          registrationState: _registrationState,
+          message: event.reason ?? 'Reconnect failed',
+        ));
+        _emitError('reconnect_failed', event.reason ?? 'Reconnect failed', null);
+        break;
+      case NetworkEventType.online:
+      case NetworkEventType.networkChanged:
+      case NetworkEventType.reconnected:
+        break;
+    }
+  }
 
-    _logger.warn(
-        'Reconnecting in ${delaySeconds}s (attempt $_reconnectAttempts)');
-    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
-      if (_connectionState == ConnectionStateStatus.connected) return;
-      _sip.disconnect();
-      try {
-        await _connectWithCredentials(username, password);
-      } catch (_) {
-        // _connectWithCredentials already called _scheduleReconnect() on
-        // failure, so no action needed here.
-      }
-    });
+  /// The network changed during a call. The signalling socket is left alone
+  /// (replacing it would drop the dialog); this is the hook for moving the
+  /// media to the new interface with an ICE restart (re-INVITE).
+  void _onNetworkHandover(NetworkStatus from, NetworkStatus to) {
+    _logger.warn('Network changed during a call: $from -> $to');
   }
 
   Future<void> _answerInvite(String callId) async {
@@ -995,4 +1068,15 @@ class VobizClient {
       cause: cause,
     ));
   }
+}
+
+/// A monitor for [SdkConfig.watchNetwork] = false: always online, never
+/// changes, so only the keep-alive notices a lost network.
+class _AlwaysOnlineMonitor implements ConnectivityMonitor {
+  @override
+  Future<NetworkStatus> current() async =>
+      NetworkStatus(const <NetworkType>[NetworkType.other]);
+
+  @override
+  Stream<NetworkStatus> get changes => const Stream<NetworkStatus>.empty();
 }
