@@ -20,7 +20,7 @@ export function fcmToken(name) {
  * Starts a bridge. `env` is merged over a signed, fully configured default.
  * Returns { bridge, base, pushes, api, logs, stateFile, stop }.
  */
-export async function startBridge({ env = {}, stateFile, apiHandler, endpoints = ['alice', 'bob', 'carol'] } = {}) {
+export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, endpoints = ['alice', 'bob', 'carol'] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-bridge-test-'));
   const file = stateFile || path.join(dir, 'bridge-state.json');
   const pushes = [];
@@ -39,6 +39,7 @@ export async function startBridge({ env = {}, stateFile, apiHandler, endpoints =
     deps: {
       log: (tag, message) => logs.push(`${tag} ${message}`),
       sendPush: async (token, data, opts) => {
+        if (pushDelay) await pushDelay();
         pushes.push({ token, data, opts });
         return { ok: true };
       },

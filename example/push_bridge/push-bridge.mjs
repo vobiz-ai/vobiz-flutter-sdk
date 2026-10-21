@@ -119,6 +119,9 @@ export function createBridge(options = {}) {
     'POST /push/unregister': onUnregister,
     'POST /push/test': onTestCall,
     'POST /push/accept': onAccept,
+    'POST /push/registered': onRegistered,
+    // Where a call is transferred to when the app reports it is registered
+    'POST /dial-now/*': vobiz(onDialNow),
     'POST /push/decline': onDecline,
   };
 
@@ -133,7 +136,7 @@ export function createBridge(options = {}) {
     } catch (error) {
       log('!!', `${req.method} ${url.pathname} failed: ${error.stack || error}`);
       if (!res.headersSent) {
-        if (url.pathname === '/answer' || url.pathname.startsWith('/dial-result/')) {
+        if (url.pathname === '/answer' || /^\/(dial-result|dial-now)\//.test(url.pathname)) {
           sendXml(res, '<Speak>Sorry, something went wrong. Please try again.</Speak><Hangup/>');
         } else {
           sendJson(res, 500, { error: 'Internal error' });
@@ -202,12 +205,16 @@ export function createBridge(options = {}) {
       bridged: false,
       finished: null,
       endedPushSent: false,
+      // The app said it is registered: dial it now, not after the ringback.
+      redialNow: false,
+      ringbackUntil: 0,
     };
     calls.set(id, call);
     log('->', `Inbound call ${short(id)} from ${call.from} to ${call.to}; ringing ${targets.join(', ')}`);
 
-    // The answer URL must reply within 10 seconds, so the push gets 4.
-    await withTimeout(pushToTargets(call, incomingPayload(call)), 4000, 'push', log);
+    // Ring the endpoint at once; the push goes out in parallel. Waiting for
+    // FCM here only delayed the first INVITE to an app that is already open.
+    background(pushToTargets(call, incomingPayload(call)), 'push');
     return sendXml(res, dialXml(call, { ringback: false }));
   }
 
@@ -235,27 +242,32 @@ export function createBridge(options = {}) {
     }
     if (status === 'cancel') {
       finish(call, 'caller hung up');
-      await endRinging(call, 'caller_hung_up');
+      endRinging(call, 'caller_hung_up');
       return sendXml(res, '<Hangup/>');
     }
-    if (status === 'busy' && !call.declined) {
-      // An endpoint that is offline (the app closed) comes back "busy" at once
-      // too (seen 2026-10-09), so busy alone is not a decline. The app reports
-      // Decline separately: give that a moment to arrive, then keep trying.
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    }
+    // An endpoint that is offline (the app closed) comes back "busy" at once
+    // too (seen 2026-10-09), so busy alone is not a decline. The app reports
+    // Decline and "registered" itself; the bridge acts on those as they
+    // arrive instead of sleeping here.
     if (call.declined) {
       finish(call, 'declined');
-      await endRinging(call, 'declined');
+      endRinging(call, 'declined');
       return sendXml(res, '<Hangup reason="busy"/>');
     }
     if (left <= RINGBACK_SECONDS + 2) {
       finish(call, 'missed');
-      await endRinging(call, 'missed');
+      endRinging(call, 'missed');
       return sendXml(res, '<Speak>Sorry, there was no answer. Please try again later.</Speak><Hangup/>');
     }
+    // The app reported it is registered while this attempt was in flight:
+    // ring it again straight away.
+    if (call.redialNow) {
+      call.redialNow = false;
+      return sendXml(res, dialXml(call, { ringback: false }));
+    }
     // "failed" is what an endpoint that is not registered produces: the app
-    // is still starting. Play ringback, then ring it again.
+    // is still starting. Play ringback, then ring it again (unless the app
+    // reports "registered" first, see onRegistered).
     return sendXml(res, dialXml(call, { ringback: true }));
   }
 
@@ -285,7 +297,7 @@ export function createBridge(options = {}) {
     const call = calls.get(params.CallUUID);
     if (call) {
       if (!call.finished) finish(call, `ended (${params.HangupCause || params.CallStatus || 'hangup'})`);
-      await endRinging(call, call.finished === 'answered' ? 'completed' : 'caller_hung_up');
+      endRinging(call, call.finished === 'answered' ? 'completed' : 'caller_hung_up');
     }
     sendText(res, 200, 'OK');
   }
@@ -303,6 +315,7 @@ export function createBridge(options = {}) {
     const pre = ringback
       ? `  <PreAnswer><Play>${esc(base)}/ringback.wav</Play></PreAnswer>\n`
       : '';
+    call.ringbackUntil = ringback ? Date.now() + RINGBACK_SECONDS * 1000 : 0;
     return `${pre}  <Dial${callerId} timeout="${ringFor}" timeLimit="14400" action="${esc(action)}" method="POST" redirect="true" callbackUrl="${esc(events)}" callbackMethod="POST">\n${users}\n  </Dial>`;
   }
 
@@ -468,6 +481,71 @@ export function createBridge(options = {}) {
     sendJson(res, 200, { ok: true, test: Boolean(call.test) });
   }
 
+  /**
+   * The app's SIP registration succeeded. Ring it now instead of waiting for
+   * the next timed attempt: during ringback the caller's leg is transferred
+   * (Vobiz Transfer API) to /dial-now, which dials at once; while an attempt
+   * is still in flight, the next dial result dials without ringback.
+   * Body: { call_id, call_key } for one call, or no call with the phone's
+   * device token for every call ringing its endpoint.
+   */
+  async function onRegistered(req, res) {
+    const body = await readJson(req);
+    let list;
+    if (body.call_id) {
+      const call = callFor(body);
+      if (!call) return sendJson(res, 404, { error: 'Unknown call' });
+      list = [call];
+    } else {
+      const device = deviceFromRequest(req);
+      if (!device) return sendJson(res, 401, { error: 'Send call_id and call_key, or this phone\'s device token' });
+      list = [...calls.values()].filter((c) => c.targets.includes(device.username));
+    }
+    const results = {};
+    for (const call of list) {
+      if (call.finished || call.test) {
+        results[call.id] = call.finished ? 'finished' : 'test';
+        continue;
+      }
+      results[call.id] = await redialNow(call);
+    }
+    const single = body.call_id ? results[body.call_id] : undefined;
+    sendJson(res, 200, {
+      ok: true,
+      ...(single ? { redial: single, finished: single === 'finished' } : { calls: results }),
+    });
+  }
+
+  /** Dials the app for `call` as soon as possible. Returns what it did. */
+  async function redialNow(call) {
+    if (call.ringbackUntil > Date.now() && config.authId) {
+      try {
+        await vobizApi('POST', `/Call/${encodeURIComponent(call.id)}/`, {
+          legs: 'aleg',
+          aleg_url: `${publicBase()}/dial-now/${callRef(call.id)}`,
+          aleg_method: 'POST',
+        });
+        call.ringbackUntil = 0;
+        log('ok', `Call ${short(call.id)}: the app is registered; dialling it now`);
+        return 'transferred';
+      } catch (error) {
+        log('!!', `Call ${short(call.id)}: could not transfer to dial now (${error.message}); dialling after the ringback`);
+      }
+    }
+    call.redialNow = true;
+    log('ok', `Call ${short(call.id)}: the app is registered; the next attempt rings it without ringback`);
+    return 'next_attempt';
+  }
+
+  /** The caller's leg, transferred here by redialNow(): ring the app now. */
+  async function onDialNow(req, res, url) {
+    const id = callIdFromPath(url);
+    const call = id ? calls.get(id) : null;
+    if (!call || call.finished) return sendXml(res, '<Hangup/>');
+    call.redialNow = false;
+    return sendXml(res, dialXml(call, { ringback: false }));
+  }
+
   /** The user tapped Decline. Needs the call's own key from the push. */
   async function onDecline(req, res) {
     const body = await readJson(req);
@@ -511,10 +589,15 @@ export function createBridge(options = {}) {
     };
   }
 
-  async function endRinging(call, reason) {
+  /** Tells the pushed phones to stop ringing. Does not hold up the reply to Vobiz. */
+  function endRinging(call, reason) {
     if (call.endedPushSent) return;
     call.endedPushSent = true;
-    await withTimeout(pushToTargets(call, { type: 'call_ended', call_id: call.id, reason }), 4000, 'push', log);
+    background(pushToTargets(call, { type: 'call_ended', call_id: call.id, reason }), 'push');
+  }
+
+  function background(promise, label) {
+    promise.catch((error) => log('!!', `${label} failed: ${error.message}`));
   }
 
   async function pushToTargets(call, data) {
@@ -1112,21 +1195,6 @@ function makeRingbackWav(seconds) {
   header.write('data', 36);
   header.writeUInt32LE(pcm.length, 40);
   return Buffer.concat([header, pcm]);
-}
-
-async function withTimeout(promise, ms, label, log = defaultLog) {
-  let timer;
-  const timeout = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      log('!!', `${label} took longer than ${ms} ms; carrying on without waiting`);
-      resolve();
-    }, ms);
-  });
-  try {
-    await Promise.race([promise.catch((e) => log('!!', `${label} failed: ${e.message}`)), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function defaultLog(tag, message) {
