@@ -23,6 +23,13 @@ export 'src/network/keep_alive.dart' show KeepAliveConfig;
 export 'src/network/network_event.dart';
 export 'src/network/reconnect_policy.dart';
 export 'src/network/turn_servers.dart';
+// ── Media and audio ───────────────────────────────────────────────────────────
+export 'src/audio/audio_route.dart'
+    show AudioRoute, AudioRouteDevice, AudioRouteController, BluetoothPermissionRequester;
+export 'src/audio/proximity.dart' show ProximityController, NoProximityController;
+export 'src/media/call_media_event.dart';
+export 'src/media/call_quality.dart' show CallQualityLevel, CallQualitySample;
+export 'src/media/dtmf_transport.dart';
 
 // ── Authentication ────────────────────────────────────────────────────────────
 export 'src/auth/credentials_provider.dart';
