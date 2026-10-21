@@ -149,6 +149,13 @@ class _IdentityPanelState extends State<IdentityPanel> {
       ),
       const SizedBox(height: 18),
       if (zero) ...<Widget>[
+        Text(
+          'Demo only: Zero-Config sends your Auth Token to the shared demo webhook server. '
+          'A production app signs in with SIP credentials or a token from its own backend.',
+          key: const Key('demoOnly'),
+          style: TextStyle(fontSize: 11, height: 1.4, color: pg.warning),
+        ),
+        const SizedBox(height: 12),
         const SectionLabel('Auth ID',
             trailing: InfoTip(
                 title: 'Auth ID', message: 'Found in your Vobiz Console Dashboard.')),
