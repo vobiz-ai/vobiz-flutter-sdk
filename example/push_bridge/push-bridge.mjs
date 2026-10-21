@@ -54,6 +54,7 @@ export function createBridge(options = {}) {
     callerIdMode: (env.CALLER_ID_MODE || 'number').trim().toLowerCase(),
     headerStyle: (env.SIP_HEADER_STYLE || 'suffix').trim().toLowerCase(),
     alwaysRing: csv(env.ALWAYS_RING),
+    routes: parseRoutes(env.ROUTES),
     stateFile: options.stateFile || path.join(HERE, 'bridge-state.json'),
   };
   // Webhooks are checked unless the operator explicitly opts out for local
@@ -85,7 +86,8 @@ export function createBridge(options = {}) {
 
   const state = loadState();
   if (env.BRIDGE_KEY) state.bridgeKey = env.BRIDGE_KEY.trim();
-  if (!state.bridgeKey) state.bridgeKey = crypto.randomBytes(18).toString('base64url');
+  const keyIsNew = !state.bridgeKey;
+  if (keyIsNew) state.bridgeKey = crypto.randomBytes(18).toString('base64url');
   // Signs the per-call part of the Dial callback paths (see callRef()).
   if (!state.webhookSecret) state.webhookSecret = crypto.randomBytes(32).toString('base64url');
   pruneNonces();
@@ -113,9 +115,9 @@ export function createBridge(options = {}) {
     'POST /hangup': vobiz(onHangup),
     'GET /hangup': vobiz(onHangup),
     // The app
-    'POST /push/register': withBridgeKey(onRegister),
-    'POST /push/unregister': withBridgeKey(onUnregister),
-    'POST /push/test': withBridgeKey(onTestCall),
+    'POST /push/register': onRegister,
+    'POST /push/unregister': onUnregister,
+    'POST /push/test': onTestCall,
     'POST /push/accept': onAccept,
     'POST /push/decline': onDecline,
   };
@@ -180,7 +182,7 @@ export function createBridge(options = {}) {
       return sendXml(res, dialXml(call, { ringback: call.attempts > 0 }));
     }
 
-    const targets = ringTargets();
+    const targets = ringTargets(params.To);
     if (!targets.length) {
       log('..', `Inbound call from ${params.From || 'unknown'}: no app has signed in, so the caller is told`);
       return sendXml(res, '<Speak>Sorry, nobody is signed in to take this call. Please try again later.</Speak><Hangup/>');
@@ -331,68 +333,114 @@ export function createBridge(options = {}) {
     }
   }
 
-  /** Who rings for an inbound call: every endpoint an app registered, plus ALWAYS_RING. */
-  function ringTargets() {
-    const names = new Set(Object.keys(state.devices).filter((u) => state.devices[u].length));
+  /**
+   * Who rings for an inbound call to `to`: the users ROUTES maps that number
+   * to, plus ALWAYS_RING. Without ROUTES, the one user that has registered a
+   * phone; with several users and no ROUTES nobody is pushed, because the
+   * bridge cannot know whose number was dialled.
+   */
+  function ringTargets(to) {
+    const names = new Set();
+    if (config.routes.size) {
+      for (const user of config.routes.get(displayNumber(to)) || []) names.add(user);
+    } else {
+      const users = new Set(Object.values(state.devices).map((d) => d.username));
+      if (users.size === 1) names.add([...users][0]);
+      else if (users.size > 1) {
+        log('!!', `Phones are registered for ${users.size} different endpoints (${[...users].join(', ')}) and ROUTES is not set, so none of them is rung for ${to || 'this call'}. Set ROUTES=<number>=<endpoint>,… in .env.`);
+      }
+    }
     for (const user of config.alwaysRing) names.add(user);
     return [...names];
   }
 
+  /** The registered phones of these endpoints. */
+  function devicesOf(users) {
+    return Object.entries(state.devices)
+      .filter(([, d]) => users.includes(d.username))
+      .map(([id, d]) => ({ id, ...d }));
+  }
+
   // ── The app's requests ───────────────────────────────────────────────────────
 
-  /** The app signed in: remember which endpoint it is and where to push. */
-  async function onRegister(req, res, url, body) {
+  /**
+   * The app signed in. A new phone pairs with the bridge key (X-Bridge-Key)
+   * and gets its own device token back, which it sends from then on
+   * (Authorization: Bearer <device_token>). Calls to an endpoint are pushed
+   * only to the phones registered for it.
+   */
+  async function onRegister(req, res) {
+    const device = deviceFromRequest(req);
+    if (!device && !keyMatches(req)) return sendJson(res, 401, { error: 'Pair with the bridge key, or send this phone\'s device token' });
+    const body = await readJson(req);
     const username = endpointUsername(body.username);
     if (!USERNAME_RE.test(username)) return sendJson(res, 400, { error: 'username must be the SIP endpoint username' });
-    const token = typeof body.token === 'string' && body.token.length > 20 ? body.token : null;
+    const token = typeof body.token === 'string' && body.token.length > 20 && body.token.length < 4096 ? body.token : null;
 
-    // One device belongs to one endpoint: drop this token from any other.
-    if (token) {
-      for (const [user, devices] of Object.entries(state.devices)) {
-        state.devices[user] = devices.filter((d) => d.token !== token);
-        if (!state.devices[user].length) delete state.devices[user];
-      }
+    const known = await endpointKnown(username);
+    if (known === false) {
+      log('!!', `Refused to register ${username}: not an endpoint on ${config.authId}`);
+      return sendJson(res, 403, { error: `${username} is not an endpoint on this Vobiz account` });
     }
-    const devices = (state.devices[username] || []).filter((d) => (token ? d.token !== token : d.token));
-    devices.unshift({
+    if (known === null) return sendJson(res, 503, { error: 'Could not check the endpoint with Vobiz; try again' });
+
+    let id = device?.id;
+    let secret = null;
+    if (!id) {
+      id = crypto.randomBytes(9).toString('base64url');
+      secret = crypto.randomBytes(24).toString('base64url');
+    }
+    // A Firebase token belongs to one phone: drop older records that carry it.
+    if (token) {
+      for (const [other, d] of Object.entries(state.devices)) if (other !== id && d.token === token) delete state.devices[other];
+    }
+    state.devices[id] = {
+      username,
       token,
+      secretHash: secret ? sha256(secret) : state.devices[id].secretHash,
       platform: String(body.platform || 'android').slice(0, 20),
       app: String(body.app || '').slice(0, 120),
       registeredAt: new Date().toISOString(),
-    });
-    state.devices[username] = devices.slice(0, 3);
+    };
     saveState();
 
-    const warning = await endpointWarning(username);
-    log('ok', `Registered ${username}${token ? ` for push (token ${mask(token)})` : ' without push (no Firebase token)'}`);
-    if (warning) log('!!', warning);
-    sendJson(res, 200, { ok: true, username, push: Boolean(token), warning: warning || undefined });
+    log('ok', `Registered ${username} on device ${id}${token ? ` for push (token ${mask(token)})` : ' without push (no Firebase token)'}`);
+    sendJson(res, 200, {
+      ok: true,
+      username,
+      push: Boolean(token),
+      device_id: id,
+      // Only on pairing; the bridge keeps a hash and cannot show it again.
+      ...(secret ? { device_token: `${id}.${secret}` } : {}),
+      ...(known === undefined ? { warning: 'The bridge cannot check endpoints (VOBIZ_AUTH_ID is not set)' } : {}),
+    });
   }
 
-  async function onUnregister(req, res, url, body) {
-    const username = endpointUsername(body.username);
-    const before = (state.devices[username] || []).length;
-    state.devices[username] = (state.devices[username] || []).filter((d) => body.token && d.token !== body.token);
-    if (!state.devices[username].length) delete state.devices[username];
+  /** Forget this phone (device token required). */
+  async function onUnregister(req, res) {
+    const device = deviceFromRequest(req);
+    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
+    delete state.devices[device.id];
     saveState();
-    log('ok', `Unregistered ${username || '(unknown)'} (${before} device record${before === 1 ? '' : 's'} before)`);
+    log('ok', `Unregistered device ${device.id} (${device.username})`);
     sendJson(res, 200, { ok: true });
   }
 
-  /** A pretend incoming call, to try the push path without dialling a real number. */
-  async function onTestCall(req, res, url, body) {
-    const username = endpointUsername(body.username);
+  /** A pretend incoming call to the asking phone only, to try the push path. */
+  async function onTestCall(req, res) {
+    const device = deviceFromRequest(req);
+    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
+    const body = await readJson(req);
+    if (!device.token) return sendJson(res, 409, { error: 'This phone has no push token registered' });
     const delay = clampInt(body.delay_seconds, 10, 0, 60);
-    const targets = username ? [username] : ringTargets();
-    const devices = targets.flatMap((u) => (state.devices[u] || []).filter((d) => d.token));
-    if (!devices.length) return sendJson(res, 409, { error: 'No device with a push token is registered for that endpoint' });
 
     const call = {
       id: crypto.randomUUID(),
       key: crypto.randomBytes(16).toString('hex'),
       from: 'Test call',
       to: '',
-      targets,
+      targets: [device.username],
+      onlyDevice: device.id,
       createdAt: Date.now() + delay * 1000,
       deadline: Date.now() + (delay + 30) * 1000,
       attempts: 0,
@@ -403,7 +451,7 @@ export function createBridge(options = {}) {
       test: true,
     };
     calls.set(call.id, call);
-    log('->', `Test call ${short(call.id)} for ${targets.join(', ')} in ${delay} s`);
+    log('->', `Test call ${short(call.id)} for device ${device.id} in ${delay} s`);
     setTimeout(() => pushToTargets(call, incomingPayload(call)).catch(() => {}), delay * 1000);
     sendJson(res, 200, { ok: true, call_id: call.id, sending_in_seconds: delay });
   }
@@ -420,19 +468,10 @@ export function createBridge(options = {}) {
     sendJson(res, 200, { ok: true, test: Boolean(call.test) });
   }
 
-  /** The user tapped Decline: the next dial result hangs up with "busy". */
+  /** The user tapped Decline. Needs the call's own key from the push. */
   async function onDecline(req, res) {
     const body = await readJson(req);
-    let call = callFor(body);
-    // Declined in the app without a push (no call key): find it by caller.
-    if (!call && keyMatches(req)) {
-      const user = endpointUsername(body.username);
-      const caller = String(body.caller || '').replace(/\D/g, '');
-      call = [...calls.values()]
-        .filter((c) => !c.finished && c.targets.includes(user))
-        .filter((c) => !caller || c.from.replace(/\D/g, '').endsWith(caller.slice(-10)))
-        .sort((a, b) => b.createdAt - a.createdAt)[0];
-    }
+    const call = callFor(body);
     if (!call) return sendJson(res, 404, { error: 'Unknown call' });
     // Closing the call screen of a call that has already ended reports a
     // Decline too: nothing to do.
@@ -471,7 +510,7 @@ export function createBridge(options = {}) {
   }
 
   async function pushToTargets(call, data) {
-    const devices = call.targets.flatMap((user) => (state.devices[user] || []).filter((d) => d.token));
+    const devices = devicesOf(call.targets).filter((d) => d.token && (!call.onlyDevice || d.id === call.onlyDevice));
     if (!devices.length) return;
     if (!firebase.ready && !deps.sendPush) {
       log('!!', 'Not sending a push: FIREBASE_SERVICE_ACCOUNT is not set up');
@@ -565,12 +604,11 @@ export function createBridge(options = {}) {
   }
 
   function forgetToken(token) {
-    for (const [user, devices] of Object.entries(state.devices)) {
-      const kept = devices.filter((d) => d.token !== token);
-      if (kept.length !== devices.length) {
-        log('..', `Removed an expired push token from ${user}; the app registers a new one when it next signs in`);
+    for (const device of Object.values(state.devices)) {
+      if (device.token === token) {
+        log('..', `Removed an expired push token from ${device.username}; the app registers a new one when it next signs in`);
         // Keep the endpoint ringing even without a token.
-        state.devices[user] = kept.length ? kept : [{ token: null, platform: 'android', app: '', registeredAt: new Date().toISOString() }];
+        device.token = null;
       }
     }
     saveState();
@@ -735,19 +773,22 @@ export function createBridge(options = {}) {
 
   const endpointCache = { at: 0, names: null };
 
-  /** Warns when an app registers an endpoint that is not on VOBIZ_AUTH_ID's account. */
-  async function endpointWarning(username) {
-    if (!config.authId || !config.authToken) return null;
+  /**
+   * Whether `username` is an endpoint on VOBIZ_AUTH_ID's account: true,
+   * false, null when Vobiz could not be asked, undefined when there is no
+   * account to ask.
+   */
+  async function endpointKnown(username) {
+    if (!config.authId || !config.authToken) return undefined;
     try {
       if (!endpointCache.names || Date.now() - endpointCache.at > 60 * 1000) {
         const endpoints = await listAll('/Endpoint/');
         endpointCache.names = new Set(endpoints.filter((e) => e.username).map((e) => String(e.username).toLowerCase()));
         endpointCache.at = Date.now();
       }
-      return endpointCache.names.has(username.toLowerCase())
-        ? null
-        : `${username} is not an endpoint on ${config.authId}; inbound calls to ${config.number || 'your number'} may not reach it`;
-    } catch {
+      return endpointCache.names.has(username.toLowerCase());
+    } catch (error) {
+      log('!!', `Vobiz: could not list endpoints: ${error.message}`);
       return null;
     }
   }
@@ -801,23 +842,32 @@ export function createBridge(options = {}) {
       : 'Webhooks: signatures are NOT checked (ALLOW_UNSIGNED_WEBHOOKS=true). Anyone who finds this address can ring your phones. Local testing only.');
 
     const registered = Object.entries(state.devices)
-      .map(([user, devices]) => `${user} (${devices.filter((d) => d.token).length ? 'push' : 'no push'})`);
-    log('..', `Apps registered: ${registered.length ? registered.join(', ') : 'none yet'}`);
+      .map(([id, d]) => `${d.username} on ${id} (${d.token ? 'push' : 'no push'})`);
+    log('..', `Phones registered: ${registered.length ? registered.join(', ') : 'none yet'}`);
+    for (const [number, users] of config.routes) log('..', `Calls to ${number} ring ${users.join(', ')}`);
 
     console.log('');
-    console.log('  In the app: Identity tab → Incoming calls → Push server, paste this line:');
-    console.log('');
-    console.log(`    ${config.publicUrl || 'https://<your-tunnel>'}#key=${state.bridgeKey}`);
+    if (keyIsNew) {
+      // Shown once, when it is created. Afterwards it is in the state file
+      // (readable by this user only) or in BRIDGE_KEY.
+      console.log('  Pair a phone: Identity tab → Incoming calls → Push server, paste this line:');
+      console.log('');
+      console.log(`    ${config.publicUrl || 'https://<your-tunnel>'}#key=${state.bridgeKey}`);
+    } else {
+      console.log(`  Pair a phone with ${config.publicUrl || 'https://<your-tunnel>'}#key=<bridge key>; the key is bridgeKey in ${config.stateFile} (or BRIDGE_KEY).`);
+    }
     console.log('');
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
 
-  function withBridgeKey(handler) {
-    return async (req, res, url) => {
-      if (!keyMatches(req)) return sendJson(res, 401, { error: 'Wrong or missing bridge key' });
-      return handler(req, res, url, await readJson(req));
-    };
+  /** The registered phone whose device token is in `Authorization: Bearer`, or null. */
+  function deviceFromRequest(req) {
+    const match = String(req.headers.authorization || '').match(/^Bearer\s+([\w-]+)\.([\w-]+)$/);
+    if (!match || !Object.prototype.hasOwnProperty.call(state.devices, match[1])) return null;
+    const device = state.devices[match[1]];
+    if (!device.secretHash || !safeEqual(sha256(match[2]), device.secretHash)) return null;
+    return { id: match[1], ...device };
   }
 
   function keyMatches(req) {
@@ -853,7 +903,11 @@ export function createBridge(options = {}) {
       return {
         bridgeKey: json.bridgeKey || '',
         webhookSecret: json.webhookSecret || '',
-        devices: object(json.devices),
+        // { deviceId: { username, token, secretHash, … } }. Records from the
+        // old { username: [devices] } layout had no per-phone secret: the
+        // phones pair again.
+        devices: Object.fromEntries(Object.entries(object(json.devices))
+          .filter(([, d]) => d && !Array.isArray(d) && d.username && d.secretHash)),
         nonces: object(json.nonces),
       };
     } catch {
@@ -863,7 +917,9 @@ export function createBridge(options = {}) {
 
   function saveState() {
     const tmp = `${config.stateFile}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    // The bridge key, device secrets' hashes and push tokens: this user only.
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, config.stateFile);
   }
 
@@ -883,6 +939,22 @@ export function configProblems(config, env, allowUnsigned) {
   else if (!/^https:\/\//i.test(config.publicUrl)) problems.push('PUBLIC_URL must be https:// (a signature sent over plain HTTP can be captured and replayed)');
   if (!config.authToken) problems.push('VOBIZ_AUTH_TOKEN is not set: it is the key Vobiz signs webhooks with');
   return problems;
+}
+
+/** ROUTES=+919876543210=alice,bob;+918000000000=carol → Map(number → [users]). */
+function parseRoutes(value) {
+  const routes = new Map();
+  for (const entry of String(value || '').split(';')) {
+    const [number, users] = entry.split('=');
+    if (!number || !users) continue;
+    const list = csv(users);
+    if (list.length) routes.set(displayNumber(number.trim()), list);
+  }
+  return routes;
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('base64url');
 }
 
 function esc(value) {

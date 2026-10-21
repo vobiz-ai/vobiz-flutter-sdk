@@ -20,7 +20,7 @@ export function fcmToken(name) {
  * Starts a bridge. `env` is merged over a signed, fully configured default.
  * Returns { bridge, base, pushes, api, logs, stateFile, stop }.
  */
-export async function startBridge({ env = {}, stateFile, apiHandler } = {}) {
+export async function startBridge({ env = {}, stateFile, apiHandler, endpoints = ['alice', 'bob', 'carol'] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-bridge-test-'));
   const file = stateFile || path.join(dir, 'bridge-state.json');
   const pushes = [];
@@ -45,7 +45,9 @@ export async function startBridge({ env = {}, stateFile, apiHandler } = {}) {
       vobizApi: async (method, pathname, body) => {
         api.push({ method, pathname, body });
         if (apiHandler) return apiHandler(method, pathname, body);
-        if (pathname.startsWith('/Endpoint/')) return { objects: [], meta: { total_count: 0 } };
+        if (pathname.startsWith('/Endpoint/')) {
+          return { objects: endpoints.map((username) => ({ username })), meta: { total_count: endpoints.length } };
+        }
         return { message: 'ok' };
       },
     },
@@ -117,9 +119,12 @@ export async function until(fn, ms = 2000) {
   return fn();
 }
 
-/** Registers a phone for `username` with its own FCM token; returns the response body. */
+/**
+ * Pairs a phone for `username` with its own FCM token. Returns the response
+ * body ({ device_id, device_token, … }) plus `auth`, the header to send later.
+ */
 export async function registerDevice(ctx, username, { name = username } = {}) {
   const r = await postJson(ctx, '/push/register', { username, token: fcmToken(name), platform: 'android' }, { 'X-Bridge-Key': BRIDGE_KEY });
   if (r.status !== 200) throw new Error(`register ${username}: ${r.status} ${r.text}`);
-  return r.json;
+  return { ...r.json, fcm: fcmToken(name), auth: { Authorization: `Bearer ${r.json.device_token}` } };
 }
