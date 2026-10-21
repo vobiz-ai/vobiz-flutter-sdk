@@ -10,6 +10,11 @@ export 'src/errors/vobiz_exception.dart';
 export 'src/webrtc/ice_config.dart';
 export 'src/webrtc/media_constraints.dart';
 
+// ── Network ───────────────────────────────────────────────────────────────────
+export 'src/network/connectivity_monitor.dart';
+export 'src/network/network_event.dart';
+export 'src/network/reconnect_policy.dart';
+
 // ── Authentication ────────────────────────────────────────────────────────────
 export 'src/models/auth/auth_mode.dart';
 export 'src/models/auth/credential_config.dart';
