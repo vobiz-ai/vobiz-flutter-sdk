@@ -1,9 +1,11 @@
 package ai.vobiz.vobiz_webrtc_example
 
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
 
 class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -15,6 +17,13 @@ class MainActivity : FlutterActivity() {
         super.onNewIntent(intent)
         showOverLockScreenWhenAnswering(intent)
     }
+
+    /**
+     * Always the app's one engine ([CallEngine]): the one a push may already
+     * have started, signed in and ringing. Provided by the host, it is not
+     * destroyed with this activity, so a call keeps running when the UI goes.
+     */
+    override fun provideFlutterEngine(context: Context): FlutterEngine = CallEngine.obtain(context)
 
     /**
      * Accept on the incoming-call screen opens the app with the call screen's
