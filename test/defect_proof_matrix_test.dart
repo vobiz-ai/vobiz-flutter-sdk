@@ -17,14 +17,7 @@ SIPService _svc(List<String> sent) {
   return s;
 }
 
-/// Each test here proves an open defect: it fails until that issue is fixed,
-/// and then passes. Skipped by default so `flutter test` stays green; run
-///   flutter test --dart-define=PROVE_DEFECTS=true test/defect_proof_*
-/// to see them fail, and remove the skip when the issue is closed.
-Object _open(String issue) => const bool.fromEnvironment('PROVE_DEFECTS')
-    ? false
-    : 'Open defect $issue (vobiz-ai/vobiz-flutter-sdk): passes once it is fixed';
-
+// The defects these proved are fixed; the tests now run with the suite.
 void main() {
   test('N2 (#38): a failed answer declines the INVITE, so the NEXT call rings instead of getting 486', () {
     final sent = <String>[];
@@ -52,7 +45,7 @@ void main() {
     expect(sent.map((m) => m.split(' ').first), contains('BYE'), reason: 'sent: $sent');
   });
 
-  test('N18: overlapping DTMF INFOs: a 407 on the first re-sends the FIRST digit', () {
+  test('N18 (#49): overlapping DTMF INFOs: a 407 on the first re-sends the FIRST digit', () {
     final sent = <String>[];
     final s = _svc(sent);
     s.debugReceive(_inv('c2'));
@@ -60,12 +53,20 @@ void main() {
     sent.clear();
     s.sendDtmf('1');
     s.sendDtmf('2');
+    // The 407 answers the first INFO: it echoes that INFO's Via and CSeq, as
+    // a server does. (Tones now go one at a time, so only the first is out.)
+    final info = sent.single;
+    String header(String name) => info
+        .split('\r\n')
+        .firstWhere((l) => l.startsWith('$name:'))
+        .substring(name.length + 1)
+        .trim();
     s.debugReceive('SIP/2.0 407 Proxy Authentication Required\r\n'
-        'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bKx\r\nFrom: <sip:play1@registrar.vobiz.ai>;tag=t\r\n'
-        'To: <sip:+918000000000@10.0.2.9>;tag=ms\r\nCall-ID: c2\r\nCSeq: 3 INFO\r\n'
+        'Via: ${header('Via')}\r\nFrom: ${header('From')}\r\n'
+        'To: ${header('To')}\r\nCall-ID: c2\r\nCSeq: ${header('CSeq')}\r\n'
         'Proxy-Authenticate: Digest realm="registrar.vobiz.ai", nonce="n", qop="auth"\r\nContent-Length: 0\r\n\r\n');
     final retried = sent.last;
     expect(retried, contains('Proxy-Authorization'));
     expect(retried, contains('Signal=1'), reason: 'retry carried: ${retried.split('\r\n\r\n').last}');
-  }, skip: _open('#49'));
+  });
 }

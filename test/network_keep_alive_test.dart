@@ -12,13 +12,22 @@ import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 
 import 'network_fakes.dart';
 
-const String _register200 = 'SIP/2.0 200 OK\r\n'
-    'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bKx\r\n'
-    'From: <sip:play1@registrar.vobiz.ai>;tag=t\r\n'
-    'To: <sip:play1@registrar.vobiz.ai>;tag=srv\r\n'
-    'Call-ID: reg@vobiz-client\r\n'
-    'CSeq: 1 REGISTER\r\n'
-    'Content-Length: 0\r\n\r\n';
+/// The registrar's 200 OK to [register]: its Via and CSeq echoed, as the
+/// SIP layer matches responses to requests by branch and CSeq.
+String _register200(String register) {
+  String header(String name) => register
+      .split('\r\n')
+      .firstWhere((l) => l.startsWith('$name:'))
+      .substring(name.length + 1)
+      .trim();
+  return 'SIP/2.0 200 OK\r\n'
+      'Via: ${header('Via')}\r\n'
+      'From: ${header('From')}\r\n'
+      'To: ${header('To')};tag=srv\r\n'
+      'Call-ID: ${header('Call-ID')}\r\n'
+      'CSeq: ${header('CSeq')}\r\n'
+      'Content-Length: 0\r\n\r\n';
+}
 
 /// A WebSocket server that completes the handshake and then never answers
 /// anything again, pings included: a connection whose network has silently
@@ -57,7 +66,7 @@ void main() {
           ..debugOnSend = sent.add;
         s.connectionState.value = SipConnectionState.connected;
         s.register('play1', 'secret');
-        s.debugReceive(_register200);
+        s.debugReceive(_register200(sent.last));
         sent.clear();
 
         async.elapse(const Duration(minutes: 5));
@@ -85,7 +94,7 @@ void main() {
         )..debugOnSend = sent.add;
         s.connectionState.value = SipConnectionState.connected;
         s.register('play1', 'secret');
-        s.debugReceive(_register200);
+        s.debugReceive(_register200(sent.last));
         sent.clear();
 
         async.elapse(const Duration(seconds: 25));

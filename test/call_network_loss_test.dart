@@ -58,6 +58,7 @@ void main() {
       // What the reconnect does: close the old socket keeping the dialog, then
       // register again.
       h.sip.disconnect(keepCall: true);
+      h.sip.register('play1', 'secret');
       h.registered();
       await h.settle();
       expect(h.events.last.reason, 'reconnected');

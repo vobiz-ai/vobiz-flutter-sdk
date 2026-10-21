@@ -376,7 +376,8 @@ class VobizClient {
       await _terminate(callId,
           message: 'Signed out', reason: 'disconnected', declineCode: 480);
     }
-    _sip.disconnect();
+    // Unregisters (REGISTER Expires: 0, at most ~2 s) before the socket closes.
+    await _sip.disconnect();
     await _peer.disposeAllCalls();
     _callId = null;
     _callState = CallStateStatus.idle;
@@ -458,6 +459,9 @@ class VobizClient {
     _callHeaders = Map<String, String>.unmodifiable(outgoing);
     _callState = CallStateStatus.connecting;
     _emitCallEvent(callId, CallStateStatus.connecting, 'Preparing outbound call');
+    // Busy for inbound INVITEs while the microphone and ICE are prepared: one
+    // arriving now would ring unseen and tangle with this call's dialog.
+    _sip.reserveForOutgoingCall();
 
     try {
       await _peer.initialize(callId);
@@ -478,6 +482,8 @@ class VobizClient {
       return callId;
     } catch (e, st) {
       _logger.error('makeCall failed: $e\n$st');
+      // Ends the reservation, and the INVITE if it already went out.
+      if (_callId == callId) _sip.hangup();
       await _cleanupCall(callId);
       _emitError('make_call_failed', 'Could not start the call', e);
       rethrow;
@@ -876,7 +882,14 @@ class VobizClient {
             sipCode: sipCode, reason: reason);
         _cleanupCall(id, reason: reason);
       }
-      _emitError('call_failed', reason, null);
+      // A 401/407 here means the digest was refused (the SIP layer answers
+      // one challenge, two for a stale nonce): wrong credentials, not a
+      // failed call.
+      final authFailed = sipCode == 401 || sipCode == 407;
+      _emitError(
+          authFailed ? VobizErrorCode.authFailed : VobizErrorCode.callFailed,
+          reason,
+          null);
     };
 
     _peer.onIceConnectionState = (callId, state) {
@@ -922,7 +935,7 @@ class VobizClient {
           message: 'Signed out', reason: 'disconnected', declineCode: 480));
     }
     if (_sip.connectionState.value != SipConnectionState.disconnected) {
-      _sip.disconnect();
+      unawaited(_sip.disconnect());
     }
   }
 
@@ -996,7 +1009,8 @@ class VobizClient {
     if (username == null || password == null) return;
     // Keep a connected call's dialog: once registered again it can still
     // be hung up, and the far end's BYE still matches it.
-    _sip.disconnect(keepCall: _callId != null);
+    // Not a sign-out: no unregistration, the REGISTER below replaces it.
+    unawaited(_sip.disconnect(keepCall: _callId != null, unregister: false));
     await _connectWithCredentials(username, password, reconnecting: true);
   }
 

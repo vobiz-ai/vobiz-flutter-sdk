@@ -40,6 +40,10 @@ abstract final class VobizErrorCode {
 
   /// A call did not connect in time.
   static const String callTimeout = 'call_timeout';
+
+  /// The server refused the call's credentials (401/407 after the SDK
+  /// answered its digest challenge).
+  static const String authFailed = 'auth_failed';
 }
 
 /// An SDK operation failed.

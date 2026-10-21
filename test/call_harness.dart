@@ -89,7 +89,9 @@ class Harness {
     Duration networkLossGrace = const Duration(seconds: 12),
   }) {
     sip = SIPService(wsUrl: 'wss://example.invalid', sipServer: sipServer)
-      ..debugOnSend = sent.add;
+      ..debugOnSend = sent.add
+      // No registrar answers the unregistration on dispose; don't wait 2 s.
+      ..unregisterTimeout = const Duration(milliseconds: 10);
     client = VobizClient.withServices(
       sip: sip,
       peer: peer,
@@ -112,11 +114,18 @@ class Harness {
   final List<ErrorEvent> errors = <ErrorEvent>[];
   final List<ConnectionEvent> connection = <ConnectionEvent>[];
 
-  /// The registrar's 200 OK to REGISTER.
-  void registered() => sip.debugReceive('SIP/2.0 200 OK\r\n'
-      'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bKr\r\n'
-      'From: <sip:play1@$sipServer>;tag=t\r\nTo: <sip:play1@$sipServer>;tag=r\r\n'
-      'Call-ID: reg\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n');
+  /// The registrar's 200 OK to the last REGISTER: its Via and CSeq echoed,
+  /// since the SIP layer matches responses by branch and CSeq.
+  void registered() {
+    final register =
+        SipParser.parse(sent.lastWhere((m) => m.startsWith('REGISTER ')));
+    sip.debugReceive('SIP/2.0 200 OK\r\n'
+        'Via: ${register.header('Via')}\r\n'
+        'From: ${register.header('From')}\r\n'
+        'To: ${register.header('To')};tag=r\r\n'
+        'Call-ID: ${register.header('Call-ID')}\r\n'
+        'CSeq: ${register.header('CSeq')}\r\nContent-Length: 0\r\n\r\n');
+  }
 
   /// First lines of what was sent ("SIP/2.0 486 Busy Here", "BYE sip:...").
   List<String> get firstLines =>
