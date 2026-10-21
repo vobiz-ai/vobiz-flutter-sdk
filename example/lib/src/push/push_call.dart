@@ -127,18 +127,14 @@ String? pushRefFromHeaders(Map<String, String> headers) {
   return null;
 }
 
-/// Whether an incoming SIP call is the call [push] announced.
+/// Whether an incoming SIP call is the call [push] announced: only when the
+/// INVITE carries the bridge's call reference for exactly that call.
 ///
-/// The bridge's call reference decides when it arrived. Without it, the
-/// caller is compared with both numbers the push carries, because the
-/// bridge presents either the real caller or the Vobiz number that was
-/// called (CALLER_ID_MODE).
-bool inviteMatchesPush(PushCall push, {required Map<String, String> headers, String? from}) {
-  final ref = pushRefFromHeaders(headers);
-  if (ref != null) return ref == push.callId;
-  final caller = callerFromHeaders(headers) ?? from ?? '';
-  return samePhoneNumber(caller, push.caller) || samePhoneNumber(caller, push.callee);
-}
+/// Numbers are never enough. With the bridge's default caller ID every call
+/// shows the Vobiz number, so matching by number would answer any call that
+/// arrived after an Accept without a tap.
+bool inviteMatchesPush(PushCall push, {required Map<String, String> headers}) =>
+    pushRefFromHeaders(headers) == push.callId;
 
 /// The real caller the bridge passed on the INVITE (`X-VH-Caller`), when its
 /// caller ID shows the Vobiz number instead.

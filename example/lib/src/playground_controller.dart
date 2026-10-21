@@ -241,6 +241,11 @@ class PlaygroundController extends ChangeNotifier {
   /// that still rings as a Decline, which must not be taken for the user's.
   final Set<String> _closingScreens = <String>{};
 
+  /// Pushed calls already taken after an Accept. The plugin can deliver
+  /// one Accept twice (replayed when the app starts, and found again among
+  /// its active calls); each call is taken once.
+  final Set<String> _takenCalls = <String>{};
+
   PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer);
 
   // ── Trace ───────────────────────────────────────────────────────────────────
@@ -866,8 +871,7 @@ class PlaygroundController extends ChangeNotifier {
   /// Whether an INVITE is the call the user already accepted on the call screen.
   bool _isAcceptedCall(CallEvent e) {
     final accepted = _acceptedCall;
-    return accepted != null &&
-        inviteMatchesPush(accepted, headers: e.headers, from: e.remoteIdentity);
+    return accepted != null && inviteMatchesPush(accepted, headers: e.headers);
   }
 
   /// A call rings over SIP while the app is in the background: show it on the
@@ -876,7 +880,7 @@ class PlaygroundController extends ChangeNotifier {
     final ref = pushRefFromHeaders(e.headers);
     for (final active in await callScreen.active()) {
       final pushed = PushCall.fromExtra(active.extra);
-      if (pushed == null || !inviteMatchesPush(pushed, headers: e.headers, from: e.remoteIdentity)) {
+      if (pushed == null || !inviteMatchesPush(pushed, headers: e.headers)) {
         continue;
       }
       _callScreenId = active.id;
@@ -922,10 +926,14 @@ class PlaygroundController extends ChangeNotifier {
     switch (event) {
       case ck.CallEventActionCallAccept(:final callKitParams):
         final pushed = PushCall.fromExtra(callKitParams.extra);
+        final ringingHere = client.callState == CallStateStatus.incoming &&
+            (callKitParams.id == _callScreenId ||
+                pushRefFromHeaders(client.callHeaders) == callKitParams.id);
         _callScreenId = callKitParams.id;
         _callScreenAccepted = true;
         _callScreenPush = pushed;
-        if (client.callState == CallStateStatus.incoming) {
+        // Answer the SIP call only when it is the call this screen showed.
+        if (ringingHere) {
           log('📲 Accepted on the call screen', LogType.event);
           onTabRequest?.call(1);
           if (pushed != null && !pushed.isTest) unawaited(_quietly(() => PushBridgeApi.accept(pushed)));
@@ -1020,6 +1028,7 @@ class PlaygroundController extends ChangeNotifier {
   /// The user accepted a pushed call. Sign in if needed, then answer when
   /// the bridge rings this endpoint again.
   Future<void> _takeAcceptedCall(PushCall call, String screenId) async {
+    if (!_takenCalls.add(call.callId)) return;
     onTabRequest?.call(1);
     if (call.isTest) {
       log('✅ Test call accepted. The push woke this phone and the call screen worked; a real '
@@ -1031,7 +1040,8 @@ class PlaygroundController extends ChangeNotifier {
     }
     log('📲 Accepted the call from ${call.caller} on the call screen', LogType.event);
     unawaited(_quietly(() => PushBridgeApi.accept(call)));
-    if (client.callState == CallStateStatus.incoming) {
+    if (client.callState == CallStateStatus.incoming &&
+        pushRefFromHeaders(client.callHeaders) == call.callId) {
       await answer();
       return;
     }

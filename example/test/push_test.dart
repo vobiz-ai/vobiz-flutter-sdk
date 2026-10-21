@@ -87,22 +87,17 @@ void main() {
       expect(samePhoneNumber('Unknown', 'Unknown'), isFalse);
     });
 
-    test('the call reference decides when it arrived, in either spelling', () {
+    test('the call reference decides, in either spelling', () {
       expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-PushRef': 'ref-1'}), isTrue);
       expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-PushRefX-VH': 'ref-1'}), isTrue);
-      expect(
-          inviteMatchesPush(push,
-              headers: <String, String>{'X-VH-PushRef': 'ref-2'}, from: '+919876543210'),
-          isFalse);
+      expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-PushRef': 'ref-2'}), isFalse);
     });
 
-    test('without a reference, the caller or the called Vobiz number matches', () {
-      expect(inviteMatchesPush(push, headers: const <String, String>{}, from: '919876543210'), isTrue);
-      // CALLER_ID_MODE=number: the INVITE shows the Vobiz number.
-      expect(inviteMatchesPush(push, headers: const <String, String>{}, from: '+918000000000'), isTrue);
-      expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-Caller': '919876543210'},
-          from: '+918000000001'), isTrue);
-      expect(inviteMatchesPush(push, headers: const <String, String>{}, from: '+917000000000'), isFalse);
+    test('a number is never enough to match (#46)', () {
+      // CALLER_ID_MODE=number: every call shows the Vobiz number, so a number
+      // match would auto-answer whichever call came next.
+      expect(inviteMatchesPush(push, headers: const <String, String>{}), isFalse);
+      expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-Caller': '919876543210'}), isFalse);
     });
 
     test('reads the real caller the bridge passed', () {
