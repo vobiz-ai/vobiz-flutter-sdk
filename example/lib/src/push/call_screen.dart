@@ -131,3 +131,26 @@ class CallScreen {
     }
   }
 }
+
+/// [CallScreen] as an object, so the app can be tested without the plugin.
+class CallScreenApi {
+  const CallScreenApi();
+
+  Stream<ck.CallEvent?> get events => CallScreen.events;
+
+  Future<void> showIncoming({
+    required String id,
+    required String caller,
+    String subtitle = 'Vobiz call',
+    Map<String, dynamic> extra = const <String, dynamic>{},
+  }) =>
+      CallScreen.showIncoming(id: id, caller: caller, subtitle: subtitle, extra: extra);
+
+  Future<void> end(String id) => CallScreen.end(id);
+
+  Future<List<ck.CallKitParams>> active() => CallScreen.active();
+
+  Future<bool?> canUseFullScreen() => CallScreen.canUseFullScreen();
+
+  Future<void> requestFullScreen() => CallScreen.requestFullScreen();
+}

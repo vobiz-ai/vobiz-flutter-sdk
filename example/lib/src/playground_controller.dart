@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
 import 'countries.dart';
+import 'push/call_platform.dart';
 import 'push/call_screen.dart';
 import 'push/push_bridge_api.dart';
 import 'push/push_call.dart';
@@ -91,13 +92,27 @@ class CallHeaderRecord {
 /// modes, the same checks before dialling, and the same trace messages, so the
 /// two can be compared side by side.
 class PlaygroundController extends ChangeNotifier {
-  PlaygroundController({VobizClient? client, FlutterSecureStorage? secureStorage, PushService? push})
-      : client = client ?? VobizClient(),
+  PlaygroundController({
+    VobizClient? client,
+    FlutterSecureStorage? secureStorage,
+    PushService? push,
+    CallScreenApi? callScreen,
+    CallPlatform? platform,
+  })  : client = client ?? VobizClient(),
         _secure = secureStorage ?? const FlutterSecureStorage(),
-        push = push ?? PushService.unavailable('Push is not set up in this build.');
+        push = push ?? PushService.unavailable('Push is not set up in this build.'),
+        callScreen = callScreen ?? const CallScreenApi(),
+        platform = platform ?? CallPlatform();
 
   final VobizClient client;
   final FlutterSecureStorage _secure;
+
+  /// The system incoming-call screen.
+  final CallScreenApi callScreen;
+
+  /// The example's Android side: the call's foreground service, pushes,
+  /// missed-call notifications.
+  final CallPlatform platform;
 
   /// Firebase push, which wakes the app for calls when it is closed.
   final PushService push;
@@ -124,6 +139,21 @@ class PlaygroundController extends ChangeNotifier {
 
   VobizAuthMode get authMode => client.authMode;
   bool _reconnecting = false;
+
+  /// Why the last Connect did nothing or failed, shown under the button (it
+  /// is in the Trace too).
+  String? connectError;
+
+  /// The sign-in fields Connect found empty: 'authId', 'authToken',
+  /// 'sipUsername', 'sipPassword'.
+  Set<String> missingFields = <String>{};
+
+  /// Bumped by every sign-out, so a sign-in that was still waiting for the
+  /// server cannot bring the session back afterwards.
+  int _session = 0;
+
+  /// The sign-in in progress, so a second Connect joins it.
+  Future<void>? _connecting;
 
   /// Registered, in a call, or briefly reconnecting after the network dropped.
   bool get isSignedIn =>
@@ -241,7 +271,7 @@ class PlaygroundController extends ChangeNotifier {
     _subs.add(client.connectionEvents.listen(_onConnection));
     _subs.add(client.callEvents.listen(_onCall));
     _subs.add(client.errorEvents.listen(_onError));
-    _subs.add(CallScreen.events.listen(_onCallScreenEvent, onError: (Object _) {}));
+    _subs.add(callScreen.events.listen(_onCallScreenEvent, onError: (Object _) {}));
     _subs.add(push.foregroundCalls.listen(_onForegroundPush));
     _subs.add(push.tokenRefresh.listen((_) => _registerWithBridge(quiet: true)));
     notifyListeners();
@@ -273,24 +303,40 @@ class PlaygroundController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> connect() async {
-    if (status == PhoneStatus.connecting) return;
+  /// Signs in. A second call while one is in progress joins it rather than
+  /// opening another connection.
+  Future<void> connect() {
+    final running = _connecting;
+    if (running != null) return running;
+    if (status == PhoneStatus.connecting) return Future<void>.value();
+    final attempt = _connect();
+    _connecting = attempt;
+    return attempt.whenComplete(() {
+      if (identical(_connecting, attempt)) _connecting = null;
+    });
+  }
+
+  Future<void> _connect() async {
     final zero = authTab == AuthTab.zeroConfig;
-    if (zero && (authId.trim().isEmpty || authToken.trim().isEmpty)) {
-      log('Please enter Auth ID and Auth Token', LogType.error);
-      return;
-    }
-    if (!zero && (sipUsername.trim().isEmpty || sipPassword.isEmpty)) {
-      log('Please enter both SIP username and password', LogType.error);
-      return;
+    connectError = null;
+    missingFields = <String>{
+      if (zero && authId.trim().isEmpty) 'authId',
+      if (zero && authToken.trim().isEmpty) 'authToken',
+      if (!zero && sipUsername.trim().isEmpty) 'sipUsername',
+      if (!zero && sipPassword.isEmpty) 'sipPassword',
+    };
+    if (missingFields.isNotEmpty) {
+      return _connectFailed(zero
+          ? 'Please enter Auth ID and Auth Token'
+          : 'Please enter both SIP username and password');
     }
     final hook = webhookUrl.trim().replaceAll(RegExp(r'/+$'), '');
     if (zero && !hook.startsWith('https://')) {
-      log('⚠️ Public Webhook URL is required! Vobiz Cloud cannot reach localhost. '
-          'Use the hosted server or an https tunnel.', LogType.error);
-      return;
+      return _connectFailed('⚠️ Public Webhook URL is required! Vobiz Cloud cannot reach localhost. '
+          'Use the hosted server or an https tunnel.');
     }
 
+    final session_ = _session;
     _setStatus(PhoneStatus.connecting, 'Connecting...');
     _startLoginTimeout();
     try {
@@ -301,6 +347,10 @@ class PlaygroundController extends ChangeNotifier {
           authId: authId,
           authToken: authToken,
         );
+        if (session_ != _session) {
+          await _abandonSignIn();
+          return;
+        }
         log('Provisioned App ID: ${session.applicationId}'
             '${session.reusedExisting ? ' (reused existing infrastructure)' : ''}',
             LogType.success);
@@ -318,30 +368,68 @@ class PlaygroundController extends ChangeNotifier {
           username: sipUsername.trim(),
           password: sipPassword,
         ));
+        if (session_ != _session) {
+          await _abandonSignIn();
+          return;
+        }
       }
       await _saveCredentials();
     } on VobizException catch (e) {
+      if (session_ != _session) return;
       _loginTimeout?.cancel();
       connectedAs = null;
-      log('API Setup Error: ${e.message}', LogType.error);
+      connectError = 'API Setup Error: ${e.message}';
+      log(connectError!, LogType.error);
       _setStatus(PhoneStatus.offline, 'Error');
     } catch (e) {
+      if (session_ != _session) return;
       _loginTimeout?.cancel();
-      log('Connection failed: $e', LogType.error);
+      connectError = 'Connection failed: $e';
+      log(connectError!, LogType.error);
       _setStatus(PhoneStatus.error, 'Error');
     }
   }
 
+  void _connectFailed(String message) {
+    connectError = message;
+    log(message, LogType.error);
+  }
+
+  /// Signed out while the server was still answering: drop what it gave.
+  Future<void> _abandonSignIn() async {
+    log('Sign-in finished after sign-out; dropping that session', LogType.warning);
+    connectedAs = null;
+    await client.disconnect();
+  }
+
+  /// Signs out, and forgets the saved Auth Token and SIP password: after a
+  /// sign-out nothing on this device can sign in as this account again.
   Future<void> disconnect() async {
+    _session++;
+    _connecting = null;
     _loginTimeout?.cancel();
     _reconnecting = false;
+    connectError = null;
     log('Logging out...', LogType.info);
     // Signing out means "stop ringing this phone"; closing the app does not.
     await _unregisterFromBridge(client.sipUsername ?? connectedAs);
     await client.disconnect();
     connectedAs = null;
+    authToken = '';
+    sipPassword = '';
+    await _forgetCredentials();
     _resetCallState(registered: false);
     _setStatus(PhoneStatus.offline, 'Disconnected');
+  }
+
+  Future<void> _forgetCredentials() async {
+    try {
+      for (final key in <String>[_kAuthId, _kAuthToken, _kSipUser, _kSipPass]) {
+        await _secure.delete(key: key);
+      }
+    } catch (e) {
+      log('Could not remove the saved credentials: $e', LogType.warning);
+    }
   }
 
   void _startLoginTimeout() {
@@ -350,7 +438,8 @@ class PlaygroundController extends ChangeNotifier {
     _loginTimeout = Timer(const Duration(seconds: 20), () {
       if (status == PhoneStatus.connecting) {
         _reconnecting = false;
-        log('Login timed out (No response from registrar)', LogType.error);
+        connectError = 'Login timed out (No response from registrar)';
+        log(connectError!, LogType.error);
         _setStatus(PhoneStatus.error, 'Timeout');
       }
     });
@@ -649,7 +738,7 @@ class PlaygroundController extends ChangeNotifier {
   /// Reads the notification and full-screen permissions without asking.
   Future<void> refreshCallPermissions() async {
     notificationsAllowed = await push.notificationsAllowed();
-    fullScreenAllowed = await CallScreen.canUseFullScreen();
+    fullScreenAllowed = await callScreen.canUseFullScreen();
     notifyListeners();
   }
 
@@ -657,8 +746,8 @@ class PlaygroundController extends ChangeNotifier {
   /// when missing, full-screen notifications (Android 14+, opens Settings).
   Future<void> requestCallPermissions() async {
     notificationsAllowed = await push.requestNotificationPermission();
-    fullScreenAllowed = await CallScreen.canUseFullScreen();
-    if (fullScreenAllowed == false) await CallScreen.requestFullScreen();
+    fullScreenAllowed = await callScreen.canUseFullScreen();
+    if (fullScreenAllowed == false) await callScreen.requestFullScreen();
     notifyListeners();
   }
 
@@ -774,7 +863,7 @@ class PlaygroundController extends ChangeNotifier {
   /// call screen, joining a push for the same call if one is already showing.
   Future<void> _showCallScreenForSip(CallEvent e) async {
     final ref = pushRefFromHeaders(e.headers);
-    for (final active in await CallScreen.active()) {
+    for (final active in await callScreen.active()) {
       final pushed = PushCall.fromExtra(active.extra);
       if (pushed == null || !inviteMatchesPush(pushed, headers: e.headers, from: e.remoteIdentity)) {
         continue;
@@ -791,7 +880,7 @@ class PlaygroundController extends ChangeNotifier {
     _callScreenId = id;
     _callScreenAccepted = false;
     _callScreenPush = null;
-    await CallScreen.showIncoming(
+    await callScreen.showIncoming(
       id: id,
       caller: remoteParty,
       extra: <String, dynamic>{'source': 'sip', 'call': e.callId},
@@ -808,7 +897,7 @@ class PlaygroundController extends ChangeNotifier {
 
   Future<void> _closeCallScreen(String id) async {
     _closingScreens.add(id);
-    await CallScreen.end(id);
+    await callScreen.end(id);
   }
 
   Future<void> _onCallScreenEvent(ck.CallEvent? event) async {
@@ -891,7 +980,7 @@ class PlaygroundController extends ChangeNotifier {
       log('📲 Push received for a call from ${call.caller}; it rings here over SIP', LogType.info);
       return;
     }
-    CallScreen.showIncoming(
+    callScreen.showIncoming(
       id: call.callId,
       caller: call.isTest ? 'Test call' : call.caller,
       subtitle: call.isTest ? 'The push reached this phone. Nothing will connect.' : 'Vobiz call',
@@ -901,7 +990,7 @@ class PlaygroundController extends ChangeNotifier {
 
   /// Opened by Accept on the call screen while the app was closed: take it.
   Future<void> _resumeAcceptedCall() async {
-    for (final active in await CallScreen.active()) {
+    for (final active in await callScreen.active()) {
       final pushed = PushCall.fromExtra(active.extra);
       if (pushed == null || !active.isAccepted) continue;
       final expires = pushed.expiresAt;
@@ -1045,8 +1134,12 @@ class PlaygroundController extends ChangeNotifier {
 
   void _onConnection(ConnectionEvent e) {
     if (e.registrationState == RegistrationState.registered) {
+      // Signed out meanwhile: a late registration must not sign back in.
+      if (status == PhoneStatus.offline && statusText == 'Disconnected') return;
       _loginTimeout?.cancel();
       _reconnecting = false;
+      connectError = null;
+      missingFields = <String>{};
       final wasConnecting = status != PhoneStatus.online &&
           status != PhoneStatus.inCall &&
           status != PhoneStatus.ringing;
@@ -1064,8 +1157,9 @@ class PlaygroundController extends ChangeNotifier {
         (e.message ?? '').startsWith('Registration failed')) {
       _loginTimeout?.cancel();
       _reconnecting = false;
-      log('Login failed: ${e.message?.replaceFirst('Registration failed: ', '') ?? 'Unknown reason'}',
-          LogType.error);
+      connectError =
+          'Login failed: ${e.message?.replaceFirst('Registration failed: ', '') ?? 'Unknown reason'}';
+      log(connectError!, LogType.error);
       _setStatus(PhoneStatus.error, 'Auth Failed');
       return;
     }
