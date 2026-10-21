@@ -540,6 +540,9 @@ class SIPService {
   void Function()? onRegistered;
   void Function(String reason)? onRegistrationFailed;
   void Function()? onRemoteRinging;
+  /// The far end received the INVITE (100 Trying): the call is no longer
+  /// waiting on a response at all.
+  void Function()? onTrying;
   void Function(String? sdp)? onCallProgress;
   void Function(String callerId, String sdp, Map<String, String> headers)?
       onIncomingCall;
@@ -625,9 +628,17 @@ class SIPService {
     _pendingInvite = null;
   }
 
-  void reject() {
-    if (_pendingInvite == null) return;
-    _send(SipBuilder.busyHere(invite: _pendingInvite!, localTag: _localTag));
+  /// Declines the ringing INVITE with [code] (486 Busy Here by default). Once
+  /// the call has been answered there is no INVITE left to decline, so the
+  /// call is hung up with a BYE instead of being dropped silently.
+  void reject([int code = 486, String reason = 'Busy Here']) {
+    final invite = _pendingInvite;
+    if (invite == null) {
+      if (_activeCallId != null) hangup();
+      return;
+    }
+    _send(SipBuilder.response(
+        request: invite, code: code, reason: reason, localTag: _localTag));
     _clearCallState();
   }
 
@@ -647,11 +658,14 @@ class SIPService {
     onCallEnded?.call('Hung up');
   }
 
-  void disconnect() {
+  /// Closes the socket. [keepCall] keeps the established call's dialog, so a
+  /// reconnect can still hang it up (or be hung up) once it is registered
+  /// again.
+  void disconnect({bool keepCall = false}) {
     _manualDisconnect = true;
     _registrationRefreshTimer?.cancel();
     _optionsKeepAliveTimer?.cancel();
-    _clearCallState();
+    if (!keepCall) _clearCallState();
     _socket?.sink.close();
     _socket = null;
     _connectionState.value = SipConnectionState.disconnected;
@@ -965,6 +979,7 @@ class SIPService {
 
     switch (msg.statusCode) {
       case 100:
+        onTrying?.call();
         break;
       case 180:
         _updateDialog(msg);

@@ -52,6 +52,11 @@ class PeerService {
   /// Which call is "current" for operations that don't specify a callId.
   String? _activeCallId;
 
+  /// Called with each ICE connection state change, so the client can tell
+  /// when a call's media has been lost (failed/disconnected) or recovered.
+  void Function(String callId, RTCIceConnectionState state)?
+      onIceConnectionState;
+
   /// Emits local/remote media lifecycle updates.
   Stream<MediaEvent> get mediaEvents => _mediaEvents.stream;
 
@@ -460,6 +465,7 @@ class PeerService {
 
     connection.onIceConnectionState = (RTCIceConnectionState iceState) {
       _logger.info('ICE connection state for $callId: $iceState');
+      onIceConnectionState?.call(callId, iceState);
       _mediaEvents.addIfOpen(
         MediaEvent(
           callId: callId,
