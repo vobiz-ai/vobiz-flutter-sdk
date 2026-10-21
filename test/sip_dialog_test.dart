@@ -193,7 +193,7 @@ void main() {
       expect(_lines(sent.single, 'Route'), _lines(ack, 'Route'));
     });
 
-    test('a late 200 OK for a call that has ended is ignored', () {
+    test('a 200 OK for an INVITE this client never sent is ignored', () {
       final sent = <String>[];
       final service = SIPService(wsUrl: 'wss://test', sipServer: 'registrar.vobiz.ai')
         ..debugOnSend = sent.add;
