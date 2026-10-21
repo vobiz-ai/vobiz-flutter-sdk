@@ -95,17 +95,17 @@ export function createBridge(options = {}) {
 
   /** Inbound calls in progress, by Vobiz CallUUID. Kept in memory only. */
   const calls = new Map();
-  const ringback = makeRingbackWav(RINGBACK_SECONDS);
+  const ringback = makeToneWav(RINGBACK_SECONDS, [[0, 0.4], [0.6, 1.0]]);
+  // Indian busy tone: 400 Hz, 0.75 s on, 0.75 s off.
+  const busyTone = makeToneWav(3, [[0, 0.75], [1.5, 2.25]]);
 
   // ── HTTP server ──────────────────────────────────────────────────────────────
 
   const routes = {
     'GET /': (req, res) => sendText(res, 200, 'Vobiz push bridge is running.\n'),
     'GET /health': (req, res) => sendJson(res, 200, { ok: true, service: 'vobiz-push-bridge', instance: INSTANCE }),
-    'GET /ringback.wav': (req, res) => {
-      res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': ringback.length, 'Cache-Control': 'public, max-age=3600' });
-      res.end(ringback);
-    },
+    'GET /ringback.wav': (req, res) => sendWav(res, ringback),
+    'GET /busy.wav': (req, res) => sendWav(res, busyTone),
     // Vobiz webhooks
     'POST /answer': vobiz(onAnswer),
     'GET /answer': vobiz(onAnswer),
@@ -122,6 +122,8 @@ export function createBridge(options = {}) {
     'POST /push/registered': onRegistered,
     // Where a call is transferred to when the app reports it is registered
     'POST /dial-now/*': vobiz(onDialNow),
+    // Where a call is transferred to when the user taps Decline
+    'POST /declined/*': vobiz(onDeclinedXml),
     'POST /push/decline': onDecline,
   };
 
@@ -136,7 +138,7 @@ export function createBridge(options = {}) {
     } catch (error) {
       log('!!', `${req.method} ${url.pathname} failed: ${error.stack || error}`);
       if (!res.headersSent) {
-        if (url.pathname === '/answer' || /^\/(dial-result|dial-now)\//.test(url.pathname)) {
+        if (url.pathname === '/answer' || /^\/(dial-result|dial-now|declined)\//.test(url.pathname)) {
           sendXml(res, '<Speak>Sorry, something went wrong. Please try again.</Speak><Hangup/>');
         } else {
           sendJson(res, 500, { error: 'Internal error' });
@@ -225,6 +227,7 @@ export function createBridge(options = {}) {
     const status = String(params.DialStatus || '').toLowerCase();
     const cause = params.DialHangupCause || params.DialBLegHangupCause || '';
     if (!call) return sendXml(res, '<Hangup/>');
+    if (call.finished === 'declined') return sendXml(res, declinedXml());
 
     const left = Math.round((call.deadline - Date.now()) / 1000);
     log('..', `Call ${short(id)} attempt ${call.attempts}: ${status || 'no status'}${cause ? ` (${cause})` : ''}, ${Math.max(left, 0)} s left`);
@@ -252,7 +255,7 @@ export function createBridge(options = {}) {
     if (call.declined) {
       finish(call, 'declined');
       endRinging(call, 'declined');
-      return sendXml(res, '<Hangup reason="busy"/>');
+      return sendXml(res, declinedXml());
     }
     if (left <= RINGBACK_SECONDS + 2) {
       finish(call, 'missed');
@@ -556,7 +559,42 @@ export function createBridge(options = {}) {
     if (call.finished) return sendJson(res, 200, { ok: true, finished: true });
     call.declined = true;
     log('ok', `Call ${short(call.id)} declined on the phone`);
-    sendJson(res, 200, { ok: true });
+    let busy = 'next_attempt';
+    if (!call.test) {
+      finish(call, 'declined');
+      endRinging(call, 'declined');
+      // Act now rather than at the next dial result (up to a ringback later,
+      // or never while the app's other phones are still ringing).
+      if (config.authId) {
+        try {
+          await vobizApi('POST', `/Call/${encodeURIComponent(call.id)}/`, {
+            legs: 'aleg',
+            aleg_url: `${publicBase()}/declined/${callRef(call.id)}`,
+            aleg_method: 'POST',
+          });
+          busy = 'transferred';
+        } catch (error) {
+          log('!!', `Call ${short(call.id)}: could not transfer to busy (${error.message}); the next dial result hangs up`);
+        }
+      }
+    }
+    sendJson(res, 200, { ok: true, busy });
+  }
+
+  /** The caller's leg after Decline: hear busy, then a busy rejection. */
+  async function onDeclinedXml(req, res) {
+    return sendXml(res, declinedXml());
+  }
+
+  /**
+   * Busy for a declined call. <Hangup reason="busy"> rejects the call
+   * unbilled only while it is unanswered; once a <Dial> has answered the
+   * caller's leg, Vobiz ends it as a normal hangup (docs: /xml/hangup). So the
+   * caller first hears a busy tone: as early media (not billed) if the call is
+   * still unanswered, as ordinary audio if it was answered.
+   */
+  function declinedXml() {
+    return `  <PreAnswer><Play>${esc(publicBase())}/busy.wav</Play></PreAnswer>\n  <Hangup reason="busy"/>`;
   }
 
   function callFor(body) {
@@ -1160,15 +1198,20 @@ function loadEnvFile(file) {
   }
 }
 
+function sendWav(res, wav) {
+  res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'public, max-age=3600' });
+  res.end(wav);
+}
+
 /**
- * Three seconds of the Indian ringback tone (400 Hz modulated at 25 Hz;
- * 0.4 s on, 0.2 s off, 0.4 s on, 2 s off) as 8 kHz 16-bit mono WAV.
+ * `seconds` of an Indian call-progress tone (400 Hz modulated at 25 Hz),
+ * sounding during `bursts` ([start, end] in seconds), as 8 kHz 16-bit mono
+ * WAV. Ringback: 0.4 s on, 0.2 s off, 0.4 s on, 2 s off. Busy: 0.75 s on/off.
  */
-function makeRingbackWav(seconds) {
+function makeToneWav(seconds, bursts) {
   const rate = 8000;
   const samples = rate * seconds;
   const pcm = Buffer.alloc(samples * 2);
-  const bursts = [[0, 0.4], [0.6, 1.0]];
   for (let i = 0; i < samples; i += 1) {
     const t = i / rate;
     const burst = bursts.find(([start, end]) => t >= start && t < end);
