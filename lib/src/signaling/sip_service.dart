@@ -392,6 +392,42 @@ class SipBuilder {
     return response(request: invite, code: 486, reason: 'Busy Here', localTag: localTag);
   }
 
+  /// An in-dialog re-INVITE carrying a new offer, used to hold (`a=sendonly`)
+  /// and resume (`a=sendrecv`) the call (RFC 3264 8.4, RFC 6337 5.3).
+  static String reInvite({
+    required String requestUri,
+    required String fromUser,
+    required String toHeader,
+    required String sipServer,
+    required String localTag,
+    required String callId,
+    required int cseq,
+    required String contactUri,
+    required String sdp,
+    String? authHeaderName,
+    String? authHeader,
+    List<String> routes = const <String>[],
+  }) {
+    return <String>[
+      'INVITE $requestUri SIP/2.0',
+      'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bK${_branch()}',
+      for (final route in routes) 'Route: $route',
+      'From: <sip:$fromUser@$sipServer>;tag=$localTag',
+      'To: $toHeader',
+      'Call-ID: $callId',
+      'CSeq: $cseq INVITE',
+      'Contact: <$contactUri>',
+      'Max-Forwards: 70',
+      'Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, INFO',
+      'User-Agent: vobiz_flutter_sdk',
+      if (authHeaderName != null && authHeader != null) '$authHeaderName: $authHeader',
+      'Content-Type: application/sdp',
+      'Content-Length: ${utf8.encode(sdp).length}',
+      '',
+      sdp,
+    ].join('\r\n');
+  }
+
   static String _branch() =>
       Random().nextInt(0x7fffffff).toRadixString(16).padLeft(8, '0');
 }
@@ -516,6 +552,13 @@ class SIPService {
   String? _pendingInfoBody;
   int _infoAuthAttempts = 0;
 
+  // The hold/resume re-INVITE in flight (see reInvite).
+  Completer<String>? _reInvite;
+  String? _reInviteSdp;
+  int? _reInviteCSeq;
+  int _reInviteAuthAttempts = 0;
+  Timer? _reInviteTimer;
+
   WebSocketChannel? _socket;
   Timer? _registrationRefreshTimer;
   Timer? _optionsKeepAliveTimer;
@@ -611,6 +654,31 @@ class SIPService {
     return true;
   }
 
+  /// Sends a re-INVITE with [sdp] on the established call (hold or resume)
+  /// and completes with the SDP of the 200 OK, after acknowledging it.
+  /// Fails with [SipRequestFailed] on a final error response, if the call
+  /// ends first, or after [timeout] (RFC 3261 Timer B).
+  Future<String> reInvite(
+    String sdp, {
+    Duration timeout = const Duration(seconds: 32),
+  }) {
+    if (!hasActiveDialog || _username == null) {
+      return Future<String>.error(StateError('No connected call to renegotiate'));
+    }
+    if (_reInvite != null) {
+      return Future<String>.error(StateError('A hold or resume is already in progress'));
+    }
+    final completer = Completer<String>();
+    _reInvite = completer;
+    _reInviteSdp = sdp;
+    _reInviteAuthAttempts = 0;
+    _reInviteTimer = Timer(timeout, () {
+      _finishReInvite(error: SipRequestFailed('No answer to the re-INVITE', null));
+    });
+    _sendReInvite();
+    return completer.future;
+  }
+
   void answer(String sdp) {
     if (_pendingInvite == null) return;
     _lastAnsweredInvite = _pendingInvite;
@@ -703,6 +771,84 @@ class SIPService {
       authHeader: authHeader,
       routes: _routeSet,
     ));
+  }
+
+  void _sendReInvite({String? authHeaderName, String? authHeader}) {
+    final sdp = _reInviteSdp;
+    if (sdp == null || _activeCallId == null || _username == null) return;
+    _reInviteCSeq = _cseq;
+    _send(SipBuilder.reInvite(
+      requestUri: _inDialogRequestUri(),
+      fromUser: _username!,
+      toHeader: _activeRemotePartyHeader ?? _buildFallbackToHeader(),
+      sipServer: sipServer,
+      localTag: _localTag,
+      callId: _activeCallId!,
+      cseq: _cseq++,
+      contactUri: _contactUri,
+      sdp: sdp,
+      authHeaderName: authHeaderName,
+      authHeader: authHeader,
+      routes: _routeSet,
+    ));
+  }
+
+  void _finishReInvite({String? sdp, Object? error}) {
+    final completer = _reInvite;
+    _reInvite = null;
+    _reInviteSdp = null;
+    _reInviteCSeq = null;
+    _reInviteTimer?.cancel();
+    _reInviteTimer = null;
+    if (completer == null || completer.isCompleted) return;
+    if (error != null) {
+      completer.completeError(error);
+    } else {
+      completer.complete(sdp ?? '');
+    }
+  }
+
+  /// A response to our hold/resume re-INVITE. It never ends the call: a
+  /// refusal only means the old session stays as it was (RFC 3261 14.1).
+  void _handleReInviteResponse(SipMessage msg) {
+    final code = msg.statusCode;
+    if (code < 200) return;
+    if (code < 300) {
+      _send(SipBuilder.ack(
+        requestUri: _inDialogRequestUri(),
+        fromUser: _username!,
+        toHeader: _activeRemotePartyHeader ?? _buildFallbackToHeader(),
+        sipServer: sipServer,
+        localTag: _localTag,
+        callId: _activeCallId!,
+        cseq: _reInviteCSeq ?? _extractCSeqNumber(msg.header('CSeq')),
+        routes: _routeSet,
+      ));
+      _finishReInvite(sdp: msg.body);
+      return;
+    }
+    if ((code == 401 || code == 407) && _reInviteAuthAttempts == 0 &&
+        _password != null) {
+      _reInviteAuthAttempts++;
+      final auth = SipDigestAuth.buildAuthHeader(
+        wwwAuthenticate: msg.header('Proxy-Authenticate') ??
+            msg.header('WWW-Authenticate') ??
+            '',
+        method: 'INVITE',
+        uri: _inDialogRequestUri(),
+        username: _username!,
+        password: _password!,
+      );
+      if (auth != null) {
+        _sendReInvite(
+          authHeaderName: code == 407 ? 'Proxy-Authorization' : 'Authorization',
+          authHeader: auth,
+        );
+        return;
+      }
+    }
+    _finishReInvite(
+        error: SipRequestFailed('re-INVITE refused ($code ${_reasonPhrase(msg)})', code));
   }
 
   String _inDialogRequestUri() =>
@@ -963,6 +1109,12 @@ class SIPService {
     final uuid = _nonEmpty(msg.header('X-Calluuid'));
     if (uuid != null) _callUuid = uuid;
 
+    if (_reInviteCSeq != null &&
+        _extractCSeqNumber(msg.header('CSeq')) == _reInviteCSeq) {
+      _handleReInviteResponse(msg);
+      return;
+    }
+
     switch (msg.statusCode) {
       case 100:
         break;
@@ -1140,6 +1292,7 @@ class SIPService {
     _activeExtraHeaders = const <String, String>{};
     _pendingInfoBody = null;
     _routeSet = const <String>[];
+    _finishReInvite(error: SipRequestFailed('The call ended', null));
   }
 
   /// Whether [msg] belongs to the current call. A CANCEL or BYE for some
@@ -1209,4 +1362,15 @@ class SIPService {
       (_) => chars[rand.nextInt(chars.length)],
     ).join();
   }
+}
+
+/// A SIP request the far end refused or never answered.
+class SipRequestFailed implements Exception {
+  SipRequestFailed(this.message, this.statusCode);
+
+  final String message;
+  final int? statusCode;
+
+  @override
+  String toString() => message;
 }
