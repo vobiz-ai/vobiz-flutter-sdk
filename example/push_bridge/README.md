@@ -15,17 +15,19 @@ something has to send that push: this bridge.
 caller ──> your Vobiz number ──> Vobiz ──> POST /answer on this bridge
                                               │
              ┌────────────────────────────────┴───────────────────────────┐
-             │ 1. Firebase push (high priority) ──> phone shows the call   │
-             │ 2. <Dial><User>sip:your-endpoint</User></Dial> right away   │
+             │ 1. <Dial><User>sip:your-endpoint</User></Dial> right away   │
+             │    (only the endpoints ROUTES maps the dialled number to)  │
              │      app open: it rings at once                             │
              │      app closed: the endpoint is offline, the dial fails,   │
              │      and the caller hears ringback while the bridge dials   │
              │      again every 3 seconds                                  │
+             │ 2. in parallel, a Firebase push to that endpoint's phones   │
              └─────────────────────────────────────────────────────────────┘
-user taps Accept ──> app opens, signs in with the saved credentials ──> the next
-dial reaches it ──> the app answers by itself
-user taps Decline ──> app tells the bridge ──> the caller hears busy
-caller hangs up ──> Vobiz calls /hangup ──> a push stops the phone ringing
+app's SIP REGISTER succeeds ──> POST /push/registered ──> the bridge dials it now
+user taps Accept ──> the dial reaches the app ──> it answers by itself
+user taps Decline ──> app tells the bridge ──> caller hears busy, other phones stop
+another phone answers ──> a push stops the other phones (answered_elsewhere)
+caller hangs up ──> Vobiz calls /hangup ──> a push stops the phones ringing
 ```
 
 ## What you need
@@ -47,7 +49,13 @@ caller hangs up ──> Vobiz calls /hangup ──> a push stops the phone ringi
 cd example/push_bridge
 cp .env.example .env        # then fill it in: PUBLIC_URL, FIREBASE_SERVICE_ACCOUNT, VOBIZ_*
 node push-bridge.mjs        # or: npm start
+npm test                    # node:test, local fakes only: no Vobiz or Firebase calls
 ```
+
+It will not start without an `https://` `PUBLIC_URL` and `VOBIZ_AUTH_TOKEN`: both
+go into every Vobiz webhook signature, and without them anyone who finds the
+tunnel could ring your phones. For a local experiment only,
+`ALLOW_UNSIGNED_WEBHOOKS=true` starts it anyway and says so in the log.
 
 On start-up it checks everything and says what it found:
 
@@ -57,13 +65,17 @@ On start-up it checks everything and says what it found:
 [18:10:03] ok Tunnel: https://example.trycloudflare.com reaches this server
 [18:10:04] ok Vobiz: application Vobiz_Flutter_Push_Bridge now answers at https://example.trycloudflare.com/answer
 [18:10:04] ok Vobiz: +919876543210 now rings this bridge
-[18:10:04] ok Webhooks: Vobiz signatures are checked
-[18:10:04] .. Apps registered: none yet
+[18:10:04] ok Webhooks: Vobiz signatures (V3/V2) and nonces are checked
+[18:10:04] .. Phones registered: none yet
 
-  In the app: Identity tab → Incoming calls → Push server, paste this line:
+  Pair a phone: Identity tab → Incoming calls → Push server, paste this line:
 
     https://example.trycloudflare.com#key=…
 ```
+
+The pairing line is printed once, when the bridge key is created. Later it is
+`bridgeKey` in `bridge-state.json` (readable by your user only) or your
+`BRIDGE_KEY`.
 
 With `VOBIZ_AUTH_ID`, `VOBIZ_AUTH_TOKEN` and `VOBIZ_NUMBER` set, the bridge creates
 (or updates) the application `Vobiz_Flutter_Push_Bridge` with its answer and hangup
@@ -73,8 +85,13 @@ the application yourself in the Vobiz Console with answer URL `<PUBLIC_URL>/answ
 and hangup URL `<PUBLIC_URL>/hangup` (both POST), and attach the number.
 
 A quick tunnel gets a new address each time it starts. Put the new one in
-`PUBLIC_URL`, restart the bridge (it re-points the application), and paste the new
-line it prints into the app.
+`PUBLIC_URL`, restart the bridge (it re-points the application), and change the
+address in the app; the phone keeps its device token.
+
+**More than one endpoint?** Set `ROUTES` so each number rings only its own
+endpoints, e.g. `ROUTES=+919876543210=alice;+918000000000=bob,carol`. Without
+`ROUTES` the bridge rings the one endpoint that has registered a phone; if phones
+are registered for several endpoints it rings none of them and says so in the log.
 
 ## In the app
 
@@ -106,9 +123,10 @@ Disconnecting in the app unregisters the phone; closing the app does not.
 | `RING_SECONDS` | `45` | How long a caller waits for the app |
 | `CALLER_ID_MODE` | `number` | `number`: the app's SIP call shows your Vobiz number, as the web Playground does. `caller`: pass the real caller through |
 | `SIP_HEADER_STYLE` | `suffix` | How the call reference is written in `<User sipHeaders>`; Vobiz's docs show both `RefX-VH=` and `Ref=` |
-| `VERIFY_SIGNATURES` | `true` | Reject webhooks without a valid `X-Vobiz-Signature-V3` (needs the Auth Token) |
-| `ALWAYS_RING` | — | Endpoints to ring even if no app registered, comma separated |
-| `BRIDGE_KEY` | generated | The key the app sends; saved in `bridge-state.json` |
+| `ROUTES` | — | Which endpoints each number rings: `+91…=alice,bob;+91…=carol` |
+| `ALWAYS_RING` | — | Endpoints to ring even if no app registered, comma separated (not pushed) |
+| `BRIDGE_KEY` | generated | The pairing key; saved in `bridge-state.json` |
+| `ALLOW_UNSIGNED_WEBHOOKS` | `false` | `true` accepts webhooks without a Vobiz signature. Local tests only |
 
 Whatever the caller ID mode, the push shows the real caller, and the bridge passes
 the real caller to the app in a SIP header as well.
@@ -117,29 +135,90 @@ the real caller to the app in a SIP header as well.
 
 | Route | Called by | Purpose |
 |---|---|---|
-| `POST /answer` | Vobiz | An inbound call: push, then dial the endpoint |
-| `POST /dial-result` | Vobiz | One dial attempt ended: dial again, or hang up |
-| `POST /dial-events` | Vobiz | Live events for the leg ringing the app. Only an answer event here counts as answered: Vobiz can report `DialStatus=completed` for a ring nobody picked up |
-| `POST /hangup` | Vobiz | The caller's leg ended: stop the phone ringing |
-| `GET /ringback.wav` | Vobiz | Three seconds of ringback, played between attempts |
-| `POST /push/register`, `/push/unregister` | the app | Ring this endpoint on this device (needs the bridge key) |
-| `POST /push/test` | the app | A pretend call (needs the bridge key) |
+| `POST /answer` | Vobiz | An inbound call: dial the endpoint, push its phones |
+| `POST /dial-result/<call>.<tag>` | Vobiz | One dial attempt ended: dial again, or hang up |
+| `POST /dial-events/<call>.<tag>` | Vobiz | Live events for the leg ringing the app. Only an answer event here counts as answered: Vobiz can report `DialStatus=completed` for a ring nobody picked up |
+| `POST /dial-now/<call>.<tag>` | Vobiz | The caller's leg, transferred here when the app reports it is registered: dial now |
+| `POST /declined/<call>.<tag>` | Vobiz | The caller's leg, transferred here on Decline: busy tone, then busy |
+| `POST /hangup` | Vobiz | The caller's leg ended: stop the phones ringing |
+| `GET /ringback.wav`, `/busy.wav` | Vobiz | Three seconds of ringback / busy tone |
+| `POST /push/register` | the app | Pair (bridge key) or update (device token) this phone |
+| `POST /push/unregister`, `/push/test` | the app | Forget / test-push this phone (device token) |
+| `POST /push/registered` | the app | The app's SIP registration succeeded: dial it now (call key or device token) |
 | `POST /push/accept`, `/push/decline` | the app | The user's answer (needs that call's key from the push) |
 | `GET /health` | anyone | `{"ok": true}` |
 
+Every Vobiz route needs a valid signature. `<call>.<tag>` is the Vobiz CallUUID and
+an HMAC the bridge made, so the signed URL (Vobiz signs the URL, not the body or
+query string) names the call.
+
+## App ↔ bridge protocol
+
+All app requests are JSON `POST`s. `<device_token>` is what pairing returned.
+
+| Request | Auth | Body | Response |
+|---|---|---|---|
+| `/push/register` (pair) | `X-Bridge-Key: <bridge key>` | `{username, token?, platform?, app?}` | `{ok, username, push, device_id, device_token}`. Store `device_token`; it is shown only once. 401 bad key, 403 username is not an endpoint on the account, 503 Vobiz could not be asked |
+| `/push/register` (update, e.g. new FCM token or username) | `Authorization: Bearer <device_token>` | same | `{ok, username, push, device_id}` |
+| `/push/unregister` | `Authorization: Bearer <device_token>` | `{}` | `{ok}`; the device token stops working |
+| `/push/test` | `Authorization: Bearer <device_token>` | `{delay_seconds?}` | `{ok, call_id, sending_in_seconds}`; pushes this phone only |
+| `/push/registered` | none (call key) | `{call_id, call_key}` | `{ok, redial: "transferred" \| "next_attempt" \| "finished" \| "test", finished}` |
+| `/push/registered` | `Authorization: Bearer <device_token>` | `{}` | `{ok, calls: {<call_id>: …}}` for every call ringing this endpoint |
+| `/push/accept` | none (call key) | `{call_id, call_key}` | `{ok, test}`, or `{ok, finished: true, reason}` if the call is over |
+| `/push/decline` | none (call key) | `{call_id, call_key}` | `{ok, busy: "transferred" \| "next_attempt"}`, or `{ok, finished: true}`. There is no decline by username or caller number any more |
+
+Push messages (FCM data, all values strings):
+
+- `incoming_call`: `call_id`, `call_key`, `caller`, `callee`, `server`, `sent_at`,
+  **`ttl_ms`** (milliseconds the call can still ring when the bridge sent it; expire
+  the call screen `ttl_ms` after the push arrives, never by comparing `expires_at`
+  with the phone's clock), `expires_at` (bridge clock, for older builds only),
+  `line_busy: "1"` when the endpoint is already on a call through the bridge (show
+  call waiting, not the full-screen ringing screen), `test: "1"` for test calls.
+- `call_ended`: `call_id`, `reason`: `caller_hung_up`, `answered_elsewhere` (with
+  `answered_by` when Vobiz names the endpoint), `declined`, `missed`, `busy`,
+  `completed`. A phone already in the call (SIP `PushRef` = `call_id`) ignores
+  `answered_elsewhere`; any other phone stops ringing without a missed-call entry.
+
+The SIP INVITE for a pushed call carries a `PushRef` header (written `PushRefX-VH=`
+or `PushRef=` in `<User sipHeaders>`, see `SIP_HEADER_STYLE`) equal to `call_id`, on
+every attempt. The app should auto-answer an
+accepted call only when `PushRef` equals that `call_id`, never by caller or callee
+number. The app should call `/push/registered` as soon as its REGISTER gets a 200
+while a pushed call is ringing.
+
 ## Security
 
-- The app needs the bridge key to register; accept and decline need a per-call key
-  that only the pushed phone receives.
-- With `VOBIZ_AUTH_TOKEN` set, every webhook must carry a valid Vobiz signature.
-- `.env`, `bridge-state.json` and service account keys are git-ignored. Do not commit
-  them.
+- Webhooks fail closed: every Vobiz request needs a valid V3 (or V2) signature over
+  `PUBLIC_URL` + path, and each nonce is accepted once (remembered for 30 minutes,
+  across restarts). Vobiz nonces are random and nothing is timestamped, so there is
+  no clock-based freshness check. Vobiz signs only callback URLs that have
+  credentials configured; if your log shows "no X-Vobiz-Signature headers", set
+  them on the application.
+- The bridge key only pairs a phone. Each phone then has its own device token (the
+  bridge stores a hash), and can only update, test or remove itself. With
+  `VOBIZ_AUTH_ID` set, only endpoints on your account can be registered.
+- Calls are pushed only to the phones of the endpoints that number rings.
+- Accept, decline and "registered" need the per-call key that only those phones
+  receive.
+- `bridge-state.json` (bridge key, device hashes, push tokens, nonces) is written
+  `0600`. `.env`, `bridge-state.json` and service account keys are git-ignored. Do
+  not commit them.
+- Not done: proving that a phone holds the endpoint's SIP password. Whoever has the
+  bridge key can still pair a phone for any endpoint on the account, so treat the
+  key like a password.
 
 ## Limits
 
 - Android only. iOS needs PushKit and an APNs VoIP certificate, which this example
   does not set up.
-- Every endpoint that has registered rings for every inbound call to the number.
+- Decline: `<Hangup reason="busy">` rejects a call unbilled only while it is
+  unanswered. Whether the caller's leg is already answered (and billed) once the
+  first `<Dial>` has run has not been checked on a CDR yet; the caller hears a busy
+  tone either way.
+- The transfer to `/dial-now` and `/declined` uses the Vobiz Transfer API, which
+  needs `VOBIZ_AUTH_ID` and a call in progress; if it fails, the next dial attempt
+  does the same thing a few seconds later.
 - Calls in progress live in memory: restarting the bridge mid-call drops them.
 - Swiping the app from Recents is fine; **Force stop** (Settings → Apps) is not:
   Android delivers no push to a force-stopped app until it is opened again.
