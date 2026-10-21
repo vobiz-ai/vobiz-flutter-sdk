@@ -29,6 +29,25 @@ enum TransferTarget { number, user }
 
 enum TransferStatus { idle, submitting, accepted, failed }
 
+/// Who a transfer moves, as the user sees it.
+enum TransferParty { me, other, both }
+
+/// The Redirect API's `legs` for [party] on a call in [direction].
+///
+/// Vobiz names legs by the call, not by this app: the A-leg is the side
+/// that started the call and the B-leg the side `<Dial>` reached. On a
+/// call this app placed, the app is the A-leg. On a call that rang this
+/// app (the bridge's `<Dial><User>`), the caller is the A-leg and the app
+/// the B-leg, so "move me" is `bleg`.
+TransferLeg transferLegFor(TransferParty party, CallDirection? direction) {
+  final inbound = direction == CallDirection.inbound;
+  return switch (party) {
+    TransferParty.both => TransferLeg.both,
+    TransferParty.me => inbound ? TransferLeg.bLeg : TransferLeg.aLeg,
+    TransferParty.other => inbound ? TransferLeg.aLeg : TransferLeg.bLeg,
+  };
+}
+
 class LogEntry {
   LogEntry(this.message, this.type) : time = DateTime.now();
 
@@ -202,7 +221,10 @@ class PlaygroundController extends ChangeNotifier {
 
   // ── Transfer ────────────────────────────────────────────────────────────────
   TransferTarget transferTarget = TransferTarget.number;
-  TransferLeg transferLeg = TransferLeg.aLeg;
+  TransferParty transferParty = TransferParty.me;
+
+  /// The `legs` value the current call's transfer will send.
+  TransferLeg get transferLeg => transferLegFor(transferParty, client.callDirection);
   String transferIso = 'IN';
   String transferNumber = '';
   String transferUser = '';
@@ -655,7 +677,12 @@ class PlaygroundController extends ChangeNotifier {
 
     transferStatus = TransferStatus.submitting;
     transferError = '';
-    log('↗️ Transferring ${transferLeg == TransferLeg.aLeg ? 'you' : 'the other party'} '
+    final who = switch (transferParty) {
+      TransferParty.me => 'you',
+      TransferParty.other => 'the other party',
+      TransferParty.both => 'both parties',
+    };
+    log('↗️ Transferring $who (legs=${transferLeg.apiValue}) '
         'to $transferDestination '
         '${transferTarget == TransferTarget.user ? '(with headers)' : '(blind)'}...',
         LogType.event);
