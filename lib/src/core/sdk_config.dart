@@ -1,3 +1,5 @@
+import '../network/keep_alive.dart';
+import '../network/reconnect_policy.dart';
 import '../webrtc/ice_config.dart';
 import '../webrtc/media_constraints.dart';
 
@@ -38,6 +40,9 @@ class SdkConfig {
     this.iceConfig = const IceConfig(),
     this.mediaConstraints = const MediaConstraints(),
     this.unsafeDemoZeroConfig = false,
+    this.reconnectPolicy = const ReconnectPolicy(),
+    this.keepAlive = const KeepAliveConfig(),
+    this.watchNetwork = true,
   });
 
   /// The hosted Vobiz WebRTC Playground server: the "production webhook
@@ -114,4 +119,22 @@ class SdkConfig {
   /// Defaults to false; the operations above then throw
   /// [VobizDemoModeRequiredException].
   final bool unsafeDemoZeroConfig;
+
+  /// Backoff and retry cap for [autoReconnect].
+  ///
+  /// Defaults to 1 s doubling to 30 s, giving up after 10 attempts with a
+  /// `reconnect_failed` error and [ConnectionStateStatus.failed]. The client
+  /// tries again when the network changes or the app calls
+  /// `VobizClient.reconnect()`.
+  final ReconnectPolicy reconnectPolicy;
+
+  /// How the signalling WebSocket is kept open and how fast a dead one is
+  /// noticed. Defaults to a WebSocket ping every 15 s (dead within 30 s).
+  final KeepAliveConfig keepAlive;
+
+  /// Watch the device's network (Wi-Fi, mobile, offline) and react at once:
+  /// fail calls fast while offline, and reconnect and re-register as soon as
+  /// the network comes back or changes. Without it a lost network is noticed
+  /// only by the keep-alive.
+  final bool watchNetwork;
 }

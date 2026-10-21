@@ -17,6 +17,13 @@ export 'src/utils/logger.dart' show Logger, LogWriter;
 export 'src/webrtc/ice_config.dart';
 export 'src/webrtc/media_constraints.dart';
 
+// ── Network ───────────────────────────────────────────────────────────────────
+export 'src/network/connectivity_monitor.dart';
+export 'src/network/keep_alive.dart' show KeepAliveConfig;
+export 'src/network/network_event.dart';
+export 'src/network/reconnect_policy.dart';
+export 'src/network/turn_servers.dart';
+
 // ── Authentication ────────────────────────────────────────────────────────────
 export 'src/auth/credentials_provider.dart';
 export 'src/backend/backend_credentials_provider.dart';
