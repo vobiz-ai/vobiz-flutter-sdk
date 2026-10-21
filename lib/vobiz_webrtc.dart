@@ -1,3 +1,9 @@
+/// Make and receive Vobiz calls from Flutter: SIP over WebSocket for
+/// signalling, WebRTC for audio.
+///
+/// Start with [VobizClient]. Sign in with per-user SIP credentials from your
+/// own backend ([VobizClientCredentialsProvider.connectWithCredentialsProvider]);
+/// the account Auth Token never belongs on a device.
 library vobiz_webrtc;
 
 // ── Core ──────────────────────────────────────────────────────────────────────
@@ -11,6 +17,8 @@ export 'src/webrtc/ice_config.dart';
 export 'src/webrtc/media_constraints.dart';
 
 // ── Authentication ────────────────────────────────────────────────────────────
+export 'src/auth/credentials_provider.dart';
+export 'src/backend/backend_credentials_provider.dart';
 export 'src/models/auth/auth_mode.dart';
 export 'src/models/auth/credential_config.dart';
 export 'src/models/auth/token_config.dart';
