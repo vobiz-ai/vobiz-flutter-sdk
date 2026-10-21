@@ -1,6 +1,4 @@
-import 'package:meta/meta.dart';
-
-@internal
+/// What the UI can do with a call in its current state ([CallSession.actions]).
 class CallActions {
   const CallActions({
     this.canAnswer = false,

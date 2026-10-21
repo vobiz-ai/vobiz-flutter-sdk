@@ -11,6 +11,7 @@ export 'src/core/sdk_config.dart';
 export 'src/core/sip_headers.dart';
 export 'src/core/vobiz_client.dart';
 export 'src/errors/vobiz_exception.dart';
+export 'src/utils/logger.dart' show Logger, LogWriter;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 export 'src/webrtc/ice_config.dart';
@@ -24,11 +25,16 @@ export 'src/models/auth/credential_config.dart';
 export 'src/models/auth/token_config.dart';
 export 'src/models/auth/zero_config_session.dart';
 
+// ── Calls ─────────────────────────────────────────────────────────────────────
+export 'src/calls/call_actions.dart';
+export 'src/calls/call_session.dart';
+
 // ── Events ────────────────────────────────────────────────────────────────────
 export 'src/events/call_event.dart';
 export 'src/events/connection_event.dart';
 export 'src/events/error_event.dart';
 export 'src/events/media_event.dart';
+export 'src/events/sdk_event.dart';
 
 // ── Models ────────────────────────────────────────────────────────────────────
 export 'src/models/call/call_direction.dart';

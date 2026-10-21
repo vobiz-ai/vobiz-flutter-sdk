@@ -1,9 +1,7 @@
-import 'package:meta/meta.dart';
-
 typedef LogWriter = void Function(String message);
 
-@internal
-
+/// Where the SDK writes its log lines. Pass one to `VobizClient(logger:)`
+/// to route SDK logs into your own logging; [writer] receives each line.
 class Logger {
   Logger({LogWriter? writer}) : _writer = writer;
 
