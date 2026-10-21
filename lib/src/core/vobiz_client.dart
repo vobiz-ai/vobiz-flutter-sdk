@@ -61,6 +61,7 @@ class VobizClient {
     Logger? logger,
     http.Client? httpClient,
     Duration setupTimeout = _defaultSetupTimeout,
+    Duration networkLossGrace = _defaultNetworkLossGrace,
   }) : this._(
           config: config,
           logger: logger ?? Logger(),
@@ -68,6 +69,7 @@ class VobizClient {
           sip: sip,
           peer: peer,
           setupTimeout: setupTimeout,
+          networkLossGrace: networkLossGrace,
         );
 
   VobizClient._({
@@ -77,6 +79,7 @@ class VobizClient {
     SIPService? sip,
     PeerService? peer,
     Duration setupTimeout = _defaultSetupTimeout,
+    Duration networkLossGrace = _defaultNetworkLossGrace,
   })  : _config = config,
         _logger = logger,
         _sip = sip ??
@@ -94,6 +97,7 @@ class VobizClient {
         _http = httpClient ?? http.Client(),
         _ownsHttp = httpClient == null,
         _setupTimeout = setupTimeout,
+        _networkLossGrace = networkLossGrace,
         backendUrl = config.backendUrl {
     _api = WebhookServerApi(client: _http);
     _wireSip();
@@ -104,6 +108,10 @@ class VobizClient {
   /// responded, ringing is bounded by the server's `<Dial timeout>` instead.
   static const Duration _defaultSetupTimeout = Duration(seconds: 30);
 
+  /// How long a connected call may survive a dropped socket or lost media
+  /// (ICE failed/disconnected) before it is ended as `network_lost`.
+  static const Duration _defaultNetworkLossGrace = Duration(seconds: 12);
+
   final SdkConfig _config;
   final Logger _logger;
   final SIPService _sip;
@@ -112,6 +120,7 @@ class VobizClient {
   final bool _ownsHttp;
   late final WebhookServerApi _api;
   final Duration _setupTimeout;
+  final Duration _networkLossGrace;
 
   /// Public base URL of the webhook server (see [SdkConfig.backendUrl]).
   ///
@@ -149,6 +158,11 @@ class VobizClient {
   // The call whose 200 OK has been applied, so a retransmitted 200 is not
   // applied (and reported as failing) a second time.
   String? _answeredCallId;
+
+  // A connected call riding out a dropped socket or lost media.
+  Timer? _networkLossTimer;
+  bool _signalingLost = false;
+  bool _mediaLost = false;
 
   // The current call's details
   CallDirection? _direction;
@@ -304,11 +318,19 @@ class VobizClient {
     return _connectWithCredentials(config.username, config.password);
   }
 
+  /// Signs out. A call in progress is ended first, while the socket is still
+  /// open: a ringing call is declined (480) and any other gets a BYE, so the
+  /// far end is not left talking to a closed socket.
   Future<void> disconnect() async {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempts = 0;
     _clearCallSetupTimer();
+    final callId = _callId;
+    if (callId != null) {
+      await _terminate(callId,
+          message: 'Signed out', reason: 'disconnected', declineCode: 480);
+    }
     _sip.disconnect();
     await _peer.disposeAllCalls();
     _callId = null;
@@ -693,6 +715,10 @@ class VobizClient {
         registrationState: _registrationState,
         message: 'Registered',
       ));
+      if (_signalingLost) {
+        _signalingLost = false;
+        _checkNetworkRecovered();
+      }
     };
 
     _sip.onRegistrationFailed = (reason) {
@@ -708,13 +734,16 @@ class VobizClient {
 
     _sip.onSocketError = (reason) {
       _registrationState = RegistrationState.unregistered;
-      _connectionState = ConnectionStateStatus.disconnected;
+      _connectionState = _config.autoReconnect
+          ? ConnectionStateStatus.reconnecting
+          : ConnectionStateStatus.disconnected;
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
         message: 'Socket error: $reason',
       ));
       _emitError('socket_error', reason, null);
+      _onSignalingLost();
       if (_config.autoReconnect) _scheduleReconnect();
     };
 
@@ -757,6 +786,7 @@ class VobizClient {
         if (_callId != id) return;
         _callState = CallStateStatus.active;
         _emitCallEvent(id, CallStateStatus.active, 'Call connected');
+        if (_mediaLost) _startNetworkLossTimer(id);
       } catch (e) {
         // The call is answered (and billed) but has no audio. The SIP layer
         // has already ACKed the 200, so end it with a BYE rather than leave
@@ -798,6 +828,27 @@ class VobizClient {
       _emitError('call_failed', reason, null);
     };
 
+    _peer.onIceConnectionState = (callId, state) {
+      if (callId != _callId) return;
+      switch (state) {
+        case RTCIceConnectionState.RTCIceConnectionStateFailed:
+        case RTCIceConnectionState.RTCIceConnectionStateDisconnected:
+          _mediaLost = true;
+          if (_callState == CallStateStatus.active ||
+              _callState == CallStateStatus.held) {
+            _startNetworkLossTimer(callId);
+          }
+          break;
+        case RTCIceConnectionState.RTCIceConnectionStateConnected:
+        case RTCIceConnectionState.RTCIceConnectionStateCompleted:
+          _mediaLost = false;
+          _checkNetworkRecovered();
+          break;
+        default:
+          break;
+      }
+    };
+
     _peer.mediaEvents.listen((MediaEvent event) {
       _mediaEvents.addIfOpen(event);
     });
@@ -816,6 +867,11 @@ class VobizClient {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempts = 0;
+    final callId = _callId;
+    if (callId != null) {
+      unawaited(_terminate(callId,
+          message: 'Signed out', reason: 'disconnected', declineCode: 480));
+    }
     if (_sip.connectionState.value != SipConnectionState.disconnected) {
       _sip.disconnect();
     }
@@ -886,7 +942,9 @@ class VobizClient {
         'Reconnecting in ${delaySeconds}s (attempt $_reconnectAttempts)');
     _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
       if (_connectionState == ConnectionStateStatus.connected) return;
-      _sip.disconnect();
+      // Keep a connected call's dialog: once registered again it can still
+      // be hung up, and the far end's BYE still matches it.
+      _sip.disconnect(keepCall: _callId != null);
       try {
         await _connectWithCredentials(username, password);
       } catch (_) {
@@ -944,6 +1002,7 @@ class VobizClient {
       }
       _callState = CallStateStatus.active;
       _emitCallEvent(callId, CallStateStatus.active, 'Call connected');
+      if (_mediaLost) _startNetworkLossTimer(callId);
     } catch (e, st) {
       if (_callId != callId) {
         // Cancelled while answering; that path has already cleaned up.
@@ -984,6 +1043,56 @@ class VobizClient {
   void _clearCallSetupTimer() {
     _callSetupTimer?.cancel();
     _callSetupTimer = null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — network loss during a call
+  // ---------------------------------------------------------------------------
+
+  /// The socket dropped. A connected call's media may well still be flowing,
+  /// so it gets [_networkLossGrace] to reconnect and re-register. A call
+  /// still being set up cannot be completed over a new connection (its
+  /// INVITE transaction belonged to the old one), so it ends now.
+  void _onSignalingLost() {
+    final id = _callId;
+    if (id == null) return;
+    if (_callState == CallStateStatus.active ||
+        _callState == CallStateStatus.held) {
+      _signalingLost = true;
+      _startNetworkLossTimer(id);
+      return;
+    }
+    unawaited(_terminate(id,
+        message: 'Network connection lost', reason: 'network_lost'));
+  }
+
+  void _startNetworkLossTimer(String callId) {
+    if (_networkLossTimer != null) return;
+    _logger.warn('Call $callId lost its network connection; waiting '
+        '${_networkLossGrace.inSeconds}s for it to come back');
+    _emitCallEvent(callId, _callState, 'Reconnecting', reason: 'reconnecting');
+    _networkLossTimer = Timer(_networkLossGrace, () async {
+      _networkLossTimer = null;
+      if (_callId != callId) return;
+      _logger.warn('Call $callId did not recover; ending it');
+      await _terminate(callId,
+          message: 'Network connection lost', reason: 'network_lost');
+      _emitError('network_lost', 'The call was lost with the network', null);
+    });
+  }
+
+  /// Signalling is registered again and media is flowing: the call survived.
+  void _checkNetworkRecovered() {
+    final id = _callId;
+    if (id == null || _networkLossTimer == null) return;
+    if (_signalingLost || _mediaLost) return;
+    _clearNetworkLossTimer();
+    _emitCallEvent(id, _callState, 'Reconnected', reason: 'reconnected');
+  }
+
+  void _clearNetworkLossTimer() {
+    _networkLossTimer?.cancel();
+    _networkLossTimer = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -1061,6 +1170,9 @@ class VobizClient {
     if (_callId != callId) return;
     _callId = null;
     _clearCallSetupTimer();
+    _clearNetworkLossTimer();
+    _signalingLost = false;
+    _mediaLost = false;
     _callUuid = _sip.callUuid ?? _callUuid;
     _callState = CallStateStatus.ended;
     _emitCallEvent(

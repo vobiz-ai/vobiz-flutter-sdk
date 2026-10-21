@@ -86,6 +86,7 @@ class FakePeer extends PeerService {
 class Harness {
   Harness({
     Duration setupTimeout = const Duration(seconds: 30),
+    Duration networkLossGrace = const Duration(seconds: 12),
   }) {
     sip = SIPService(wsUrl: 'wss://example.invalid', sipServer: sipServer)
       ..debugOnSend = sent.add;
@@ -93,6 +94,7 @@ class Harness {
       sip: sip,
       peer: peer,
       setupTimeout: setupTimeout,
+      networkLossGrace: networkLossGrace,
     );
     client.callEvents.listen(events.add);
     client.errorEvents.listen(errors.add);
@@ -183,8 +185,8 @@ class Harness {
 }
 
 /// An inbound call, answered: the client is active and the 200 OK is sent.
-Future<Harness> answeredCall() async {
-  final h = Harness();
+Future<Harness> answeredCall({Duration grace = const Duration(seconds: 12)}) async {
+  final h = Harness(networkLossGrace: grace);
   h.invite('in-1');
   await h.client.acceptCall();
   expect(h.client.callState, CallStateStatus.active);
