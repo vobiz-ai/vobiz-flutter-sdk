@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+Fixes from the end-to-end review of 0.2.0 (tracking issue #56). Verified with unit
+tests (SDK, example app and push bridge) only: no device, emulator or live Vobiz
+call was used. #58 lists what still needs a device.
+
+### Security
+
+- The account Auth Token no longer leaves the device unless
+  `SdkConfig.unsafeDemoZeroConfig` is set. Zero-Config, the Playground transfer and the
+  shared demo recordings list are demo-only and throw
+  `VobizDemoModeRequiredException` otherwise (#2).
+- Push bridge: refuses to start without an `https` `PUBLIC_URL` and the Auth Token,
+  checks Vobiz V3/V2 signatures as documented, rejects replayed nonces, and signs the
+  call id into Dial callback paths (#12). Each phone pairs once and then uses its own
+  device token; calls ring only the endpoints `ROUTES` maps the number to; the state
+  file is 0600 (#13).
+- Calls are matched to pushes by `PushRef` only, never by phone number (#46).
+- Sign-out unregisters (REGISTER `Expires: 0`) and the example wipes stored
+  credentials and the bridge device token (#27).
+
+### Added
+
+- `connectWithCredentialsProvider` and `VobizBackendCredentialsProvider`: per-user SIP
+  credentials from your own backend, fetched again when the registrar refuses them
+  (#14, #29). Typed errors: `VobizErrorCode` (including `auth_failed`),
+  `VobizDemoModeRequiredException`, `VobizCredentialsException`,
+  `VobizRegistrationException` (#33).
+- Network: `networkEvents`, `reconnect()`, capped backoff (`SdkConfig.reconnectPolicy`),
+  immediate reconnect when the network returns or switches, fast failure while offline,
+  and a 12 s grace period that keeps a connected call through a short drop (#3, #18).
+  `TurnServers.withFallbacks()` for TURN over UDP, TCP and TLS 443 (#20). New dependency:
+  `connectivity_plus`.
+- Media: real hold and resume by re-INVITE, RFC 4733 DTMF with SIP INFO fallback,
+  183 early media, `CallQualityEvent` (interval loss, jitter, RTT, estimated MOS),
+  an audio-route API, and Bluetooth-permission, proximity and audio-interruption hooks
+  (#17, #20, #23, #30, #41, #44).
+- `VobizIncomingPush` for reading call pushes (`ttl_ms` expiry, `lineBusy`) (#11, #50).
+- CI: analyze and test for the SDK and example, and `node --test` for the bridge (#34).
+
+### Fixed
+
+- SIP: CANCEL when hanging up a ringing outbound call, with a crossing 200 ACKed and
+  ended (#4); in-dialog re-INVITE and UPDATE answered, unsupported requests get 405/501,
+  no `Supported: timer` (#6); one digest retry (two with `stale=true`), `opaque` echoed
+  (#16); every non-2xx final response ACKed and a 32 s Timer B (#21); REGISTER lifetime
+  600 s, refreshed at 80% of what is granted, 423 handled, failures reported (#22);
+  responses matched by branch and CSeq, challenged BYE retried (#24); an INVITE during
+  outbound setup gets 486 (#25); a ringing inbound call is declined with 486, not BYE
+  (#26); DTMF digits sent one at a time (#49); a failed registration closes the socket
+  (#53); every message uses CRLF line endings.
+- Calls: no zombie call after sign-out, `dispose()` or a lost connection (#3); ringing
+  calls are no longer cut off at 30 s (#5); no ghost "active" call after a CANCEL during
+  answer (#7); a failed answer sends 480/488/500 and says why (#38); an unusable 200 OK
+  is ACKed and ended (#39); `rejectCall()` on an answered call sends BYE (#52); setup
+  timeout ends as `setup_timeout` (#54).
+- Media: the PeerConnection and streams are disposed on every end path (#28, #37);
+  the speaker setting no longer leaks into the next call (#42); mute is one state that
+  survives hold and applies before the mic opens (#43).
+- Keep-alive: the OPTIONS the registrar rejected is gone; a WebSocket ping every 15 s
+  notices a dead connection within 30 s (#35).
+
+### Changed
+
+- `TokenConfig` is deprecated: it is a SIP password. Vobiz has no JWT SIP auth (#29).
+- `hold()`/`resume()` throw when there is no call or Vobiz refuses; legacy
+  call-control routes throw `UnsupportedError` instead of failing silently (#30).
+- `CallSession`, `CallActions`, `SdkEvent` and `Logger` are exported (#33).
+- Docs: PLATFORM_SETUP rewritten (target 36, iOS 15, iOS rings in the foreground only,
+  no `voip` mode, camera permissions removed), CREDENTIALS rewritten around one endpoint
+  per user (#10, #32). Example iOS target 15 with a Podfile.
+
+### Example app and push bridge
+
+- Calls woken by push sign in while the phone is still ringing and tell the bridge,
+  which dials at once (`POST /push/registered`) (#8). One cached Flutter engine hosts
+  SIP and UI (#51).
+- Every call runs under the app's own foreground service (`phoneCall|microphone`) with
+  a Hang up action (#15, #47).
+- Answered-elsewhere and caller-hung-up pushes stop ringing; missed-call notifications
+  only for real misses; a local "Recent calls" log (#9, #19). Call waiting instead of a
+  second ringing screen (#45). Incoming calls ring and vibrate with the app open (#40).
+- Decline sends the caller a busy tone and busy hangup at once (#31).
+- Transfer picks `aleg`/`bleg` by call direction and offers `both` (#48).
+- Connect errors show on the Identity tab (#57); the app root no longer rebuilds every
+  second during a call (#55); no duplicate connect after Accept (#35).
+
+### Not done here
+
+- iOS PushKit/CallKit (needs Xcode), Telecom/ConnectionService integration, and ICE
+  restart on a network handover (#10, #11, #17, #18).
+- Platform work: Opus instead of PCMU, Vobiz-hosted TURN on 443, JWT SIP auth (#20, #29).
+- #36 needs the app's Trace; #58 is the device test plan.
+
+---
+
 ## [0.2.0] - 2026-10-09
 
 The SDK now signs in and calls the way the Vobiz WebRTC Playground
