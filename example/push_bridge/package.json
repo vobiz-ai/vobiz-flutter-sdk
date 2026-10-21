@@ -4,7 +4,8 @@
   "private": true,
   "description": "Answers a Vobiz number and wakes the Flutter example app with a push, so inbound calls ring it in the background and after it is swiped away.",
   "scripts": {
-    "start": "node push-bridge.mjs"
+    "start": "node push-bridge.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=18"
