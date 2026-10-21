@@ -2,7 +2,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:vobiz_webrtc/src/webrtc/peer_service.dart';
-import 'package:vobiz_webrtc/src/utils/logger.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
 /// Runs the SDK's own per-call media lifecycle N times (what every call does:

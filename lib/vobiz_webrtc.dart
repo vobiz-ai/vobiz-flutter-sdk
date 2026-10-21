@@ -1,3 +1,9 @@
+/// Make and receive Vobiz calls from Flutter: SIP over WebSocket for
+/// signalling, WebRTC for audio.
+///
+/// Start with [VobizClient]. Sign in with per-user SIP credentials from your
+/// own backend ([VobizClientCredentialsProvider.connectWithCredentialsProvider]);
+/// the account Auth Token never belongs on a device.
 library vobiz_webrtc;
 
 // ── Core ──────────────────────────────────────────────────────────────────────
@@ -5,22 +11,33 @@ export 'src/core/sdk_config.dart';
 export 'src/core/sip_headers.dart';
 export 'src/core/vobiz_client.dart';
 export 'src/errors/vobiz_exception.dart';
+export 'src/utils/logger.dart' show Logger, LogWriter;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 export 'src/webrtc/ice_config.dart';
 export 'src/webrtc/media_constraints.dart';
 
 // ── Authentication ────────────────────────────────────────────────────────────
+export 'src/auth/credentials_provider.dart';
+export 'src/backend/backend_credentials_provider.dart';
 export 'src/models/auth/auth_mode.dart';
 export 'src/models/auth/credential_config.dart';
 export 'src/models/auth/token_config.dart';
 export 'src/models/auth/zero_config_session.dart';
+
+// ── Calls ─────────────────────────────────────────────────────────────────────
+export 'src/calls/call_actions.dart';
+export 'src/calls/call_session.dart';
+
+// ── Push ──────────────────────────────────────────────────────────────────────
+export 'src/push/vobiz_push.dart';
 
 // ── Events ────────────────────────────────────────────────────────────────────
 export 'src/events/call_event.dart';
 export 'src/events/connection_event.dart';
 export 'src/events/error_event.dart';
 export 'src/events/media_event.dart';
+export 'src/events/sdk_event.dart';
 
 // ── Models ────────────────────────────────────────────────────────────────────
 export 'src/models/call/call_direction.dart';

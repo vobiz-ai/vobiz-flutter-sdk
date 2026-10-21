@@ -1,24 +1,31 @@
 import '../webrtc/ice_config.dart';
 import '../webrtc/media_constraints.dart';
 
+// For dartdoc references only.
+import '../errors/vobiz_exception.dart' show VobizDemoModeRequiredException;
+
 /// Configuration for [VobizClient].
 ///
-/// Every field has a default that works against the hosted Vobiz WebRTC
-/// Playground server, so most apps construct it with no arguments. Account
-/// credentials are never part of the configuration: they are supplied at sign
-/// in, by whoever is using the app.
+/// No credentials are part of the configuration, and the account Auth Token
+/// never belongs on a device. In production your own backend hands each
+/// signed-in user their own SIP endpoint's credentials (see CREDENTIALS.md):
 ///
 /// ```dart
 /// final client = VobizClient(config: const SdkConfig());
 ///
-/// // Zero-Config Setup: the account's Auth ID and Auth Token.
-/// await client.connectWithAuthToken(authId: authId, authToken: authToken);
+/// // Production: per-user SIP credentials from your backend, re-fetched
+/// // whenever the registrar refuses them.
+/// await client.connectWithCredentialsProvider(myBackendProvider);
 ///
-/// // Or SIP Direct: an existing endpoint's username and password.
+/// // Or SIP Direct: an endpoint's username and password you already hold.
 /// await client.connectWithCredentials(
 ///   CredentialConfig(username: sipUsername, password: sipPassword),
 /// );
 /// ```
+///
+/// Zero-Config Setup (`connectWithAuthToken`) sends the account Auth ID and
+/// Auth Token to the webhook server, exactly like the web Playground. It is a
+/// demo and refuses to run unless [unsafeDemoZeroConfig] is true.
 class SdkConfig {
   const SdkConfig({
     this.wsUrl = 'wss://registrar.vobiz.ai:5063/',
@@ -30,6 +37,7 @@ class SdkConfig {
     this.debug = false,
     this.iceConfig = const IceConfig(),
     this.mediaConstraints = const MediaConstraints(),
+    this.unsafeDemoZeroConfig = false,
   });
 
   /// The hosted Vobiz WebRTC Playground server: the "production webhook
@@ -46,6 +54,12 @@ class SdkConfig {
   final String sipServer;
 
   /// Public base URL of the webhook (answer URL) server.
+  ///
+  /// The default, [defaultWebhookUrl], is the shared Vobiz demo server. It is
+  /// only used in demo mode ([unsafeDemoZeroConfig]): its recordings list is
+  /// shared by everyone who uses it, so the SDK will not read it otherwise.
+  /// Production apps that use transfers or recordings set this to their own
+  /// server.
   ///
   /// Zero-Config Setup points the account's application at `<backendUrl>/api/answer`,
   /// so Vobiz must be able to reach it over HTTPS. Transfers and the recordings
@@ -86,4 +100,18 @@ class SdkConfig {
   /// Defaults to audio-only with echo cancellation, noise suppression and
   /// auto gain control enabled.
   final MediaConstraints mediaConstraints;
+
+  /// DEMO ONLY. Allows the operations that send the account Auth ID and Auth
+  /// Token from the device: Zero-Config Setup (`connectWithAuthToken`), the
+  /// Playground transfer (`transferCall`) and reading the shared Playground
+  /// recordings list on [defaultWebhookUrl].
+  ///
+  /// The Auth Token is the account's full REST credential (buy numbers, place
+  /// calls, read CDRs). Zero-Config also uses one shared endpoint per account
+  /// and gives it a new password on every sign-in, so two devices signed in
+  /// to the same account log each other out. Never ship an app with this set.
+  ///
+  /// Defaults to false; the operations above then throw
+  /// [VobizDemoModeRequiredException].
+  final bool unsafeDemoZeroConfig;
 }

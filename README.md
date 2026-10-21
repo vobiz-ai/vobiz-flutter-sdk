@@ -3,13 +3,15 @@
 Make and receive Vobiz voice calls from a Flutter app on Android and iOS: SIP over
 WebSocket for signalling, WebRTC for the audio.
 
-It signs in and calls the same way as the [Vobiz WebRTC Playground](https://rtc-demo.vobiz.ai),
-against the same hosted webhook server, so an app built on it needs **no backend of
-its own and no credentials compiled in**. Whoever uses the app signs in with their
-own account.
+> **Never put the account Auth Token on a device.** In production each user signs in
+> as their own SIP endpoint, with credentials your backend issues
+> ([CREDENTIALS.md](CREDENTIALS.md)). The Playground-style Zero-Config sign-in, which
+> sends the Auth Token from the device, is a demo and is off unless you set
+> `SdkConfig(unsafeDemoZeroConfig: true)`.
 
-- **Two ways to sign in:** Zero-Config Setup (Auth ID + Auth Token) or SIP Direct
-  (an endpoint's username and password)
+- **Sign in** with per-user SIP credentials from your backend, refreshed when the
+  registrar refuses them; or with an endpoint's username and password; or, for demos
+  only, the Playground's Zero-Config Setup
 - **Outbound calls** to phone numbers, with a caller ID, custom `X-VH-` SIP headers,
   call recording and Dial-User (ring a SIP endpoint)
 - **Inbound calls**, with the caller's custom headers
@@ -20,19 +22,18 @@ The [`example/`](example) app is a full Playground for Flutter that uses all of 
 
 ---
 
-## Sign in: the two modes
+## Sign in
 
-| | **Zero-Config Setup** | **SIP Direct** |
-|---|---|---|
-| You enter | Auth ID and Auth Token (Vobiz Console dashboard) | An endpoint's SIP username and password (Console → Voice → Endpoints) |
-| What happens | The webhook server finds or creates the application "Vobiz WebRTC Playground" and the endpoint "Vobiz WebRTC Playground Endpoint" on **your** account, points the application at its answer URL, gives the endpoint a fresh password, and the SDK registers as it | The SDK registers as that endpoint. Nothing is provisioned |
-| Credentials on the device | Auth ID and Auth Token, in memory only until `disconnect()` | The endpoint's password only |
-| Transfer | Yes | No (it needs the account credentials) |
+| | **Credentials provider** (production) | **SIP Direct** | **Zero-Config Setup** (demo only) |
+|---|---|---|---|
+| Call | `connectWithCredentialsProvider(provider)` | `connectWithCredentials(CredentialConfig(...))` | `connectWithAuthToken(...)` with `SdkConfig(unsafeDemoZeroConfig: true)` |
+| Where credentials come from | Your backend creates one endpoint per user and returns its username and password | You already hold an endpoint's username and password | The webhook server provisions the account's single shared Playground endpoint |
+| On the device | That user's endpoint password | The endpoint password | **The account Auth ID and Auth Token** |
+| Several devices / users | Each has its own endpoint | One endpoint each | One shared endpoint, password rotated on every sign-in: devices log each other out |
+| Refused credentials | The provider is asked again and the client re-registers | Registration fails | Registration fails |
 
-Zero-Config Setup sends the Auth ID and Auth Token to the webhook server once, exactly
-as the web Playground does. Signing in this way gives the shared Playground endpoint a
-new password, so a web Playground session on the same account that signed in with the
-old one stops working at its next refresh.
+There is no JWT / access-token sign-in: Vobiz SIP registration uses endpoint
+credentials only. `TokenConfig` is a deprecated alias for a SIP password.
 
 ## Quick start
 
@@ -47,15 +48,16 @@ dependencies:
 ```dart
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
-final client = VobizClient(); // defaults to the hosted webhook server
+final client = VobizClient();
 
-// Zero-Config Setup
-final session = await client.connectWithAuthToken(
-  authId: authIdTheUserTyped,
-  authToken: authTokenTheUserTyped,
+// Production: your backend returns this user's own endpoint credentials.
+final provider = VobizBackendCredentialsProvider(
+  url: Uri.parse('https://api.example.com/voice/sip-credentials'),
+  headers: () async => {'Authorization': 'Bearer ${await mySession.accessToken()}'},
 );
+final session = await client.connectWithCredentialsProvider(provider.call);
 
-// …or SIP Direct
+// …or SIP Direct with credentials you already hold
 await client.connectWithCredentials(
   CredentialConfig(username: sipUsername, password: sipPassword),
 );
@@ -109,7 +111,11 @@ final stats = await client.getCallStats(); // rttMs, jitterMs, packetLossPercent
 await client.hangup();
 ```
 
-### Transfer (Zero-Config only)
+### Transfer (demo only)
+
+`transferCall` posts the account Auth Token to the webhook server, so it needs
+Zero-Config and `unsafeDemoZeroConfig`. In production, transfer from your backend with
+the Vobiz API and `client.callUuid`.
 
 ```dart
 await client.transferCall(number: '+919876543211');               // blind
@@ -130,15 +136,17 @@ final recording = await client.waitForRecording(client.lastCallUuid!);
 print(recording?.url);
 ```
 
-The recordings list on the hosted server is shared by everyone who uses it, so match by
-CallUUID, as `waitForRecording` does, rather than taking the newest entry.
+The hosted demo server's recordings list is shared by everyone who uses it, so the SDK
+reads it only with `unsafeDemoZeroConfig`. In production point `backendUrl` at your own
+server, scoped to the signed-in user.
 
 ---
 
 ## The webhook server
 
-`SdkConfig.backendUrl` defaults to `https://rtc-demo.vobiz.ai`, the hosted Playground
-server (the web Playground's "production webhook callback"). It serves:
+`SdkConfig.backendUrl` defaults to `https://rtc-demo.vobiz.ai`, the shared hosted
+Playground server. It is for demos; production apps that use the routes below run
+their own. It serves:
 
 | Route | Used for | Called by |
 |---|---|---|
@@ -165,9 +173,11 @@ example app shows the usual way round it: a small server answers your Vobiz numb
 sends a Firebase push that wakes the app and shows the system call screen, and rings
 the endpoint again until the app has signed back in. See
 [example/push_bridge](example/push_bridge/README.md) and the example app's
-*Incoming calls* panel. The SDK needs nothing extra: `CallEvent.headers` carries the
-`X-VH-` headers the server puts on the INVITE, which the app uses to match the call to
-its push.
+*Incoming calls* panel. The SDK provides `VobizIncomingPush` to read the push and match
+the INVITE that follows (`CallEvent.headers` carries the server's `PushRef` header);
+the call screen and the push server are still example code. **iOS rings only while the
+app is in the foreground** for now (no PushKit/CallKit yet). See
+[doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md).
 
 The older call-control methods (`hold`, `resume`, `transfer(String)`, `addCall`,
 `swapCalls`, `mergeCalls`, `warmTransferStart`…) call routes such as `/hold-start` that
@@ -196,7 +206,9 @@ iOS (`ios/Runner/Info.plist`):
 <array><string>audio</string></array>
 ```
 
-The microphone permission is requested when the first call starts. More detail in
+Do not add the `voip` background mode: without PushKit and CallKit it gets the app
+rejected. The microphone permission is requested when the first call starts. More
+detail, including the permissions a call-screen plugin merges in, in
 [PLATFORM_SETUP.md](PLATFORM_SETUP.md).
 
 ## Run the example
@@ -213,16 +225,17 @@ the **Trace** tab. See [example/README.md](example/README.md).
 
 | What you see | What it means |
 |---|---|
+| `VobizDemoModeRequiredException` | `connectWithAuthToken`, `transferCall` or the demo recordings list without `SdkConfig(unsafeDemoZeroConfig: true)`. Use your backend's credentials instead |
 | "Vobiz did not accept that Auth ID and Auth Token" | Zero-Config was refused. Both values are on the Vobiz Console dashboard; the Auth Token is not your login password |
 | "Wrong credentials (403 Forbidden)" / "Authentication failed" | SIP Direct: the endpoint username or password is wrong, or Zero-Config ran again elsewhere and rotated it |
 | A call fails at once with no B leg | The caller ID is not a number your account owns |
-| "Transfer needs Zero-Config Setup" | Signed in with SIP Direct |
+| "Transfer needs Zero-Config Setup" | Not signed in with the (demo) Zero-Config Setup |
 | No audio on an emulator | Use a real device, or enable the emulator's host microphone |
 
 ## Requirements
 
-Flutter 3.19+, Dart 3.3+, Android 5.0+ (API 21) or iOS 13+ (the minimums of
-`flutter_webrtc`).
+Flutter 3.19+, Dart 3.3+, Android API 24+ (Flutter's minimum), iOS 13+ for the SDK
+alone and iOS 15+ with Firebase push, as in the example.
 
 ## Licence
 

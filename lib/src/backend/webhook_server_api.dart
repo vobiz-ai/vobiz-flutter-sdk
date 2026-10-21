@@ -19,13 +19,38 @@ import '../models/call/transfer_leg.dart';
 ///
 /// `/api/answer`, `/api/transfer-xml`, `/api/recording` (POST) and
 /// `/api/dial-status` are called by Vobiz itself, never by the client.
+///
+/// `/api/setup` and `/api/transfer` take the account Auth ID and Auth Token in
+/// the request body, and the hosted server's recordings list is shared by all
+/// of its users. All three refuse to run unless [allowAccountCredentials] is
+/// true (`SdkConfig.unsafeDemoZeroConfig`), so a production build cannot send
+/// the account credential off the device by accident.
 @internal
 class WebhookServerApi {
-  WebhookServerApi({http.Client? client, this.timeout = const Duration(seconds: 20)})
-      : _client = client ?? http.Client();
+  WebhookServerApi({
+    http.Client? client,
+    this.timeout = const Duration(seconds: 20),
+    this.allowAccountCredentials = false,
+  }) : _client = client ?? http.Client();
 
   final http.Client _client;
   final Duration timeout;
+
+  /// Demo mode: the account Auth ID and Auth Token may leave the device.
+  final bool allowAccountCredentials;
+
+  /// Host of the shared Vobiz demo server (`SdkConfig.defaultWebhookUrl`).
+  static const String demoHost = 'rtc-demo.vobiz.ai';
+
+  /// True when [url] points at the shared demo server.
+  static bool isDemoServer(String url) =>
+      Uri.tryParse(normalizeBase(url))?.host.toLowerCase() == demoHost;
+
+  void _requireDemoMode(String operation) {
+    if (!allowAccountCredentials) {
+      throw VobizDemoModeRequiredException(operation);
+    }
+  }
 
   /// Strips trailing slashes so `$base/api/...` never doubles them.
   static String normalizeBase(String url) => url.trim().replaceAll(RegExp(r'/+$'), '');
@@ -38,6 +63,7 @@ class WebhookServerApi {
     required String authId,
     required String authToken,
   }) async {
+    _requireDemoMode('Zero-Config Setup');
     final base = normalizeBase(webhookUrl);
     final response = await _post(
       'setup_failed',
@@ -72,6 +98,7 @@ class WebhookServerApi {
     String? callerId,
     String sipHeaders = '',
   }) {
+    _requireDemoMode('The Playground transfer');
     final base = normalizeBase(webhookUrl);
     return _post(
       'transfer_failed',
@@ -92,8 +119,19 @@ class WebhookServerApi {
   }
 
   /// Recordings the server has received, most recent first.
+  ///
+  /// Refuses the shared demo server outside demo mode: its list is not scoped
+  /// to an account, so one customer would read another's recording URLs.
   Future<List<VobizRecording>> recordings({required String webhookUrl}) async {
     final base = normalizeBase(webhookUrl);
+    if (isDemoServer(base) && !allowAccountCredentials) {
+      throw const VobizException(
+          VobizErrorCode.recordingsFailed,
+          'The shared demo server\'s recordings list is readable by everyone '
+          'who uses it, so it is only available with '
+          'SdkConfig(unsafeDemoZeroConfig: true). Point backendUrl at your own '
+          'server, scoped to your account, for recordings in production.');
+    }
     final http.Response response;
     try {
       response = await _client

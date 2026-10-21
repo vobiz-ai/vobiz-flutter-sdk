@@ -1,5 +1,5 @@
 name: vobiz_webrtc
-description: Flutter SDK for making and receiving calls on the Vobiz platform using SIP-over-WebSocket and WebRTC. Includes automatic SIP registration, WebRTC audio setup, and call state management.
+description: Make and receive Vobiz voice calls from Flutter on Android and iOS, with SIP over WebSocket for signalling and WebRTC for audio.
 version: 0.2.0
 
 homepage: https://vobiz.ai

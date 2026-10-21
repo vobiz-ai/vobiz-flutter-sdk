@@ -14,11 +14,21 @@ VobizClient({SdkConfig config = const SdkConfig(), Logger? logger, http.Client? 
 
 | Method | Mode | Notes |
 |---|---|---|
-| `Future<ZeroConfigSession> connectWithAuthToken({required String authId, required String authToken})` | Zero-Config Setup | Posts to `<backendUrl>/api/setup`, then registers as the returned endpoint. Throws `VobizException` (`setup_failed`) with a readable message when refused, `ArgumentError` when either value is blank |
+| `Future<VobizCredentialsSession> connectWithCredentialsProvider(VobizCredentialsProvider provider, {int maxRefreshes = 1})` | **Production** | Asks your provider for the user's SIP credentials and registers; asks again when the registrar refuses them. Throws `VobizCredentialsException` when the provider fails. See [CREDENTIALS.md](CREDENTIALS.md) |
 | `Future<void> connectWithCredentials(CredentialConfig config)` | SIP Direct | Registers as an existing endpoint |
-| `Future<void> connect(Object credentials)` | SIP Direct | Accepts `CredentialConfig`, or `TokenConfig` whose token is the endpoint password |
+| `Future<ZeroConfigSession> connectWithAuthToken({required String authId, required String authToken})` | Zero-Config Setup, **demo only** | Throws `VobizDemoModeRequiredException` unless `SdkConfig.unsafeDemoZeroConfig` is true. Then posts the Auth ID and Auth Token to `<backendUrl>/api/setup` and registers as the returned endpoint (whose password it rotates). Throws `VobizException` (`setup_failed`) when refused, `ArgumentError` when either value is blank |
+| `Future<void> connect(Object credentials)` | SIP Direct | Accepts `CredentialConfig`, or the deprecated `TokenConfig` (its token is sent as the SIP password; it is not token auth) |
 | `Future<void> disconnect()` | | Unregisters, ends any call, and drops the Auth ID and Auth Token |
 | `Future<void> dispose()` | | `disconnect()` and closes the streams |
+
+`connectWithCredentialsProvider` is an extension method
+(`VobizClientCredentialsProvider`). The provider is
+`Future<CredentialConfig> Function(VobizCredentialsRequest request)`, asked with
+`signIn`, `rejected` (after a 401/403) or `refresh` (`session.refresh()`).
+`VobizCredentialsSession` has `failures` (a stream of `VobizException`), `refresh()` and
+`dispose()`. `VobizBackendCredentialsProvider(url:, headers:)` is a ready-made provider
+that POSTs `{"reason": ...}` to your backend and reads
+`{"sip_username", "sip_password", "display_name"?}`; pass `provider.call`.
 
 A new sign-in replaces the previous connection. Registration finishes asynchronously:
 watch `connectionEvents` for `RegistrationState.registered` or `.failed`.
@@ -80,14 +90,14 @@ Future<String> transferCall({
 })
 ```
 
-Zero-Config only, and only on an answered call. Give exactly one of `number` and
+Demo only (Zero-Config, which needs `unsafeDemoZeroConfig`), and only on an answered call. Give exactly one of `number` and
 `sipUser`. Headers whose names contain characters other than letters and digits cannot
 travel in XML and are left out (logged). Returns the server's confirmation; throws
 `VobizException` (`transfer_failed`) when the server or Vobiz refuses.
 
 | Method | Notes |
 |---|---|
-| `Future<List<VobizRecording>> fetchRecordings()` | Everything the webhook server has received, most recent first |
+| `Future<List<VobizRecording>> fetchRecordings()` | Everything the webhook server has received, most recent first. Refused for the shared demo server unless `unsafeDemoZeroConfig` is true (its list is not scoped to an account) |
 | `Future<VobizRecording?> waitForRecording(String callUuid, {Duration interval, int attempts})` | Polls until the recording for that call arrives (default every 2.5 s, 12 times), or returns null |
 
 ### Legacy call control
@@ -111,9 +121,29 @@ reference server implements them.
 the far end gave one, such as `Remote party is busy — USER_BUSY (Q.850 17)`). A failed
 call emits `failed` and then `ended`.
 
-Error codes include `setup_failed`, `registration_failed`, `socket_error`,
-`connect_failed`, `call_failed`, `call_timeout`, `answer_failed`, `make_call_failed`,
-`transfer_failed` and `recordings_failed`.
+Error codes are constants on `VobizErrorCode`: `setupFailed`, `registrationFailed`,
+`socketError`, `connectFailed`, `callFailed`, `callTimeout`, `answerFailed`,
+`makeCallFailed`, `transferFailed`, `recordingsFailed`, `demoModeRequired`,
+`credentialsFailed`.
+
+## Errors
+
+| Type | Code | Thrown when |
+|---|---|---|
+| `VobizException` | any | Base class: `code`, `message`, `statusCode`, `cause` |
+| `VobizDemoModeRequiredException` | `demo_mode_required` | An Auth-Token operation without `unsafeDemoZeroConfig` |
+| `VobizCredentialsException` | `credentials_failed` | Your credentials provider (or backend) failed |
+| `VobizRegistrationException` | `registration_failed` | The registrar kept refusing fresh credentials (on `VobizCredentialsSession.failures`) |
+
+Some methods still throw `StateError` (wrong call state) or `ArgumentError` (invalid
+input) as documented above.
+
+## Push
+
+`VobizIncomingPush.tryParse(Map<String, Object?> data)` reads an incoming-call push
+(`kind`, `callId`, `caller`, `callee`, `expiresAt`, `isExpired()`), and
+`matchesIncomingCall(headers:, from:)` ties the INVITE that follows to it. See
+[doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md).
 
 ## SdkConfig
 
@@ -121,12 +151,13 @@ Error codes include `setup_failed`, `registration_failed`, `socket_error`,
 |---|---|---|
 | `wsUrl` | `wss://registrar.vobiz.ai:5063/` | SIP over WebSocket |
 | `sipServer` | `registrar.vobiz.ai` | SIP domain |
-| `backendUrl` | `SdkConfig.defaultWebhookUrl` = `https://rtc-demo.vobiz.ai` | The webhook server: Zero-Config Setup, transfers, recordings, and the answer URL Vobiz calls |
+| `backendUrl` | `SdkConfig.defaultWebhookUrl` = `https://rtc-demo.vobiz.ai` | The webhook server: Zero-Config Setup, transfers, recordings, and the answer URL Vobiz calls. The default is the shared demo server, only usable in demo mode |
 | `voiceApiUrl` | `SdkConfig.defaultVoiceApiUrl` = `https://api.vobiz.ai` | The Vobiz API the webhook server calls for you |
 | `autoReconnect` | `true` | Reconnect with backoff (1, 2, 4, 8, 16 s, then every 30 s) |
 | `debug` | `false` | SDK logs to the console |
 | `iceConfig` | Google STUN | Add TURN for restrictive networks |
 | `mediaConstraints` | audio with echo cancellation, noise suppression, AGC | |
+| `unsafeDemoZeroConfig` | `false` | **Demo only.** Allows `connectWithAuthToken`, `transferCall` and the demo server's recordings, which send or expose account credentials. Never ship with it set |
 
 ## VobizSipHeaders
 
@@ -151,14 +182,17 @@ The custom-header rules, identical to the Vobiz web SDK's:
 | `VobizRecording` | `recordingId`, `callUuid`, `url`, `durationSecs`, `endReason`, `receivedAt` |
 | `CallStats` | `rttMs`, `jitterMs`, `packetLossPercent` |
 | `CredentialConfig` | `username`, `password`, `displayName`, `answerUrl` |
-| `TokenConfig` | `token`, `displayName`, `answerUrl` |
-| `VobizException` | `code`, `message`, `statusCode` |
+| `TokenConfig` (deprecated) | `token` (sent as the SIP password), `displayName` (used as the SIP username), `answerUrl` |
+| `CallSession` | `currentCall`/`calls`/`CallEvent.session`: `callId`, `remoteIdentity`, `isIncoming`, `state`, `callUuid`, `headers`, `actions` (`CallActions`) |
+| `Logger` | `Logger({LogWriter? writer})`: pass to `VobizClient(logger:)` to receive SDK log lines |
 
 ## Enums
 
 | Enum | Values |
 |---|---|
-| `VobizAuthMode` | `none`, `zeroConfig`, `sipDirect` |
+| `VobizAuthMode` | `none`, `zeroConfig`, `sipDirect` (also after `connectWithCredentialsProvider`) |
+| `VobizCredentialsRequest` | `signIn`, `rejected`, `refresh` |
+| `VobizPushKind` | `incomingCall`, `callEnded` |
 | `CallStateStatus` | `idle`, `incoming`, `outgoing`, `ringing`, `connecting`, `active`, `held`, `ended`, `failed` |
 | `CallDirection` | `inbound`, `outbound` |
 | `TransferLeg` | `aLeg` (`aleg`: move yourself), `bLeg` (`bleg`: move the other party) |

@@ -1,10 +1,11 @@
-import 'package:meta/meta.dart';
-
 import '../models/call/call_stats.dart';
 import '../state/call_state.dart';
 import 'call_actions.dart';
 
-@internal
+/// A snapshot of the current call (`VobizClient.currentCall`).
+///
+/// Changing its fields does not affect the call; use the [VobizClient]
+/// methods for that.
 class CallSession {
   CallSession({
     required this.callId,

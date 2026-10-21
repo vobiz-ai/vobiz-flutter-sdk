@@ -263,7 +263,7 @@ void main() {
   group('WebhookServerApi', () {
     test('setup posts what the Playground posts and reads the credentials back', () async {
       late http.Request seen;
-      final api = WebhookServerApi(client: MockClient((request) async {
+      final api = WebhookServerApi(allowAccountCredentials: true, client: MockClient((request) async {
         seen = request;
         return http.Response(
           jsonEncode(<String, Object>{
@@ -300,7 +300,7 @@ void main() {
     });
 
     test('setup surfaces the server error', () async {
-      final api = WebhookServerApi(client: MockClient((_) async => http.Response(
+      final api = WebhookServerApi(allowAccountCredentials: true, client: MockClient((_) async => http.Response(
           jsonEncode(<String, String>{'error': 'Missing required API credentials'}), 400)));
       expect(
         () => api.setup(
@@ -314,6 +314,7 @@ void main() {
 
     test('setup refuses a reply without credentials', () async {
       final api = WebhookServerApi(
+          allowAccountCredentials: true,
           client: MockClient((_) async => http.Response('{"success":true}', 200)));
       expect(
         () => api.setup(
@@ -324,7 +325,7 @@ void main() {
 
     test('transfer posts the Redirect API fields', () async {
       late http.Request seen;
-      final api = WebhookServerApi(client: MockClient((request) async {
+      final api = WebhookServerApi(allowAccountCredentials: true, client: MockClient((request) async {
         seen = request;
         return http.Response('{"success":true,"message":"call transferred"}', 200);
       }));
@@ -351,7 +352,7 @@ void main() {
     });
 
     test('recordings reads the list', () async {
-      final api = WebhookServerApi(client: MockClient((request) async {
+      final api = WebhookServerApi(allowAccountCredentials: true, client: MockClient((request) async {
         expect(request.url.toString(), 'https://h.test/api/recording?list=1');
         return http.Response(
           jsonEncode(<String, Object>{
@@ -391,6 +392,7 @@ void main() {
 
     test('a rejected Auth Token gets a readable explanation and opens no socket', () async {
       final client = VobizClient(
+        config: const SdkConfig(unsafeDemoZeroConfig: true),
         httpClient: MockClient((_) async => http.Response(
             jsonEncode(<String, String>{'error': 'Could not resolve Application ID'}), 500)),
       );
