@@ -1,152 +1,234 @@
-# Getting Vobiz Credentials
+# Credentials: production sign-in, and the demo modes
 
-This guide explains how to get the credentials needed to use the Vobiz WebRTC SDK.
+> **The account Auth ID and Auth Token never belong on a device.** The Auth Token is
+> the account's full REST credential: it buys numbers, places calls and reads call
+> records. A production app signs each user in as **their own SIP endpoint**, with
+> credentials that **your backend** creates and hands out. Zero-Config Setup, which
+> sends the Auth Token from the device, is a demo and is off unless you set
+> `SdkConfig(unsafeDemoZeroConfig: true)`.
 
----
+Nothing is compiled into the SDK or the example app.
 
-## Step 1: Create a Vobiz Account
+## Production: one endpoint per user, issued by your backend
 
-1. Visit [Vobiz Console](https://app.vobiz.ai)
-2. Sign up or log in
-3. Complete account verification
+```
+ App (your user is signed in to YOUR service)
+   │  POST /voice/sip-credentials   Authorization: <your own session token>
+   ▼
+ Your backend  ── holds the Vobiz Auth ID + Auth Token, server-side only
+   │  first time for this user: POST /api/v1/Account/{auth_id}/Endpoint/
+   │  stores endpoint_id, username and the password it generated
+   ▼
+ App  ◄── {"sip_username": "...", "sip_password": "..."}
+   │
+   └─ registers with registrar.vobiz.ai as that endpoint
+```
 
----
+Rules that keep devices from logging each other out:
 
-## Step 2: Purchase a Phone Number
+- **One endpoint per user** (agent). Never share one endpoint between users. If one
+  user can be signed in on several devices at once, give each device its own
+  endpoint.
+- **Create once, reuse.** Vobiz never returns an endpoint's password after creation
+  ("write-only"), so your backend stores the password it generated (encrypted) and
+  returns the same one on every sign-in and every app wake.
+- **Never rotate on sign-in.** Rotate only on purpose (suspected leak, user removed),
+  with `POST .../Endpoint/{endpoint_id}/` and a new `password`. A rotated device gets
+  `403` at its next REGISTER; the SDK then asks your backend again (see below).
+- **Delete** the endpoint when the user is removed
+  (`DELETE .../Endpoint/{endpoint_id}/`): it unregisters every device at once.
 
-1. Go to **Voice** → **Numbers**
-2. Click **"Buy Number"**
-3. Choose your country and area code
-4. Confirm purchase
-5. **Copy the phone number** (e.g., `+918046733542`)
-
-This is your **CALLER_ID**.
-
----
-
-## Step 3: Create a SIP Endpoint
-
-1. Go to **Voice** → **Endpoints**
-2. Click **"Create Endpoint"**
-3. Enter a name (e.g., `My Flutter App`)
-4. Vobiz generates:
-   - **SIP Username** (e.g., `dkvoice312279403969368799244`)
-   - **SIP Password** (shown once, save it!)
-5. The endpoint URL is: `sip:{username}@registrar.vobiz.ai`
-
-**Save these credentials:**
-- `username` = your SIP username
-- `password` = your SIP password
-- `sipServer` = `registrar.vobiz.ai`
-
----
-
-## Step 4: Get Your API Keys (Optional, for backend)
-
-1. Go to **Settings** → **API Keys**
-2. Copy:
-   - **Account SID** (e.g., `MA_BV3RYVAA`)
-   - **Auth Token** (e.g., `cJTB5IPQzOFQiOvMuy4xL...`)
-
-These are needed for your Answer URL backend server.
-
----
-
-## Step 5: Configure Your Backend
-
-Your Answer URL backend needs:
-- **CALLER_ID** = Your purchased phone number (from Step 2)
-- **SIP_ENDPOINT** = Full SIP URI from Step 3
-- **VOBIZ_ACCOUNT_SID** & **VOBIZ_AUTH_TOKEN** = From Step 4
-
-See [vobiz-rtc-demo](https://github.com/devlume-in/vobiz-rtc-demo) for server setup.
-
----
-
-## Step 6: Create Your Voice Application
-
-1. Go to **Voice** → **Applications**
-2. Click **"Create Application"**
-3. Enter a name (e.g., `My Flutter App`)
-4. Set:
-   - **Answer URL**: `https://your-public-url.ngrok-free.dev/answer` (your backend)
-   - **Hangup URL**: `https://your-public-url.ngrok-free.dev/hangup`
-5. Link your phone number from Step 2
-6. Save
-
----
-
-## Step 7: Use Credentials in Your Flutter App
+### In the app
 
 ```dart
-import 'package:vobiz_webrtc/vobiz_webrtc.dart';
+final client = VobizClient();
 
+final provider = VobizBackendCredentialsProvider(
+  url: Uri.parse('https://api.example.com/voice/sip-credentials'),
+  headers: () async => {'Authorization': 'Bearer ${await mySession.accessToken()}'},
+);
+
+final session = await client.connectWithCredentialsProvider(provider.call);
+session.failures.listen((e) => showSignInProblem(e.message));
+// When your user signs out:
+await client.disconnect();
+await session.dispose();
+```
+
+Or write the provider yourself, for example to answer from a secure-storage cache:
+
+```dart
+final session = await client.connectWithCredentialsProvider((request) async {
+  if (request == VobizCredentialsRequest.signIn) {
+    final cached = await cache.read();
+    if (cached != null) return cached;            // no network on a push wake
+  }
+  final fresh = await myApi.sipCredentials(reason: request.name);
+  await cache.write(fresh);
+  return fresh;                                   // CredentialConfig
+});
+```
+
+The provider is asked:
+
+| `VobizCredentialsRequest` | When | What to return |
+|---|---|---|
+| `signIn` | `connectWithCredentialsProvider` | cached credentials if you have them |
+| `rejected` | the registrar refused the last ones (401/403) | fresh ones from your backend |
+| `refresh` | you called `session.refresh()` | fresh ones from your backend |
+
+After `maxRefreshes` (default 1) refusals in a row the session stops and reports a
+`VobizRegistrationException` on `session.failures`. A provider that throws fails with
+`VobizCredentialsException`.
+
+### Reference backend (Node 18+, Express)
+
+The Vobiz calls below are the documented
+[Create an Endpoint](https://docs.vobiz.ai/endpoint/create-endpoint) request. Replace
+the in-memory `store` with your database, and `requireUser` with your own
+authentication.
+
+```js
+import crypto from 'node:crypto';
+import express from 'express';
+
+const VOBIZ = 'https://api.vobiz.ai/api/v1';
+const AUTH_ID = process.env.VOBIZ_AUTH_ID;        // server-side only
+const AUTH_TOKEN = process.env.VOBIZ_AUTH_TOKEN;  // server-side only
+const APP_ID = Number(process.env.VOBIZ_APP_ID);  // the application whose answer URL routes these calls
+
+const store = new Map(); // userId -> { endpointId, username, password }  (use your DB, encrypt password)
+
+async function vobiz(method, path, body) {
+  const res = await fetch(`${VOBIZ}/Account/${AUTH_ID}${path}`, {
+    method,
+    headers: { 'X-Auth-ID': AUTH_ID, 'X-Auth-Token': AUTH_TOKEN, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`Vobiz ${method} ${path}: HTTP ${res.status} ${await res.text()}`);
+  return res.status === 202 || res.status === 204 ? {} : res.json();
+}
+
+async function endpointFor(user) {
+  const existing = store.get(user.id);
+  if (existing) return existing;                              // never rotate on sign-in
+  // username: alphanumeric only, unique per account, immutable.
+  const username = `u${crypto.createHash('sha256').update(user.id).digest('hex').slice(0, 20)}`;
+  const password = crypto.randomBytes(24).toString('base64url'); // Vobiz never returns it: keep it
+  const created = await vobiz('POST', '/Endpoint/', {
+    username,
+    password,
+    alias: `agent-${username}`,     // letters, digits, - and _ only
+    application: APP_ID,
+  });
+  const record = { endpointId: created.endpoint_id, username, password };
+  store.set(user.id, record);
+  return record;
+}
+
+// requireUser: your own authentication middleware; it sets req.user.
+const app = express();
+app.use(express.json());
+
+app.post('/voice/sip-credentials', requireUser, async (req, res) => {
+  try {
+    const ep = await endpointFor(req.user);
+    res.json({ sip_username: ep.username, sip_password: ep.password, display_name: req.user.name });
+  } catch (e) {
+    console.error(e);
+    res.status(502).json({ error: 'Could not issue SIP credentials' });
+  }
+});
+```
+
+A `409` from Create means the username already exists on the account (for example the
+store was lost): look it up with
+[List all endpoints](https://docs.vobiz.ai/endpoint/list-all-endpoints)
+(`?username__exact=`), set a new password with
+[Update an Endpoint](https://docs.vobiz.ai/endpoint/update-endpoint), and store that.
+
+### Access tokens (JWT)
+
+Not available yet. Vobiz SIP registration authenticates with an endpoint's username
+and password only; the endpoint docs state that "SIP endpoints do not require a separate
+token or JWT". `TokenConfig` is not token authentication (its token is sent as a SIP
+password) and is deprecated. When the platform accepts short-lived access tokens on
+REGISTER, the SDK will add them next to the credentials provider, which is already the
+refreshable place to fetch them.
+
+### Transfers and recordings in production
+
+`transferCall` and the Playground recordings list are demo features (they post the
+account Auth Token, or read a list shared by everyone on the demo server). In
+production, make the transfer from your backend with the Vobiz API and the call's
+`client.callUuid`, and serve recordings from your backend, scoped to the signed-in user.
+
+### Receiving calls in production
+
+Attach your number to an application whose answer URL is on your backend, and have it
+answer with a `<Dial>` to the right user's endpoint (`<User>sip:USERNAME@registrar.vobiz.ai</User>`).
+Your backend knows which user should ring, so no shared in-memory state is involved.
+
+## Demo: Zero-Config Setup (Auth ID and Auth Token)
+
+For trying the SDK on your own account in the example app, the same way as the web
+Playground. **Not for production builds.**
+
+```dart
 final client = VobizClient(
-  config: SdkConfig(
-    wsUrl: 'wss://registrar.vobiz.ai:5063/',
-    sipServer: 'registrar.vobiz.ai',
-    backendUrl: 'https://your-backend.example.com',
-  ),
+  config: const SdkConfig(unsafeDemoZeroConfig: true), // DEMO ONLY
 );
-
-// Login with credentials from Step 3
-await client.login(
-  username: 'dkvoice312279403969368799244',  // From Step 3
-  password: 'your-password-here',             // From Step 3
-);
+await client.connectWithAuthToken(authId: authId, authToken: authToken);
 ```
 
----
+Without the flag, `connectWithAuthToken`, `transferCall` and reading the shared demo
+server's recordings throw `VobizDemoModeRequiredException` and send nothing.
 
-## Testing
+1. Sign in to the Vobiz Console.
+2. Copy the **Auth ID** (it looks like `MA_XXXXXXXX`) and the **Auth Token** from the
+   dashboard. The Auth Token is not your login password.
+3. Enter both on the Zero-Config Setup tab, or pass them to `connectWithAuthToken`.
 
-To test your setup:
+The webhook server then finds or creates two things on your account and the SDK signs
+in as the endpoint:
 
-1. ✅ Run your Flutter app
-2. ✅ Check if it says "Registered"
-3. ✅ Call your phone number from Step 2 using another phone
-4. ✅ Your app should show an incoming call
+| Created on your account | Name |
+|---|---|
+| Application, answer URL `<webhook>/api/answer` | `Vobiz WebRTC Playground` |
+| SIP endpoint attached to it, **with a new password each sign-in** | alias `Vobiz WebRTC Playground Endpoint`, username `play…` |
 
----
+Known limits, all of which the production path avoids:
 
-## Troubleshooting
+- There is **one** such endpoint per account, and every sign-in rotates its password,
+  so a second phone, the web Playground or a push wake on the same account logs the
+  others out at their next REGISTER.
+- The Auth Token travels to the webhook server on sign-in and on every transfer.
+- The hosted server's recordings list is shared by everyone who uses it.
+- The hosted server keeps "which endpoint to ring" in memory; after it restarts, sign
+  in with Zero-Config again before expecting incoming calls.
 
-| Problem | Solution |
-|---------|----------|
-| "Endpoint not found" | Make sure endpoint is **Active** in Vobiz Console |
-| "Authentication failed" | Double-check username and password from Step 3 |
-| "No incoming calls" | Verify phone number is linked to application in Step 6 |
-| "Answer URL not called" | Check Answer URL in Step 6 is publicly accessible (use ngrok for testing) |
+## SIP Direct: an endpoint you already have
 
----
+1. In the Vobiz Console, open **Voice → Endpoints** and create (or pick) an endpoint.
+2. Attach it to an application whose answer URL decides what calls do.
+3. Save the password when you create the endpoint: it is shown once.
+4. Pass the username and password in a `CredentialConfig` to
+   `connectWithCredentials`, or enter them on the example's SIP Direct tab.
 
-## Security Best Practices
+SIP Direct sends no account credentials anywhere. It is what the credentials provider
+does under the hood, without the refresh.
 
-⚠️ **Never commit credentials to your code!**
+## Caller ID
 
-Use environment variables or secure storage:
+Calls to phones need a caller ID the account owns: a number bought from Vobiz
+(**Voice → Numbers**) or your trial number, in E.164 form such as `+918000000000`.
+A number the account does not own fails at once, with no B leg.
 
-```dart
-// ❌ BAD
-await client.login(
-  username: 'dkvoice312279403969368799244',
-  password: 'your-password-here',
-);
+## Keep them out of source control
 
-// ✅ GOOD
-final username = dotenv.env['SIP_USERNAME'];
-final password = dotenv.env['SIP_PASSWORD'];
-await client.login(username: username!, password: password!);
-```
+Never commit an Auth Token, an endpoint password or a real number. If an Auth Token
+has been committed or shared, rotate it in the Vobiz Console: removing it from the
+files does not remove it from git history.
 
-Use packages like:
-- [flutter_dotenv](https://pub.dev/packages/flutter_dotenv) - For .env files
-- [flutter_secure_storage](https://pub.dev/packages/flutter_secure_storage) - For encrypted storage
-
----
-
-## Support
-
-- [Vobiz Documentation](https://docs.vobiz.ai)
-- [GitHub Issues](https://github.com/devlume-in/vobiz-flutter-sdk/issues)
-- Email: support@vobiz.ai
+The live sign-in test (`example/integration_test`) takes its credentials from
+`--dart-define-from-file`, never from the code. See [example/README.md](example/README.md).

@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flutter:
+    name: Analyze and test (SDK + example)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.7
+          cache: true
+
+      - name: SDK dependencies
+        run: flutter pub get
+
+      - name: Example dependencies
+        working-directory: example
+        run: flutter pub get
+
+      # Analyzes the SDK and, as a nested package, the example app.
+      - name: flutter analyze
+        run: flutter analyze
+
+      - name: SDK tests
+        run: flutter test
+
+      - name: Example tests
+        working-directory: example
+        run: flutter test test
+
+  push-bridge:
+    name: Push bridge (node --test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: example/push_bridge
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Syntax check
+        run: node --check push-bridge.mjs
+
+      - name: node --test
+        run: node --test
