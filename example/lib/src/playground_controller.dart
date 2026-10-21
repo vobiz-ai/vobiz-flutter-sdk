@@ -300,7 +300,9 @@ class PlaygroundController extends ChangeNotifier {
   /// Whether the call's foreground service is running.
   bool _callServiceOn = false;
 
-  /// Whether the current outgoing call was answered.
+  /// Whether a call placed from this phone is in progress, and whether it
+  /// was answered.
+  bool _outboundActive = false;
   bool _outboundAnswered = false;
 
   // ── Call log ────────────────────────────────────────────────────────────────
@@ -596,6 +598,7 @@ class PlaygroundController extends ChangeNotifier {
     }
     _recordRequested = recordCall;
     activeHeaders = null;
+    _outboundActive = true;
     _outboundAnswered = false;
     _setStatus(PhoneStatus.inCall, 'Calling...');
     // Started now, while the app is on screen: Android 14 refuses a
@@ -611,10 +614,14 @@ class PlaygroundController extends ChangeNotifier {
       );
     } on ArgumentError catch (e) {
       _recordRequested = false;
+      _outboundActive = false;
+      _stopCallService();
       log('⚠️ ${e.message}', LogType.error);
       _setStatus(PhoneStatus.online, 'Registered');
     } catch (e) {
       _recordRequested = false;
+      _outboundActive = false;
+      _stopCallService();
       log('❌ Could not start the call: $e', LogType.error);
       _resetCallState();
     }
@@ -1616,11 +1623,11 @@ class PlaygroundController extends ChangeNotifier {
         }
         _failedCallId = null;
         _stopCallService();
-        final inbound = e.direction == CallDirection.inbound || _inbound != null;
         final keepScreen = _keepRingingForPush();
-        if (inbound) {
+        if (!_outboundActive) {
           _finishInbound(e.reason ?? e.message);
         } else {
+          _outboundActive = false;
           _logCall(CallRecord(
             id: e.callUuid ?? e.callId,
             inbound: false,

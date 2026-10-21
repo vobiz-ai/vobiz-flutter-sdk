@@ -275,6 +275,20 @@ void main() {
       expect(controller.history.records.first.outcome, CallOutcome.outgoing);
     });
 
+    test('a ring stopped by call_ended is not logged as an outgoing call', () async {
+      await start();
+      await signIn();
+      platform.pushController.add(incoming('c1'));
+      client.ring(headers: <String, String>{'X-VH-PushRef': 'c1'});
+      await pumpEventQueue();
+      platform.pushController.add(ended('c1', 'caller_hung_up'));
+      await pumpEventQueue();
+      client.direction = null;
+      client.emit(CallStateStatus.ended);
+      await pumpEventQueue();
+      expect(controller.history.records.map((r) => r.inbound), everyElement(isTrue));
+    });
+
     test('a call answered in the app runs under the service', () async {
       await start();
       await signIn();
