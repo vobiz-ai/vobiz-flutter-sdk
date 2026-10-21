@@ -116,3 +116,10 @@ export async function until(fn, ms = 2000) {
   }
   return fn();
 }
+
+/** Registers a phone for `username` with its own FCM token; returns the response body. */
+export async function registerDevice(ctx, username, { name = username } = {}) {
+  const r = await postJson(ctx, '/push/register', { username, token: fcmToken(name), platform: 'android' }, { 'X-Bridge-Key': BRIDGE_KEY });
+  if (r.status !== 200) throw new Error(`register ${username}: ${r.status} ${r.text}`);
+  return r.json;
+}

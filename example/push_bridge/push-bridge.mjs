@@ -56,12 +56,29 @@ export function createBridge(options = {}) {
     alwaysRing: csv(env.ALWAYS_RING),
     stateFile: options.stateFile || path.join(HERE, 'bridge-state.json'),
   };
-  const verifySignatures = Boolean(config.authToken) && env.VERIFY_SIGNATURES !== 'false';
+  // Webhooks are checked unless the operator explicitly opts out for local
+  // testing. Without PUBLIC_URL and the Auth Token nothing can be checked, so
+  // the bridge refuses to start rather than quietly accepting anything.
+  const allowUnsigned = env.ALLOW_UNSIGNED_WEBHOOKS === 'true';
+  const verifySignatures = !allowUnsigned;
+  const problems = configProblems(config, env, allowUnsigned);
+  if (problems.length) {
+    const error = new Error(`Push bridge is not configured safely:\n  - ${problems.join('\n  - ')}`);
+    error.code = 'BRIDGE_CONFIG';
+    throw error;
+  }
 
   /** Seconds of ringback played between two dial attempts (one cadence of ringback.wav). */
   const RINGBACK_SECONDS = 3;
   /** After the user taps Accept, the app needs time to start and sign in. */
   const ACCEPTED_GRACE_SECONDS = 60;
+  /**
+   * How long a webhook nonce is remembered. Vobiz nonces are random, not
+   * time-based, and nothing in the request is timestamped, so replay
+   * protection is "never accept the same nonce twice" within this window;
+   * calls are long over by then.
+   */
+  const NONCE_TTL_MS = 30 * 60 * 1000;
   const INSTANCE = crypto.randomBytes(6).toString('hex');
 
   // ── State: the app's key and the registered devices, kept across restarts ────
@@ -69,6 +86,9 @@ export function createBridge(options = {}) {
   const state = loadState();
   if (env.BRIDGE_KEY) state.bridgeKey = env.BRIDGE_KEY.trim();
   if (!state.bridgeKey) state.bridgeKey = crypto.randomBytes(18).toString('base64url');
+  // Signs the per-call part of the Dial callback paths (see callRef()).
+  if (!state.webhookSecret) state.webhookSecret = crypto.randomBytes(32).toString('base64url');
+  pruneNonces();
   saveState();
 
   /** Inbound calls in progress, by Vobiz CallUUID. Kept in memory only. */
@@ -87,8 +107,9 @@ export function createBridge(options = {}) {
     // Vobiz webhooks
     'POST /answer': vobiz(onAnswer),
     'GET /answer': vobiz(onAnswer),
-    'POST /dial-result': vobiz(onDialResult),
-    'POST /dial-events': vobiz(onDialEvent),
+    // Per call: /dial-result/<call id>.<tag>, so the signed URL names the call
+    'POST /dial-result/*': vobiz(onDialResult),
+    'POST /dial-events/*': vobiz(onDialEvent),
     'POST /hangup': vobiz(onHangup),
     'GET /hangup': vobiz(onHangup),
     // The app
@@ -101,14 +122,16 @@ export function createBridge(options = {}) {
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost');
-    const handler = routes[`${req.method} ${url.pathname}`];
+    const prefix = url.pathname.split('/').slice(0, 2).join('/');
+    const handler = routes[`${req.method} ${url.pathname}`]
+      || (url.pathname.split('/').length === 3 && routes[`${req.method} ${prefix}/*`]);
     if (!handler) return sendJson(res, 404, { error: 'Not found' });
     try {
       await handler(req, res, url);
     } catch (error) {
       log('!!', `${req.method} ${url.pathname} failed: ${error.stack || error}`);
       if (!res.headersSent) {
-        if (url.pathname === '/answer' || url.pathname === '/dial-result') {
+        if (url.pathname === '/answer' || url.pathname.startsWith('/dial-result/')) {
           sendXml(res, '<Speak>Sorry, something went wrong. Please try again.</Speak><Hangup/>');
         } else {
           sendJson(res, 500, { error: 'Internal error' });
@@ -188,8 +211,8 @@ export function createBridge(options = {}) {
 
   /** One dial attempt has finished; decide whether to try again. */
   async function onDialResult(req, res, url, params) {
-    const id = url.searchParams.get('call') || params.DialALegUUID || params.CallUUID;
-    const call = calls.get(id);
+    const id = callIdFromPath(url);
+    const call = id ? calls.get(id) : null;
     const status = String(params.DialStatus || '').toLowerCase();
     const cause = params.DialHangupCause || params.DialBLegHangupCause || '';
     if (!call) return sendXml(res, '<Hangup/>');
@@ -239,7 +262,8 @@ export function createBridge(options = {}) {
    * answer or connected event is the only reliable proof the app picked up.
    */
   async function onDialEvent(req, res, url, params) {
-    const call = calls.get(url.searchParams.get('call') || params.DialALegUUID || params.CallUUID);
+    const id = callIdFromPath(url);
+    const call = id ? calls.get(id) : null;
     const event = String(params.Event || '');
     const action = String(params.DialAction || '').toLowerCase();
     if (call) {
@@ -268,8 +292,8 @@ export function createBridge(options = {}) {
     call.attempts += 1;
     const base = publicBase();
     const ringFor = Math.max(10, Math.round((call.deadline - Date.now()) / 1000));
-    const action = `${base}/dial-result?call=${encodeURIComponent(call.id)}`;
-    const events = `${base}/dial-events?call=${encodeURIComponent(call.id)}`;
+    const action = `${base}/dial-result/${callRef(call.id)}`;
+    const events = `${base}/dial-events/${callRef(call.id)}`;
     const callerId = config.callerIdMode === 'number' && call.to ? ` callerId="${esc(call.to)}"` : '';
     const users = call.targets
       .map((user) => `    <User sipHeaders="${esc(sipHeaders(call))}">sip:${esc(user)}@registrar.vobiz.ai</User>`)
@@ -554,10 +578,17 @@ export function createBridge(options = {}) {
 
   // ── Vobiz: signatures, account set-up ────────────────────────────────────────
 
-  /** Parses a Vobiz webhook and, when an Auth Token is set, checks its signature. */
+  /** Parses a Vobiz webhook and checks its signature and nonce (fails closed). */
   function vobiz(handler) {
     return async (req, res, url) => {
       const raw = await readBody(req);
+      if (verifySignatures) {
+        const verdict = checkSignature(req, url);
+        if (verdict !== 'ok') {
+          log('!!', `Rejected ${req.method} ${url.pathname}: ${verdict}`);
+          return sendText(res, 403, 'Invalid signature');
+        }
+      }
       const params = Object.fromEntries(new URLSearchParams(url.search));
       const type = String(req.headers['content-type'] || '');
       if (type.includes('application/json')) {
@@ -565,38 +596,72 @@ export function createBridge(options = {}) {
       } else if (raw) {
         Object.assign(params, Object.fromEntries(new URLSearchParams(raw)));
       }
-      if (verifySignatures && !signatureValid(req, url)) {
-        log('!!', `Rejected ${url.pathname}: no valid X-Vobiz-Signature (set VERIFY_SIGNATURES=false to skip this check while testing)`);
-        return sendText(res, 403, 'Invalid signature');
-      }
       return handler(req, res, url, params);
     };
   }
 
   /**
-   * Vobiz signs base64(HMAC-SHA256(authToken, url + "." + nonce)) (V3) or
-   * url + nonce (V2), where url is the address it called. Whether the query
-   * string is part of it is not documented, so both forms are accepted.
+   * Vobiz signs base64(HMAC-SHA256(authToken, baseUrl + "." + nonce)) (V3) or
+   * baseUrl + nonce (V2), where baseUrl is the URL it called without the query
+   * string (docs: /concepts/validating-callbacks). The body is not signed, so
+   * everything that must be trusted (the call a Dial callback is about) is in
+   * the path. A nonce is accepted once only.
    */
-  function signatureValid(req, url) {
-    const base = config.publicUrl;
-    if (!base) return true;
-    const candidates = [`${base}${url.pathname}`, `${base}${url.pathname}${url.search}`];
+  function checkSignature(req, url) {
+    const baseUrl = `${config.publicUrl}${url.pathname}`;
     const checks = [
       ['x-vobiz-signature-v3', 'x-vobiz-signature-v3-nonce', '.'],
-      ['x-vobiz-signature-ma-v3', 'x-vobiz-signature-ma-v3-nonce', '.'],
+      ['x-vobiz-signature-ma-v3', 'x-vobiz-signature-v3-nonce', '.'],
       ['x-vobiz-signature-v2', 'x-vobiz-signature-v2-nonce', ''],
+      ['x-vobiz-signature-ma-v2', 'x-vobiz-signature-v2-nonce', ''],
     ];
+    let sawSignature = false;
     for (const [sigHeader, nonceHeader, separator] of checks) {
       const signature = String(req.headers[sigHeader] || '');
       const nonce = String(req.headers[nonceHeader] || '');
       if (!signature || !nonce) continue;
-      for (const candidate of candidates) {
-        const expected = crypto.createHmac('sha256', config.authToken).update(candidate + separator + nonce).digest('base64');
-        if (safeEqual(signature, expected)) return true;
-      }
+      sawSignature = true;
+      const expected = crypto.createHmac('sha256', config.authToken).update(baseUrl + separator + nonce).digest('base64');
+      if (!safeEqual(signature, expected)) continue;
+      if (!rememberNonce(nonce)) return 'nonce already used (replayed request)';
+      return 'ok';
     }
-    return false;
+    return sawSignature
+      ? 'signature does not match (is PUBLIC_URL the exact address Vobiz calls, and VOBIZ_AUTH_TOKEN this account\'s token?)'
+      : 'no X-Vobiz-Signature-V3 / -V2 headers (Vobiz only signs callback URLs that have credentials configured)';
+  }
+
+  /** Records a nonce; false when it was seen before inside NONCE_TTL_MS. */
+  function rememberNonce(nonce) {
+    pruneNonces();
+    if (Object.prototype.hasOwnProperty.call(state.nonces, nonce)) return false;
+    state.nonces[nonce] = Date.now() + NONCE_TTL_MS;
+    saveState();
+    return true;
+  }
+
+  function pruneNonces() {
+    const now = Date.now();
+    for (const [nonce, expires] of Object.entries(state.nonces)) if (expires < now) delete state.nonces[nonce];
+  }
+
+  /** `<call id>.<tag>`: the tag proves the bridge itself wrote this path. */
+  function callRef(id) {
+    return `${encodeURIComponent(id)}.${callTag(id)}`;
+  }
+
+  function callTag(id) {
+    return crypto.createHmac('sha256', state.webhookSecret).update(`call:${id}`).digest('base64url').slice(0, 22);
+  }
+
+  /** The call id from /dial-result/<ref> or /dial-events/<ref>, or null if the tag is wrong. */
+  function callIdFromPath(url) {
+    const ref = url.pathname.split('/')[2] || '';
+    const dot = ref.lastIndexOf('.');
+    if (dot < 1) return null;
+    let id;
+    try { id = decodeURIComponent(ref.slice(0, dot)); } catch { return null; }
+    return safeEqual(ref.slice(dot + 1), callTag(id)) ? id : null;
   }
 
   async function vobizApi(method, pathname, body) {
@@ -731,9 +796,9 @@ export function createBridge(options = {}) {
       log('..', 'Vobiz: set VOBIZ_AUTH_ID, VOBIZ_AUTH_TOKEN, VOBIZ_NUMBER and PUBLIC_URL to link the number automatically');
     }
 
-    log(verifySignatures ? 'ok' : '..', verifySignatures
-      ? 'Webhooks: Vobiz signatures are checked'
-      : 'Webhooks: signatures are not checked (set VOBIZ_AUTH_TOKEN to check them)');
+    log(verifySignatures ? 'ok' : '!!', verifySignatures
+      ? 'Webhooks: Vobiz signatures (V3/V2) and nonces are checked'
+      : 'Webhooks: signatures are NOT checked (ALLOW_UNSIGNED_WEBHOOKS=true). Anyone who finds this address can ring your phones. Local testing only.');
 
     const registered = Object.entries(state.devices)
       .map(([user, devices]) => `${user} (${devices.filter((d) => d.token).length ? 'push' : 'no push'})`);
@@ -784,9 +849,15 @@ export function createBridge(options = {}) {
   function loadState() {
     try {
       const json = JSON.parse(fs.readFileSync(config.stateFile, 'utf8'));
-      return { bridgeKey: json.bridgeKey || '', devices: json.devices && typeof json.devices === 'object' ? json.devices : {} };
+      const object = (v) => (v && typeof v === 'object' ? v : {});
+      return {
+        bridgeKey: json.bridgeKey || '',
+        webhookSecret: json.webhookSecret || '',
+        devices: object(json.devices),
+        nonces: object(json.nonces),
+      };
     } catch {
-      return { bridgeKey: '', devices: {} };
+      return { bridgeKey: '', webhookSecret: '', devices: {}, nonces: {} };
     }
   }
 
@@ -796,10 +867,23 @@ export function createBridge(options = {}) {
     fs.renameSync(tmp, config.stateFile);
   }
 
-  return { server, config, state, calls, start, close, firebase };
+  return { server, config, state, calls, start, close, firebase, verifySignatures };
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Module helpers ───────────────────────────────────────────────────────────
+
+/** Settings that would leave the webhooks open. Empty when it is safe to start. */
+export function configProblems(config, env, allowUnsigned) {
+  const problems = [];
+  if (env.VERIFY_SIGNATURES === 'false') {
+    problems.push('VERIFY_SIGNATURES=false is no longer supported; for local testing only, set ALLOW_UNSIGNED_WEBHOOKS=true');
+  }
+  if (allowUnsigned) return problems;
+  if (!config.publicUrl) problems.push('PUBLIC_URL is not set: it is part of every Vobiz signature, so webhooks cannot be checked');
+  else if (!/^https:\/\//i.test(config.publicUrl)) problems.push('PUBLIC_URL must be https:// (a signature sent over plain HTTP can be captured and replayed)');
+  if (!config.authToken) problems.push('VOBIZ_AUTH_TOKEN is not set: it is the key Vobiz signs webhooks with');
+  return problems;
+}
 
 function esc(value) {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -968,5 +1052,12 @@ function defaultLog(tag, message) {
 // Run as a program (not when imported by the tests).
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   loadEnvFile(path.join(HERE, '.env'));
-  createBridge().start();
+  try {
+    createBridge().start();
+  } catch (error) {
+    if (error.code !== 'BRIDGE_CONFIG') throw error;
+    console.error(error.message);
+    console.error('Fix .env (see .env.example) and start again. ALLOW_UNSIGNED_WEBHOOKS=true skips the check for local tests only.');
+    process.exit(1);
+  }
 }
