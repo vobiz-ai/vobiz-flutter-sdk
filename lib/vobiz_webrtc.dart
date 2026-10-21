@@ -29,6 +29,9 @@ export 'src/models/auth/zero_config_session.dart';
 export 'src/calls/call_actions.dart';
 export 'src/calls/call_session.dart';
 
+// ── Push ──────────────────────────────────────────────────────────────────────
+export 'src/push/vobiz_push.dart';
+
 // ── Events ────────────────────────────────────────────────────────────────────
 export 'src/events/call_event.dart';
 export 'src/events/connection_event.dart';
