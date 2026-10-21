@@ -210,6 +210,9 @@ export function createBridge(options = {}) {
       // The app said it is registered: dial it now, not after the ringback.
       redialNow: false,
       ringbackUntil: 0,
+      // Every endpoint rung is already on a call through this bridge.
+      lineBusy: targets.every((user) => onCall(user)),
+      over: false,
     };
     calls.set(id, call);
     log('->', `Inbound call ${short(id)} from ${call.from} to ${call.to}; ringing ${targets.join(', ')}`);
@@ -238,7 +241,16 @@ export function createBridge(options = {}) {
     // DialAnswer or DialConnected event on callbackUrl proves the app answered.
     if (status === 'completed' && call.bridged) {
       finish(call, 'answered');
+      call.over = true;
       return sendXml(res, '<Hangup/>');
+    }
+    // Call waiting: the endpoint is on another call through this bridge, so
+    // "busy" is the app's SIP stack refusing a second call, not an app that is
+    // still starting. Say busy now instead of re-dialling for RING_SECONDS.
+    if (status === 'busy' && call.lineBusy && !call.accepted) {
+      finish(call, 'busy');
+      endRinging(call, 'busy');
+      return sendXml(res, declinedXml());
     }
     if (status === 'completed') {
       log('!!', `Call ${short(id)}: Vobiz reported "completed" but the app never answered; trying again`);
@@ -315,6 +327,7 @@ export function createBridge(options = {}) {
   async function onHangup(req, res, url, params) {
     const call = calls.get(params.CallUUID);
     if (call) {
+      call.over = true;
       if (!call.finished) finish(call, `ended (${params.HangupCause || params.CallStatus || 'hangup'})`);
       endRinging(call, call.finished === 'answered' ? 'completed' : 'caller_hung_up');
     }
@@ -340,9 +353,11 @@ export function createBridge(options = {}) {
 
   /**
    * Metadata on the SIP INVITE, so the app can match the call to the push it
-   * already showed. Vobiz's docs disagree on the key format ("RefX-VH=" on the
-   * SIP headers page, "Ref=" in the Dial examples), so it is configurable; the
-   * app falls back to matching the caller's number when neither arrives.
+   * already showed. PushRef is the push's call_id, on every attempt: the app
+   * auto-answers an accepted call only when PushRef equals that call_id, never
+   * by caller or callee number (with CALLER_ID_MODE=number every call shows
+   * the same number). Vobiz's docs disagree on the key format ("RefX-VH=" on
+   * the SIP headers page, "Ref=" in the Dial examples), so it is configurable.
    */
   function sipHeaders(call) {
     const caller = call.from.replace(/\D/g, '');
@@ -362,7 +377,7 @@ export function createBridge(options = {}) {
   function endReason(call) {
     const outcome = String(call.finished || '');
     if (outcome === 'answered') return 'answered_elsewhere';
-    if (outcome === 'declined' || outcome === 'missed') return outcome;
+    if (['declined', 'missed', 'busy'].includes(outcome)) return outcome;
     return 'caller_hung_up';
   }
 
@@ -392,6 +407,12 @@ export function createBridge(options = {}) {
     }
     for (const user of config.alwaysRing) names.add(user);
     return [...names];
+  }
+
+  /** Whether `user` is on a call this bridge connected and that has not ended. */
+  function onCall(user) {
+    for (const c of calls.values()) if (c.bridged && !c.over && c.targets.includes(user)) return true;
+    return false;
   }
 
   /** The registered phones of these endpoints. */
@@ -646,6 +667,9 @@ export function createBridge(options = {}) {
       server: publicBase(),
       sent_at: String(Date.now()),
       ttl_ms: String(Math.max(0, call.deadline - Date.now())),
+      // The user is already on a call: show call waiting, not the full-screen
+      // ringing screen, and leave the active call's service alone.
+      ...(call.lineBusy ? { line_busy: '1' } : {}),
       expires_at: String(call.deadline),
       ...(call.test ? { test: '1' } : {}),
     };
