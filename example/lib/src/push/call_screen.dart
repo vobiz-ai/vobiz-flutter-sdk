@@ -47,8 +47,12 @@ class CallScreen {
           type: 0,
           duration: ringFor.inMilliseconds,
           extra: extra,
+          // The app posts missed calls itself (CallPlatform.showMissedCall),
+          // from how the call really ended. The plugin's own appears only on
+          // its 45 s timeout: also for a call answered elsewhere, never when
+          // the caller hangs up.
           missedCallNotification: const ck.NotificationParams(
-            showNotification: true,
+            showNotification: false,
             isShowCallback: false,
             subtitle: 'Missed call',
           ),
@@ -80,12 +84,6 @@ class CallScreen {
   static Future<void> end(String id) async {
     if (!supported) return;
     await _guard(() => ck.FlutterCallkitIncoming.endCall(id));
-  }
-
-  /// Turns the ringing screen into an ongoing-call notification.
-  static Future<void> connected(String id) async {
-    if (!supported) return;
-    await _guard(() => ck.FlutterCallkitIncoming.setCallConnected(id));
   }
 
   /// The call the screen knows about: on Android, only the latest one.
@@ -130,4 +128,27 @@ class CallScreen {
       return null;
     }
   }
+}
+
+/// [CallScreen] as an object, so the app can be tested without the plugin.
+class CallScreenApi {
+  const CallScreenApi();
+
+  Stream<ck.CallEvent?> get events => CallScreen.events;
+
+  Future<void> showIncoming({
+    required String id,
+    required String caller,
+    String subtitle = 'Vobiz call',
+    Map<String, dynamic> extra = const <String, dynamic>{},
+  }) =>
+      CallScreen.showIncoming(id: id, caller: caller, subtitle: subtitle, extra: extra);
+
+  Future<void> end(String id) => CallScreen.end(id);
+
+  Future<List<ck.CallKitParams>> active() => CallScreen.active();
+
+  Future<bool?> canUseFullScreen() => CallScreen.canUseFullScreen();
+
+  Future<void> requestFullScreen() => CallScreen.requestFullScreen();
 }

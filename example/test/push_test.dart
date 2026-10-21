@@ -60,13 +60,44 @@ void main() {
       expect(PushCall.fromExtra(null), isNull);
     });
 
+    test('expires ttl_ms after it arrived, whatever the bridge clock says (#50)', () {
+      final arrived = DateTime(2026, 1, 1, 12);
+      final call = PushCall.fromData(<String, dynamic>{
+        ...data,
+        'ttl_ms': '30000',
+        // A bridge clock an hour behind this phone's: ignored with ttl_ms.
+        'expires_at': '${arrived.subtract(const Duration(hours: 1)).millisecondsSinceEpoch}',
+      }, receivedAt: arrived)!;
+      expect(call.expiresAt, arrived.add(const Duration(seconds: 30)));
+    });
+
+    test('reads line_busy (call waiting)', () {
+      expect(PushCall.fromData(<String, dynamic>{...data, 'line_busy': '1'})!.lineBusy, isTrue);
+      expect(PushCall.fromData(data)!.lineBusy, isFalse);
+    });
+
+    test('reads cancel pushes in both spellings, with the reason', () {
+      final elsewhere = PushCall.fromData(<String, dynamic>{
+        'type': 'call_ended',
+        'call_id': 'abc',
+        'reason': 'answered_elsewhere',
+        'answered_by': 'play2',
+      })!;
+      expect(elsewhere.kind, PushKind.cancel);
+      expect(elsewhere.answeredElsewhere, isTrue);
+      expect(elsewhere.answeredBy, 'play2');
+      final cancel = PushCall.fromData(<String, dynamic>{'type': 'cancel', 'call_id': 'abc', 'reason': 'missed'})!;
+      expect(cancel.kind, PushKind.cancel);
+      expect(cancel.answeredElsewhere, isFalse);
+    });
+
     test('reads a call-ended push', () {
       final ended = PushCall.fromData(<String, dynamic>{
         'type': 'call_ended',
         'call_id': 'abc',
         'reason': 'caller_hung_up',
       })!;
-      expect(ended.kind, PushKind.callEnded);
+      expect(ended.kind, PushKind.cancel);
       expect(ended.reason, 'caller_hung_up');
     });
   });
@@ -87,22 +118,17 @@ void main() {
       expect(samePhoneNumber('Unknown', 'Unknown'), isFalse);
     });
 
-    test('the call reference decides when it arrived, in either spelling', () {
+    test('the call reference decides, in either spelling', () {
       expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-PushRef': 'ref-1'}), isTrue);
       expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-PushRefX-VH': 'ref-1'}), isTrue);
-      expect(
-          inviteMatchesPush(push,
-              headers: <String, String>{'X-VH-PushRef': 'ref-2'}, from: '+919876543210'),
-          isFalse);
+      expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-PushRef': 'ref-2'}), isFalse);
     });
 
-    test('without a reference, the caller or the called Vobiz number matches', () {
-      expect(inviteMatchesPush(push, headers: const <String, String>{}, from: '919876543210'), isTrue);
-      // CALLER_ID_MODE=number: the INVITE shows the Vobiz number.
-      expect(inviteMatchesPush(push, headers: const <String, String>{}, from: '+918000000000'), isTrue);
-      expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-Caller': '919876543210'},
-          from: '+918000000001'), isTrue);
-      expect(inviteMatchesPush(push, headers: const <String, String>{}, from: '+917000000000'), isFalse);
+    test('a number is never enough to match (#46)', () {
+      // CALLER_ID_MODE=number: every call shows the Vobiz number, so a number
+      // match would auto-answer whichever call came next.
+      expect(inviteMatchesPush(push, headers: const <String, String>{}), isFalse);
+      expect(inviteMatchesPush(push, headers: <String, String>{'X-VH-Caller': '919876543210'}), isFalse);
     });
 
     test('reads the real caller the bridge passed', () {
@@ -160,6 +186,71 @@ void main() {
         api.register(username: 'play1'),
         throwsA(isA<PushBridgeException>().having((e) => e.message, 'message', contains('#key='))),
       );
+    });
+
+    test('pairs with the bridge key and keeps the device token it returns', () async {
+      late http.Request seen;
+      final api = PushBridgeApi(config, client: MockClient((request) async {
+        seen = request;
+        return http.Response(
+            jsonEncode(<String, Object>{'ok': true, 'username': 'play1', 'push': true, 'device_token': 'd1.s'}),
+            200);
+      }));
+      final registration = await api.register(username: 'play1', token: 'fcm-token');
+      expect(seen.headers['X-Bridge-Key'], 'abc123');
+      expect(seen.headers['Authorization'], isNull);
+      expect(registration.deviceToken, 'd1.s');
+    });
+
+    test('once paired, sends only the device token; pairs again if the bridge forgot it', () async {
+      final seen = <http.Request>[];
+      final api = PushBridgeApi(config, deviceToken: 'd1.s', client: MockClient((request) async {
+        seen.add(request);
+        if (seen.length == 1) return http.Response('{"error":"unknown device"}', 401);
+        return http.Response('{"ok":true,"push":true,"device_token":"d2.t"}', 200);
+      }));
+      final registration = await api.register(username: 'play1', token: 'fcm-token');
+      expect(seen.first.headers['Authorization'], 'Bearer d1.s');
+      expect(seen.first.headers['X-Bridge-Key'], isNull);
+      expect(seen.last.headers['X-Bridge-Key'], 'abc123');
+      expect(registration.deviceToken, 'd2.t');
+    });
+
+    test('unregister and test calls send the device token, not the bridge key', () async {
+      final seen = <http.Request>[];
+      final api = PushBridgeApi(config, deviceToken: 'd1.s', client: MockClient((request) async {
+        seen.add(request);
+        return http.Response('{"ok":true}', 200);
+      }));
+      await api.unregister();
+      await api.sendTestCall(delaySeconds: 5);
+      expect(seen.map((r) => r.url.path), <String>['/push/unregister', '/push/test']);
+      expect(seen.every((r) => r.headers['Authorization'] == 'Bearer d1.s'), isTrue);
+      expect(seen.every((r) => r.headers['X-Bridge-Key'] == null), isTrue);
+      expect(jsonDecode(seen.last.body), <String, Object>{'delay_seconds': 5});
+    });
+
+    test('registered posts the call key; accept reports a call that is already over', () async {
+      final call = PushCall.fromData(<String, dynamic>{
+        'type': 'incoming_call',
+        'call_id': 'c1',
+        'call_key': 'per-call',
+        'server': 'https://bridge.example',
+      })!;
+      final seen = <http.Request>[];
+      final client = MockClient((request) async {
+        seen.add(request);
+        return request.url.path == '/push/accept'
+            ? http.Response('{"ok":true,"finished":true,"reason":"answered_elsewhere"}', 200)
+            : http.Response('{"ok":true,"redial":"transferred","finished":false}', 200);
+      });
+      final registered = await PushBridgeApi.registered(call, client: client);
+      expect(registered.finished, isFalse);
+      expect(seen.single.url.path, '/push/registered');
+      expect(jsonDecode(seen.single.body), <String, String>{'call_id': 'c1', 'call_key': 'per-call'});
+      final accepted = await PushBridgeApi.accept(call, client: client);
+      expect(accepted.finished, isTrue);
+      expect(accepted.reason, 'answered_elsewhere');
     });
 
     test('accept and decline use the call key, not the bridge key', () async {

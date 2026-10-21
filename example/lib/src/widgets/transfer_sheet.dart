@@ -111,19 +111,19 @@ class _TransferSheet extends StatelessWidget {
             ),
           const SizedBox(height: 16),
           const SectionLabel('What moves'),
-          SegmentedButton<TransferLeg>(
-            segments: const <ButtonSegment<TransferLeg>>[
-              ButtonSegment(value: TransferLeg.aLeg, label: Text('Move me')),
-              ButtonSegment(value: TransferLeg.bLeg, label: Text('Move the other party')),
+          SegmentedButton<TransferParty>(
+            segments: const <ButtonSegment<TransferParty>>[
+              ButtonSegment(value: TransferParty.me, label: Text('Move me')),
+              ButtonSegment(value: TransferParty.other, label: Text('Move them')),
+              ButtonSegment(value: TransferParty.both, label: Text('Both')),
             ],
-            selected: <TransferLeg>{c.transferLeg},
-            onSelectionChanged: (s) => c.update(() => c.transferLeg = s.first),
+            selected: <TransferParty>{c.transferParty},
+            onSelectionChanged: (s) => c.update(() => c.transferParty = s.first),
           ),
           const SizedBox(height: 6),
           Text(
-            c.transferLeg == TransferLeg.aLeg
-                ? 'aleg: your leg moves onto the target; the other party is dropped.'
-                : 'bleg: the other party moves onto the target; you are dropped.',
+            _legHelp(c),
+            key: const Key('transferLegHelp'),
             style: TextStyle(fontSize: 11, color: pg.faint),
           ),
           const SizedBox(height: 8),
@@ -161,4 +161,20 @@ class _TransferSheet extends StatelessWidget {
       ),
     );
   }
+}
+
+/// What the selected option does on this call, with the `legs` it sends.
+String _legHelp(PlaygroundController c) {
+  final inbound = c.client.callDirection == CallDirection.inbound;
+  final legs = c.transferLeg.apiValue;
+  final side = inbound
+      ? 'This call rang this app, so the caller is the A-leg and you are the B-leg.'
+      : 'You placed this call, so you are the A-leg.';
+  final what = switch (c.transferParty) {
+    TransferParty.me => 'Your leg moves onto the target; the other party is dropped.',
+    TransferParty.other => 'The other party moves onto the target; you are dropped.',
+    TransferParty.both => 'Both legs leave this call and each runs the transfer on its own '
+        '(each dials the target). Mostly useful for a conference.',
+  };
+  return '$what legs=$legs. $side';
 }

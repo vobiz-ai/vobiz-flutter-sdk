@@ -46,7 +46,10 @@ restarts it and `q` quits.
 - In a call: timer, live latency, the call's headers, *Mute*, *Keypad*, *Speaker*,
   *Transfer* and *Hang up*.
 - *Transfer* (Zero-Config only): to a number (blind) or a SIP user (carrying your
-  headers), moving yourself or the other party.
+  headers), moving yourself, the other party, or both. The sheet shows the `legs` value
+  it sends: on a call you placed you are the A-leg; on a call that rang you, the
+  caller is.
+- *Recent calls*: the local call log, with missed calls marked.
 
 **Trace**
 Every step of sign-in and every call event, in the web Playground's wording, with copy
@@ -62,8 +65,13 @@ Calls to a Vobiz number reach the app through the push bridge in
 [push_bridge/](push_bridge/README.md): it answers the number, rings the app's endpoint,
 and sends a Firebase push that wakes the app when it is in the background or swiped
 away. The system call screen (flutter_callkit_incoming) rings, full screen on a
-locked phone. *Accept* opens the app, which signs in with the saved credentials and
-answers when the bridge rings it again. *Decline* makes the caller hear busy.
+locked phone, and the app signs in with the saved credentials right away, while it
+rings, then tells the bridge (`/push/registered`) so it dials the app at once.
+*Accept* answers the call that is already ringing over SIP. *Decline* makes the caller
+hear busy. When another device answers, a `call_ended` push stops the ringing with no
+missed-call notification; when the caller hangs up first, the app posts one. A call
+that arrives during a call shows as call waiting, not as a second ringing screen.
+Every call ends up in *Recent calls* on the Dialer.
 
 To set it up (Android):
 
@@ -78,10 +86,20 @@ To set it up (Android):
 4. *Send a test call in 10 s*, then press Home or swipe the app away: the call screen
    appears.
 
-`MainActivity` uses `launchMode="singleInstance"`: *Accept* re-opens the app from the
-call screen's own task, and with `singleTop` that started a second copy of the app
-(and a second SIP connection). It also shows over the lock screen when, and only
-when, it is opened by *Accept*.
+How the Android side fits together (`android/app/src/main/kotlin/…`):
+
+- **One Flutter engine.** `CallEngine` keeps the app's only engine in
+  `FlutterEngineCache`; `MainActivity` runs on it (`provideFlutterEngine`) and does not
+  destroy it. `CallPushReceiver` takes the bridge's Firebase messages and hands them to
+  that engine, starting it headless when the app is closed. The Dart side registers no
+  Firebase or call-screen background handlers, so no other engines start.
+- **A foreground service for every call.** `CallService` (types
+  `phoneCall|microphone`) runs from the moment a call is placed or answered, in the app
+  or on the call screen, until it ends, with an ongoing-call notification and *Hang up*.
+  Without it Android silences the microphone once the app is in the background.
+- `MainActivity` uses `launchMode="singleInstance"`, so *Accept* re-opens the running
+  activity from the call screen's own task. It shows over the lock screen when, and only
+  when, it is opened by *Accept*.
 
 ## Tests
 

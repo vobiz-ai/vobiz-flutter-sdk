@@ -4,7 +4,11 @@ enum TransferLeg {
   aLeg('aleg'),
 
   /// Moves the other party onto the transfer target. Your leg is dropped.
-  bLeg('bleg');
+  bLeg('bleg'),
+
+  /// Moves both legs: each runs the transfer XML on its own (for example,
+  /// both join a conference).
+  both('both');
 
   const TransferLeg(this.apiValue);
 

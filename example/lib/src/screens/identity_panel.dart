@@ -149,6 +149,13 @@ class _IdentityPanelState extends State<IdentityPanel> {
       ),
       const SizedBox(height: 18),
       if (zero) ...<Widget>[
+        Text(
+          'Demo only: Zero-Config sends your Auth Token to the shared demo webhook server. '
+          'A production app signs in with SIP credentials or a token from its own backend.',
+          key: const Key('demoOnly'),
+          style: TextStyle(fontSize: 11, height: 1.4, color: pg.warning),
+        ),
+        const SizedBox(height: 12),
         const SectionLabel('Auth ID',
             trailing: InfoTip(
                 title: 'Auth ID', message: 'Found in your Vobiz Console Dashboard.')),
@@ -157,8 +164,8 @@ class _IdentityPanelState extends State<IdentityPanel> {
           controller: _authId,
           autocorrect: false,
           textCapitalization: TextCapitalization.characters,
-          decoration: const InputDecoration(hintText: 'e.g. MA_XXXXXXX'),
-          onChanged: (v) => c.authId = v,
+          decoration: InputDecoration(hintText: 'e.g. MA_XXXXXXX', errorText: _missing(c, 'authId')),
+          onChanged: (v) => _edited(c, 'authId', () => c.authId = v),
         ),
         const SizedBox(height: 14),
         const SectionLabel('Auth Token',
@@ -175,13 +182,14 @@ class _IdentityPanelState extends State<IdentityPanel> {
           enableSuggestions: false,
           decoration: InputDecoration(
             hintText: '••••••••',
+            errorText: _missing(c, 'authToken'),
             suffixIcon: IconButton(
               tooltip: _showToken ? 'Hide' : 'Show',
               icon: Icon(_showToken ? Icons.visibility_off : Icons.visibility, size: 18),
               onPressed: () => setState(() => _showToken = !_showToken),
             ),
           ),
-          onChanged: (v) => c.authToken = v,
+          onChanged: (v) => _edited(c, 'authToken', () => c.authToken = v),
         ),
         const SizedBox(height: 14),
         InkWell(
@@ -225,8 +233,8 @@ class _IdentityPanelState extends State<IdentityPanel> {
           key: const Key('sipUsername'),
           controller: _sipUser,
           autocorrect: false,
-          decoration: const InputDecoration(hintText: 'Username'),
-          onChanged: (v) => c.sipUsername = v,
+          decoration: InputDecoration(hintText: 'Username', errorText: _missing(c, 'sipUsername')),
+          onChanged: (v) => _edited(c, 'sipUsername', () => c.sipUsername = v),
         ),
         const SizedBox(height: 12),
         TextField(
@@ -237,13 +245,14 @@ class _IdentityPanelState extends State<IdentityPanel> {
           enableSuggestions: false,
           decoration: InputDecoration(
             hintText: 'Password',
+            errorText: _missing(c, 'sipPassword'),
             suffixIcon: IconButton(
               tooltip: _showPassword ? 'Hide' : 'Show',
               icon: Icon(_showPassword ? Icons.visibility_off : Icons.visibility, size: 18),
               onPressed: () => setState(() => _showPassword = !_showPassword),
             ),
           ),
-          onChanged: (v) => c.sipPassword = v,
+          onChanged: (v) => _edited(c, 'sipPassword', () => c.sipPassword = v),
           onSubmitted: (_) => c.connect(),
         ),
         const SizedBox(height: 8),
@@ -277,13 +286,30 @@ class _IdentityPanelState extends State<IdentityPanel> {
             : const Icon(Icons.login),
         label: const Text('Connect'),
       ),
-      if (c.status == PhoneStatus.error)
+      if (c.connectError != null && !connecting)
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text(c.connectError!,
+              key: const Key('connectError'),
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: pg.danger)),
+        )
+      else if (c.status == PhoneStatus.error)
         Padding(
           padding: const EdgeInsets.only(top: 10),
           child: Text('${c.statusText} — the Trace tab has the details.',
               textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: pg.danger)),
         ),
     ];
+  }
+
+  /// "Required" under a field Connect found empty, until it is filled in.
+  String? _missing(PlaygroundController c, String field) =>
+      c.missingFields.contains(field) ? 'Required' : null;
+
+  void _edited(PlaygroundController c, String field, VoidCallback change) {
+    change();
+    if (c.missingFields.contains(field)) c.update(() => c.missingFields.remove(field));
   }
 
   Widget _tab(String label, IconData icon, bool selected, VoidCallback onTap, PlaygroundColors pg) {

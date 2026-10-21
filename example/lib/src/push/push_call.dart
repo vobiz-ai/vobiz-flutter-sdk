@@ -5,8 +5,32 @@ enum PushKind {
   /// Someone is calling: show the incoming-call screen.
   incomingCall,
 
-  /// The call stopped ringing (answered, declined, caller hung up, missed).
-  callEnded,
+  /// Stop ringing: the call was answered elsewhere, declined, or the caller
+  /// hung up. [PushCall.reason] says which. Sent as `cancel` (or, by older
+  /// bridges, `call_ended`).
+  cancel,
+}
+
+/// Why a [PushKind.cancel] push stopped the ringing.
+abstract final class CancelReason {
+  /// Another phone, browser or device took the call.
+  static const String answeredElsewhere = 'answered_elsewhere';
+
+  /// The call was answered and has now ended (older bridges send this when
+  /// any device answered).
+  static const String completed = 'completed';
+
+  /// Someone declined it (this user, on another device).
+  static const String declined = 'declined';
+
+  /// The caller gave up before anyone answered.
+  static const String callerHungUp = 'caller_hung_up';
+
+  /// Nobody answered before the bridge gave up.
+  static const String missed = 'missed';
+
+  /// The user was on another call and did not take this one.
+  static const String busy = 'busy';
 }
 
 /// One push message from the push bridge (`example/push_bridge`), as it
@@ -23,18 +47,28 @@ class PushCall {
     this.expiresAt,
     this.reason = '',
     this.isTest = false,
+    this.lineBusy = false,
+    this.answeredBy = '',
   });
 
   /// Reads a Firebase data message. Null when it is not from the push bridge.
-  static PushCall? fromData(Map<String, dynamic> data) {
+  ///
+  /// The call screen expires `ttl_ms` after [receivedAt] (default: now), so
+  /// a phone whose clock is off still stops ringing on time. Only without
+  /// `ttl_ms` (older bridges) is the bridge's absolute `expires_at` used.
+  static PushCall? fromData(Map<String, dynamic> data, {DateTime? receivedAt}) {
     final kind = switch ('${data['type'] ?? ''}') {
       'incoming_call' => PushKind.incomingCall,
-      'call_ended' => PushKind.callEnded,
+      'cancel' || 'call_ended' => PushKind.cancel,
       _ => null,
     };
     final callId = '${data['call_id'] ?? ''}';
     if (kind == null || callId.isEmpty) return null;
-    final expires = int.tryParse('${data['expires_at'] ?? ''}');
+    final ttl = int.tryParse('${data['ttl_ms'] ?? ''}');
+    final at = int.tryParse('${data['expires_at'] ?? ''}');
+    final expires = ttl != null
+        ? (receivedAt ?? DateTime.now()).add(Duration(milliseconds: ttl)).millisecondsSinceEpoch
+        : at;
     return PushCall(
       kind: kind,
       callId: callId,
@@ -45,6 +79,8 @@ class PushCall {
       expiresAt: expires == null ? null : DateTime.fromMillisecondsSinceEpoch(expires),
       reason: '${data['reason'] ?? ''}',
       isTest: '${data['test'] ?? ''}' == '1',
+      lineBusy: '${data['line_busy'] ?? ''}' == '1',
+      answeredBy: '${data['answered_by'] ?? ''}',
     );
   }
 
@@ -74,16 +110,29 @@ class PushCall {
   /// After this the caller has stopped waiting; the push is stale.
   final DateTime? expiresAt;
 
-  /// Why ringing stopped, for [PushKind.callEnded].
+  /// Why ringing stopped, for [PushKind.cancel]: one of [CancelReason].
   final String reason;
+
+  /// Some other device took the call: not a missed call.
+  bool get answeredElsewhere =>
+      reason == CancelReason.answeredElsewhere || reason == CancelReason.completed;
 
   /// A test call from the app's "Send a test call" button: nothing to connect.
   final bool isTest;
 
+  /// The bridge knows this endpoint is already on a call: call waiting, not
+  /// the full-screen ringing screen.
+  final bool lineBusy;
+
+  /// For [CancelReason.answeredElsewhere]: the endpoint that answered, when
+  /// Vobiz named it.
+  final String answeredBy;
+
   bool get isExpired => expiresAt != null && DateTime.now().isAfter(expiresAt!);
 
   /// The fields the call screen keeps, so Accept and Decline can reach the
-  /// bridge even when the app was closed.
+  /// bridge even when the app was closed. The expiry is stored as an
+  /// absolute time on this phone's clock, worked out when the push arrived.
   Map<String, dynamic> toExtra() => <String, dynamic>{
         'source': 'push',
         'type': 'incoming_call',
@@ -127,18 +176,14 @@ String? pushRefFromHeaders(Map<String, String> headers) {
   return null;
 }
 
-/// Whether an incoming SIP call is the call [push] announced.
+/// Whether an incoming SIP call is the call [push] announced: only when the
+/// INVITE carries the bridge's call reference for exactly that call.
 ///
-/// The bridge's call reference decides when it arrived. Without it, the
-/// caller is compared with both numbers the push carries, because the
-/// bridge presents either the real caller or the Vobiz number that was
-/// called (CALLER_ID_MODE).
-bool inviteMatchesPush(PushCall push, {required Map<String, String> headers, String? from}) {
-  final ref = pushRefFromHeaders(headers);
-  if (ref != null) return ref == push.callId;
-  final caller = callerFromHeaders(headers) ?? from ?? '';
-  return samePhoneNumber(caller, push.caller) || samePhoneNumber(caller, push.callee);
-}
+/// Numbers are never enough. With the bridge's default caller ID every call
+/// shows the Vobiz number, so matching by number would answer any call that
+/// arrived after an Accept without a tap.
+bool inviteMatchesPush(PushCall push, {required Map<String, String> headers}) =>
+    pushRefFromHeaders(headers) == push.callId;
 
 /// The real caller the bridge passed on the INVITE (`X-VH-Caller`), when its
 /// caller ID shows the Vobiz number instead.
