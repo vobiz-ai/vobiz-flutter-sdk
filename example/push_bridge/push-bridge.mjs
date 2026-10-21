@@ -285,8 +285,24 @@ export function createBridge(options = {}) {
     const action = String(params.DialAction || '').toLowerCase();
     if (call) {
       if (action === 'answer' || action === 'connected' || event === 'DialAnswer' || event === 'DialConnected') {
-        if (!call.bridged) log('ok', `Call ${short(call.id)}: the app answered`);
-        call.bridged = true;
+        if (!call.bridged) {
+          const by = endpointUsername(params.DialBLegTo || '');
+          log('ok', `Call ${short(call.id)}: answered${by ? ` by ${by}` : ''}`);
+          call.bridged = true;
+          finish(call, 'answered');
+          // Every phone that was pushed and has not got the call stops
+          // ringing now, without a "missed call". The phone that answered
+          // ignores this: it has the call (PushRef = call_id).
+          if (!call.endedPushSent) {
+            call.endedPushSent = true;
+            background(pushToTargets(call, {
+              type: 'call_ended',
+              call_id: call.id,
+              reason: 'answered_elsewhere',
+              ...(by ? { answered_by: by } : {}),
+            }), 'push');
+          }
+        }
       } else if (action === 'hangup' || event === 'DialHangup') {
         const cause = params.DialBLegHangupCauseName || params.DialBLegHangupCause || '';
         log('..', `Call ${short(call.id)}: ringing the app ended${cause ? ` (${cause})` : ''}`);
@@ -340,6 +356,14 @@ export function createBridge(options = {}) {
     const event = String(params.Event || '').toLowerCase();
     const status = String(params.CallStatus || '').toLowerCase();
     return event === 'hangup' || ['completed', 'busy', 'failed', 'no-answer', 'canceled', 'cancel'].includes(status);
+  }
+
+  /** The `reason` the app is given for a call that is over. */
+  function endReason(call) {
+    const outcome = String(call.finished || '');
+    if (outcome === 'answered') return 'answered_elsewhere';
+    if (outcome === 'declined' || outcome === 'missed') return outcome;
+    return 'caller_hung_up';
   }
 
   function finish(call, outcome) {
@@ -477,7 +501,7 @@ export function createBridge(options = {}) {
     const body = await readJson(req);
     const call = callFor(body);
     if (!call) return sendJson(res, 404, { error: 'Unknown call' });
-    if (call.finished) return sendJson(res, 200, { ok: true, finished: true });
+    if (call.finished) return sendJson(res, 200, { ok: true, finished: true, reason: endReason(call) });
     call.accepted = true;
     call.deadline = Math.max(call.deadline, call.createdAt + ACCEPTED_GRACE_SECONDS * 1000);
     log('ok', `Call ${short(call.id)} accepted on the phone; waiting for the app to sign in`);
