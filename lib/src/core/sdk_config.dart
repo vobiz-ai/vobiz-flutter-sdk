@@ -1,3 +1,4 @@
+import '../network/keep_alive.dart';
 import '../webrtc/ice_config.dart';
 import '../webrtc/media_constraints.dart';
 
@@ -30,6 +31,7 @@ class SdkConfig {
     this.debug = false,
     this.iceConfig = const IceConfig(),
     this.mediaConstraints = const MediaConstraints(),
+    this.keepAlive = const KeepAliveConfig(),
   });
 
   /// The hosted Vobiz WebRTC Playground server: the "production webhook
@@ -86,4 +88,8 @@ class SdkConfig {
   /// Defaults to audio-only with echo cancellation, noise suppression and
   /// auto gain control enabled.
   final MediaConstraints mediaConstraints;
+
+  /// How the signalling WebSocket is kept open and how fast a dead one is
+  /// noticed. Defaults to a WebSocket ping every 15 s (dead within 30 s).
+  final KeepAliveConfig keepAlive;
 }

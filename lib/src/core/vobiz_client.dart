@@ -50,6 +50,7 @@ class VobizClient {
         _sip = SIPService(
           wsUrl: config.wsUrl,
           sipServer: config.sipServer,
+          keepAlive: config.keepAlive,
           logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
         ),
         _peer = PeerService(

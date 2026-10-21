@@ -8,6 +8,7 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../core/sip_headers.dart';
+import '../network/keep_alive.dart';
 import '../utils/logger.dart';
 
 // ---------------------------------------------------------------------------
@@ -457,6 +458,7 @@ class SIPService {
   SIPService({
     required this.wsUrl,
     required this.sipServer,
+    this.keepAlive = const KeepAliveConfig(),
     Logger? logger,
   })  : _logger = logger ?? Logger(),
         _localTag = _rand(8),
@@ -465,6 +467,7 @@ class SIPService {
 
   final String wsUrl;
   final String sipServer;
+  final KeepAliveConfig keepAlive;
   final Logger _logger;
 
   final String _localTag;
@@ -518,7 +521,7 @@ class SIPService {
 
   WebSocketChannel? _socket;
   Timer? _registrationRefreshTimer;
-  Timer? _optionsKeepAliveTimer;
+  CrlfKeepAlive? _crlfKeepAlive;
 
   final _connectionState =
       ValueNotifier<SipConnectionState>(SipConnectionState.disconnected);
@@ -555,7 +558,7 @@ class SIPService {
       _socket = IOWebSocketChannel.connect(
         Uri.parse(wsUrl),
         protocols: const <String>['sip'],
-        pingInterval: const Duration(seconds: 30),
+        pingInterval: keepAlive.pingInterval,
         connectTimeout: const Duration(seconds: 20),
       );
       // Await the actual TCP/TLS/WebSocket handshake. Without this, the
@@ -650,7 +653,7 @@ class SIPService {
   void disconnect() {
     _manualDisconnect = true;
     _registrationRefreshTimer?.cancel();
-    _optionsKeepAliveTimer?.cancel();
+    _crlfKeepAlive?.stop();
     _clearCallState();
     _socket?.sink.close();
     _socket = null;
@@ -745,7 +748,7 @@ class SIPService {
         _connectionState.value = SipConnectionState.disconnected;
         _registrationState.value = SipRegistrationState.failed;
         _registrationRefreshTimer?.cancel();
-        _optionsKeepAliveTimer?.cancel();
+        _crlfKeepAlive?.stop();
         if (!_manualDisconnect && !errorReported) {
           errorReported = true;
           onSocketError?.call('SIP socket error: $e');
@@ -756,7 +759,7 @@ class SIPService {
         _logger.warn('SIP WebSocket closed');
         _connectionState.value = SipConnectionState.disconnected;
         _registrationRefreshTimer?.cancel();
-        _optionsKeepAliveTimer?.cancel();
+        _crlfKeepAlive?.stop();
         if (!_manualDisconnect && !errorReported) {
           errorReported = true;
           _registrationState.value = SipRegistrationState.failed;
@@ -767,7 +770,11 @@ class SIPService {
   }
 
   void _handleMessage(String raw) {
-    if (raw.trim().isEmpty) return;
+    if (raw.trim().isEmpty) {
+      // A bare CRLF is the RFC 5626 keep-alive pong.
+      _crlfKeepAlive?.pongReceived();
+      return;
+    }
     _logger.info('SIP << ${_summarize(raw)}');
     final msg = SipParser.parse(raw);
     if (msg.isRequest) {
@@ -906,7 +913,7 @@ class SIPService {
         _logger.info('SIP registered as $_username');
         _registrationState.value = SipRegistrationState.registered;
         _startRegistrationRefresh();
-        _startOptionsKeepAlive();
+        _startKeepAlive();
         onRegistered?.call();
         break;
       case 401:
@@ -1103,27 +1110,31 @@ class SIPService {
     );
   }
 
-  void _startOptionsKeepAlive() {
-    _optionsKeepAliveTimer?.cancel();
-    _optionsKeepAliveTimer = Timer.periodic(
-      const Duration(seconds: 60),
-      (_) {
-        if (_username == null ||
-            _connectionState.value != SipConnectionState.connected) return;
-        final callId = '${_rand(12)}@vobiz-client';
-        _send(<String>[
-          'OPTIONS sip:admin@$sipServer SIP/2.0',
-          'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bK${SipBuilder._branch()}',
-          'From: <sip:${_username!}@$sipServer>;tag=$_localTag',
-          'To: <sip:admin@$sipServer>',
-          'Call-ID: $callId',
-          'CSeq: ${_cseq++} OPTIONS',
-          'Content-Length: 0',
-          '',
-          '',
-        ].join('\r\n'));
+  /// Starts the SIP-level keep-alive, if configured. The WebSocket ping
+  /// ([KeepAliveConfig.pingInterval]) runs from connect() regardless.
+  ///
+  /// This used to send OPTIONS to `sip:admin@<registrar>` every 60 s, which
+  /// the registrar rejects ("No contact found") and logs as an error.
+  void _startKeepAlive() {
+    _crlfKeepAlive?.stop();
+    _crlfKeepAlive = null;
+    final interval = keepAlive.crlfInterval;
+    if (interval == null) return;
+    _crlfKeepAlive = CrlfKeepAlive(
+      interval: interval,
+      pongTimeout: keepAlive.crlfPongTimeout,
+      send: (String ping) {
+        if (_connectionState.value == SipConnectionState.connected) {
+          debugOnSend?.call(ping);
+          _socket?.sink.add(ping);
+        }
       },
-    );
+      onDead: () {
+        _logger.warn('No keep-alive pong: closing the dead WebSocket');
+        // Closing fires onDone, which reports the drop and reconnects.
+        _socket?.sink.close();
+      },
+    )..start();
   }
 
   void _clearCallState() {

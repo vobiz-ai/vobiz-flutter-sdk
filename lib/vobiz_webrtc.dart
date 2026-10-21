@@ -12,6 +12,7 @@ export 'src/webrtc/media_constraints.dart';
 
 // ── Network ───────────────────────────────────────────────────────────────────
 export 'src/network/connectivity_monitor.dart';
+export 'src/network/keep_alive.dart' show KeepAliveConfig;
 export 'src/network/network_event.dart';
 export 'src/network/reconnect_policy.dart';
 
