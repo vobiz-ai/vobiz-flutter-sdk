@@ -13,8 +13,13 @@
  *   2. rings the app's SIP endpoint straight away (`<Dial><User>`). If the
  *      app is open, it rings at once;
  *   3. while the endpoint is offline, keeps the caller hearing ringback and
- *      dials again every few seconds, until the app has signed back in
- *      (the user tapped Accept), the user declined, or RING_SECONDS passed.
+ *      dials again, at once when the app reports its SIP registration
+ *      (POST /push/registered) and otherwise every few seconds, until it
+ *      answers, the user declines, or RING_SECONDS pass.
+ *
+ * Webhooks must carry a valid Vobiz signature (PUBLIC_URL and
+ * VOBIZ_AUTH_TOKEN are required); phones pair once with the bridge key and
+ * then use their own device token. README.md has the app ↔ bridge protocol.
  *
  * Node 18 or newer, no npm packages. Settings come from a .env file next to
  * this script (see .env.example) or from environment variables.
