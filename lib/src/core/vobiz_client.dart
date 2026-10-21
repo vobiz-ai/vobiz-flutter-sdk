@@ -60,7 +60,8 @@ class VobizClient {
         _http = httpClient ?? http.Client(),
         _ownsHttp = httpClient == null,
         backendUrl = config.backendUrl {
-    _api = WebhookServerApi(client: _http);
+    _api = WebhookServerApi(
+        client: _http, allowAccountCredentials: config.unsafeDemoZeroConfig);
     _wireSip();
   }
 
@@ -177,6 +178,11 @@ class VobizClient {
 
   /// Zero-Config Setup: sign in with the account's Auth ID and Auth Token.
   ///
+  /// **Demo only.** Throws [VobizDemoModeRequiredException] unless
+  /// [SdkConfig.unsafeDemoZeroConfig] is true. Production apps use
+  /// `connectWithCredentialsProvider` with per-user credentials from their
+  /// own backend; see CREDENTIALS.md.
+  ///
   /// Like the web Playground, this sends them to the webhook server's
   /// `/api/setup`, which finds or creates the "Vobiz WebRTC Playground"
   /// application and endpoint on that account, points the application at
@@ -197,6 +203,10 @@ class VobizClient {
     final token = authToken.trim();
     if (id.isEmpty || token.isEmpty) {
       throw ArgumentError('Both the Auth ID and the Auth Token are required');
+    }
+    // Demo only: refuse before touching the current connection.
+    if (!_config.unsafeDemoZeroConfig) {
+      throw const VobizDemoModeRequiredException('Zero-Config Setup');
     }
 
     _closeExistingConnection();
