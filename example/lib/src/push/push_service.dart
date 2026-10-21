@@ -2,7 +2,6 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'call_screen.dart';
-import 'push_background.dart';
 import 'push_call.dart';
 
 /// Firebase Cloud Messaging for the running app: the device token the push
@@ -38,7 +37,10 @@ class PushService {
             'and rebuild to ring this phone when the app is closed.',
       );
     }
-    FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
+    // No Dart background handler: it would start a second Flutter engine
+    // for every push. The app's own receiver (CallPushReceiver.kt) hands
+    // each push to the one engine that also runs the SIP connection and the
+    // UI, starting it when the app is closed. See CallPlatform.
     return PushService._(available: true);
   }
 
@@ -57,6 +59,8 @@ class PushService {
       available ? FirebaseMessaging.instance.onTokenRefresh : const Stream<String>.empty();
 
   /// Pushes from the bridge that arrive while the app is in the foreground.
+  /// The same pushes also come through [CallPlatform.pushes]; the
+  /// controller handles each call once.
   Stream<PushCall> get foregroundCalls => available
       ? FirebaseMessaging.onMessage
           .map((message) => PushCall.fromData(message.data))

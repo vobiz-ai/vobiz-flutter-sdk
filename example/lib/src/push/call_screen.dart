@@ -47,8 +47,12 @@ class CallScreen {
           type: 0,
           duration: ringFor.inMilliseconds,
           extra: extra,
+          // The app posts missed calls itself (CallPlatform.showMissedCall),
+          // from how the call really ended. The plugin's own appears only on
+          // its 45 s timeout: also for a call answered elsewhere, never when
+          // the caller hangs up.
           missedCallNotification: const ck.NotificationParams(
-            showNotification: true,
+            showNotification: false,
             isShowCallback: false,
             subtitle: 'Missed call',
           ),
@@ -80,12 +84,6 @@ class CallScreen {
   static Future<void> end(String id) async {
     if (!supported) return;
     await _guard(() => ck.FlutterCallkitIncoming.endCall(id));
-  }
-
-  /// Turns the ringing screen into an ongoing-call notification.
-  static Future<void> connected(String id) async {
-    if (!supported) return;
-    await _guard(() => ck.FlutterCallkitIncoming.setCallConnected(id));
   }
 
   /// The call the screen knows about: on Android, only the latest one.

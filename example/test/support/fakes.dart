@@ -92,7 +92,24 @@ class FakeClient implements VobizClient {
   }
 
   @override
-  Future<void> acceptCall([String? callId]) async => actions.add('acceptCall');
+  Future<String> makeCall(
+    String destination, {
+    String? callerId,
+    Map<String, String> headers = const <String, String>{},
+    bool record = false,
+    String? dialUser,
+  }) async {
+    actions.add('makeCall');
+    state = CallStateStatus.connecting;
+    direction = CallDirection.outbound;
+    return 'out-1';
+  }
+
+  @override
+  Future<void> acceptCall([String? callId]) async {
+    actions.add('acceptCall');
+    state = CallStateStatus.connecting;
+  }
   @override
   Future<void> rejectCall([String? callId]) async => actions.add('rejectCall');
   @override
