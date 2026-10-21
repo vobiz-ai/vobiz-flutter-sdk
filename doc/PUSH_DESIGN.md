@@ -28,7 +28,7 @@ if (push == null || push.isExpired()) return;
 // after sign-in, when the INVITE arrives:
 client.callEvents.listen((e) {
   if (e.state == CallStateStatus.incoming &&
-      push.matchesIncomingCall(headers: e.headers, from: e.remoteIdentity)) {
+      push.matchesIncomingCall(headers: e.headers)) {
     client.acceptCall(); // if the user already tapped Accept
   }
 });

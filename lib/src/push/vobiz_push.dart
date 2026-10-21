@@ -33,10 +33,17 @@ class VobizIncomingPush {
     this.expiresAt,
     this.reason = '',
     this.isTest = false,
+    this.lineBusy = false,
   });
 
   /// Reads a push's data map. Null when it is not a Vobiz call push.
-  static VobizIncomingPush? tryParse(Map<String, Object?> data) {
+  ///
+  /// [receivedAt] (default: now) anchors the sender's relative `ttl_ms`, so
+  /// the expiry does not depend on the phone's clock agreeing with the
+  /// sender's. An absolute `expires_at` is used only when there is no
+  /// `ttl_ms` (older senders).
+  static VobizIncomingPush? tryParse(Map<String, Object?> data,
+      {DateTime? receivedAt}) {
     final kind = switch ('${data['type'] ?? ''}') {
       'incoming_call' => VobizPushKind.incomingCall,
       'call_ended' => VobizPushKind.callEnded,
@@ -44,7 +51,13 @@ class VobizIncomingPush {
     };
     final callId = '${data['call_id'] ?? ''}';
     if (kind == null || callId.isEmpty) return null;
+    final ttlMs = int.tryParse('${data['ttl_ms'] ?? ''}');
     final expires = int.tryParse('${data['expires_at'] ?? ''}');
+    final DateTime? expiresAt = ttlMs != null
+        ? (receivedAt ?? DateTime.now()).add(Duration(milliseconds: ttlMs))
+        : expires == null
+            ? null
+            : DateTime.fromMillisecondsSinceEpoch(expires);
     return VobizIncomingPush(
       kind: kind,
       callId: callId,
@@ -52,9 +65,10 @@ class VobizIncomingPush {
       caller: '${data['caller'] ?? ''}',
       callee: '${data['callee'] ?? ''}',
       server: '${data['server'] ?? ''}',
-      expiresAt: expires == null ? null : DateTime.fromMillisecondsSinceEpoch(expires),
+      expiresAt: expiresAt,
       reason: '${data['reason'] ?? ''}',
       isTest: '${data['test'] ?? ''}' == '1',
+      lineBusy: '${data['line_busy'] ?? ''}' == '1',
     );
   }
 
@@ -85,6 +99,10 @@ class VobizIncomingPush {
   /// A test push, not a real call.
   final bool isTest;
 
+  /// The user is already on a call: show call waiting, not a full-screen
+  /// incoming-call screen.
+  final bool lineBusy;
+
   /// Whether the push has expired at [now] (default: the current time).
   bool isExpired([DateTime? now]) {
     final at = expiresAt;
@@ -93,16 +111,11 @@ class VobizIncomingPush {
 
   /// Whether an incoming SIP call is the one this push announced.
   ///
-  /// [headers] are the INVITE's custom headers (`VobizClient.callHeaders`)
-  /// and [from] the caller identity. A `PushRef` header decides when present;
-  /// otherwise the caller (or an `X-VH-Caller` header) is compared with the
-  /// push's caller and callee by their last ten digits.
-  bool matchesIncomingCall({required Map<String, String> headers, String? from}) {
-    final ref = pushRefFromHeaders(headers);
-    if (ref != null) return ref == callId;
-    final who = callerFromHeaders(headers) ?? from ?? '';
-    return samePhoneNumber(who, caller) || samePhoneNumber(who, callee);
-  }
+  /// [headers] are the INVITE's custom headers (`VobizClient.callHeaders`).
+  /// Only an exact `PushRef` match counts: matching by phone number could
+  /// auto-answer a different call from the same caller.
+  bool matchesIncomingCall({required Map<String, String> headers}) =>
+      pushRefFromHeaders(headers) == callId;
 
   /// The push reference on an INVITE's headers: any header whose name
   /// contains `PushRef` (Vobiz documents two spellings for `<User

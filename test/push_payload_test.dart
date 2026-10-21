@@ -30,11 +30,24 @@ void main() {
         'caller': '+919876543210',
       })!;
       expect(push.matchesIncomingCall(headers: <String, String>{'X-VH-PushRef': 'c-1'}), isTrue);
-      expect(push.matchesIncomingCall(headers: <String, String>{'X-VH-PushRef': 'c-2'}, from: '+919876543210'),
-          isFalse);
-      expect(push.matchesIncomingCall(headers: const <String, String>{}, from: '09876543210'), isTrue);
-      expect(push.matchesIncomingCall(headers: <String, String>{'X-VH-Caller': '919876543210'}), isTrue);
-      expect(push.matchesIncomingCall(headers: const <String, String>{}, from: '+911111111111'), isFalse);
+      expect(push.matchesIncomingCall(headers: <String, String>{'X-VH-PushRef': 'c-2'}), isFalse);
+      // Never by number: the same caller's other call must not match.
+      expect(push.matchesIncomingCall(headers: const <String, String>{}), isFalse);
+      expect(push.matchesIncomingCall(headers: <String, String>{'X-VH-Caller': '919876543210'}), isFalse);
     });
+  });
+
+  test('ttl_ms is relative to arrival, not the sender clock', () {
+    final at = DateTime.fromMillisecondsSinceEpoch(5000);
+    final push = VobizIncomingPush.tryParse(<String, Object?>{
+      'type': 'incoming_call',
+      'call_id': 'c-9',
+      'ttl_ms': '30000',
+      'expires_at': '1', // a skewed absolute expiry is ignored
+      'line_busy': '1',
+    }, receivedAt: at)!;
+    expect(push.isExpired(at.add(const Duration(seconds: 29))), isFalse);
+    expect(push.isExpired(at.add(const Duration(seconds: 30))), isTrue);
+    expect(push.lineBusy, isTrue);
   });
 }

@@ -140,9 +140,11 @@ input) as documented above.
 
 ## Push
 
-`VobizIncomingPush.tryParse(Map<String, Object?> data)` reads an incoming-call push
-(`kind`, `callId`, `caller`, `callee`, `expiresAt`, `isExpired()`), and
-`matchesIncomingCall(headers:, from:)` ties the INVITE that follows to it. See
+`VobizIncomingPush.tryParse(Map<String, Object?> data, {receivedAt})` reads an
+incoming-call push (`kind`, `callId`, `caller`, `callee`, `expiresAt`, `lineBusy`,
+`isExpired()`). Expiry comes from the sender's relative `ttl_ms`, counted from
+arrival. `matchesIncomingCall(headers:)` ties the INVITE that follows to it by an
+exact `PushRef` match only, never by phone number. See
 [doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md).
 
 ## SdkConfig
