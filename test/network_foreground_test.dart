@@ -68,6 +68,18 @@ void main() {
     expect(server.registers, hasLength(1));
   }
 
+  Future<void> answerCall() async {
+    sip.debugReceive('INVITE sip:abcd@203.0.113.5;transport=ws SIP/2.0\r\n'
+        'Via: SIP/2.0/WSS 10.0.1.5:443;branch=z9hG4bKa\r\n'
+        'From: <sip:+918000000000@10.0.2.9>;tag=ms\r\n'
+        'To: <sip:play1@registrar.vobiz.ai>\r\n'
+        'Call-ID: in-1\r\nCSeq: 101 INVITE\r\n'
+        'Contact: <sip:Vobiz@10.0.2.9:5060>\r\n'
+        'Content-Type: application/sdp\r\nContent-Length: 3\r\n\r\nv=0');
+    await client.acceptCall();
+    expect(client.callState, CallStateStatus.active);
+  }
+
   Future<void> quiet() => Future<void>.delayed(const Duration(milliseconds: 300));
 
   setUp(() async {
@@ -116,15 +128,7 @@ void main() {
 
   test('resume during a call: REGISTER on the live socket, call and dialog kept', () async {
     await signIn();
-    sip.debugReceive('INVITE sip:abcd@203.0.113.5;transport=ws SIP/2.0\r\n'
-        'Via: SIP/2.0/WSS 10.0.1.5:443;branch=z9hG4bKa\r\n'
-        'From: <sip:+918000000000@10.0.2.9>;tag=ms\r\n'
-        'To: <sip:play1@registrar.vobiz.ai>\r\n'
-        'Call-ID: in-1\r\nCSeq: 101 INVITE\r\n'
-        'Contact: <sip:Vobiz@10.0.2.9:5060>\r\n'
-        'Content-Type: application/sdp\r\nContent-Length: 3\r\n\r\nv=0');
-    await client.acceptCall();
-    expect(client.callState, CallStateStatus.active);
+    await answerCall();
 
     lifecycle.resume();
     await eventually(() => server.registers.length == 2, reason: 'foreground REGISTER');
@@ -188,5 +192,58 @@ void main() {
     lifecycle.resume();
     await quiet();
     expect(server.registers, hasLength(1));
+  });
+
+  group('a refresh with no answer means a dead socket', () {
+    test('silent dead socket on resume: reconnects within the short refresh timeout', () async {
+      await signIn();
+      sip.refreshTimeout = const Duration(milliseconds: 300);
+      server.muteAll();
+
+      lifecycle.resume();
+      await eventually(() => server.connections == 2,
+          timeout: const Duration(seconds: 3), reason: 'reconnect after the refresh timeout');
+      await eventually(() => client.isConnected, timeout: const Duration(seconds: 3));
+      expect(server.registers, hasLength(3), reason: 'unanswered refresh, then the new REGISTER');
+      expect(client.registrationState, RegistrationState.registered);
+      expect(net.map((e) => e.reason), contains('No answer to the REGISTER refresh'));
+    });
+
+    test('silent dead socket on resume during a call: reconnects and keeps the call', () async {
+      await signIn();
+      await answerCall();
+      sip.refreshTimeout = const Duration(milliseconds: 300);
+      server.muteAll();
+
+      lifecycle.resume();
+      await eventually(() => server.connections == 2 && client.isConnected,
+          timeout: const Duration(seconds: 3));
+      expect(client.callState, CallStateStatus.active);
+      expect(sip.hasActiveDialog, isTrue);
+      expect(server.received.where((m) => m.startsWith('BYE ')), isEmpty);
+    });
+
+    test('periodic refresh with no answer: reconnects instead of failing', () async {
+      server.grantSeconds = 1; // refreshed after 1 s
+      await signIn();
+      sip.transactionTimeout = const Duration(milliseconds: 300);
+      server.muteAll();
+
+      await eventually(() => server.connections == 2 && client.isConnected,
+          timeout: const Duration(seconds: 4), reason: 'reconnect after the refresh timed out');
+      expect(conn.map((e) => e.registrationState), isNot(contains(RegistrationState.failed)));
+    });
+
+    test('a refused refresh (403) still fails the registration and does not reconnect',
+        () async {
+      await signIn();
+      server.registerStatus = 403;
+
+      lifecycle.resume();
+      await eventually(() => client.registrationState == RegistrationState.failed);
+      await quiet();
+      expect(client.connectionState, ConnectionStateStatus.failed);
+      expect(server.connections, 1);
+    });
   });
 }

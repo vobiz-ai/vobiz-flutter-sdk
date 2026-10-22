@@ -932,27 +932,44 @@ class VobizClient {
       _emitError('registration_failed', reason, null);
     };
 
-    _sip.onSocketError = (reason) {
-      _registrationState = RegistrationState.unregistered;
-      _connectionState = _config.autoReconnect
-          ? ConnectionStateStatus.reconnecting
-          : ConnectionStateStatus.disconnected;
-      _connectionEvents.addIfOpen(ConnectionEvent(
-        connectionState: _connectionState,
-        registrationState: _registrationState,
-        message: 'Socket error: $reason',
-      ));
-      _emitError('socket_error', reason, null);
-      _onSignalingLost();
-      if (_config.autoReconnect) _scheduleReconnect(reason);
-    };
+    _sip.onSocketError = _onSocketLost;
+    // A REGISTER refresh went unanswered: the socket died silently (common
+    // after the phone was locked). Reconnect now, not after a backoff delay.
+    _sip.onTransportDead = (reason) => _onSocketLost(reason, immediately: true);
 
     _sip.onTrying = () {
       // The far end has the INVITE: from here ringing is bounded by the
       // server's Dial timeout or the user, not by the setup timer.
       if (_direction == CallDirection.outbound) _clearCallSetupTimer();
     };
+    _wireSipCalls();
+  }
 
+  /// The signalling socket is gone. A connected call rides it out (its
+  /// dialog is kept across the reconnect); anything else ends.
+  void _onSocketLost(String reason, {bool immediately = false}) {
+    _registrationState = RegistrationState.unregistered;
+    _connectionState = _config.autoReconnect
+        ? ConnectionStateStatus.reconnecting
+        : ConnectionStateStatus.disconnected;
+    _connectionEvents.addIfOpen(ConnectionEvent(
+      connectionState: _connectionState,
+      registrationState: _registrationState,
+      message: 'Socket error: $reason',
+    ));
+    _emitError('socket_error', reason, null);
+    _onSignalingLost();
+    if (!_config.autoReconnect) return;
+    if (immediately) {
+      if (_username != null && _password != null) {
+        _supervisor.reconnectNow(reason: reason);
+      }
+    } else {
+      _scheduleReconnect(reason);
+    }
+  }
+
+  void _wireSipCalls() {
     _sip.onRemoteRinging = () {
       final id = _callId;
       if (id == null) return;

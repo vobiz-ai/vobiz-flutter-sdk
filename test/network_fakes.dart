@@ -35,6 +35,18 @@ class FakeSipServer {
   final List<WebSocket> sockets = <WebSocket>[];
   final List<String> received = <String>[];
   bool answerRegister = true;
+
+  /// Status the registrar answers REGISTER with (200, or a refusal).
+  int registerStatus = 200;
+
+  /// Lifetime granted in the 200 OK's Contact.
+  int grantSeconds = 3600;
+
+  /// Connections that read but never answer: a socket that died silently.
+  final Set<WebSocket> muted = <WebSocket>{};
+
+  /// Silences every open connection; new ones are answered as usual.
+  void muteAll() => muted.addAll(sockets);
   bool acceptConnections = true;
   int connections = 0;
 
@@ -59,8 +71,8 @@ class FakeSipServer {
       ws.listen((dynamic data) {
         final msg = data.toString();
         received.add(msg);
-        if (msg.startsWith('REGISTER ') && answerRegister) {
-          ws.add(_ok(msg));
+        if (msg.startsWith('REGISTER ') && answerRegister && !muted.contains(ws)) {
+          ws.add(_ok(msg, status: registerStatus, grant: grantSeconds));
         }
       }, onError: (_) {});
     });
@@ -80,20 +92,20 @@ class FakeSipServer {
     await _http?.close(force: true);
   }
 
-  static String _ok(String request) {
+  static String _ok(String request, {int status = 200, int grant = 3600}) {
     String h(String name) => request
         .split(RegExp(r'\r?\n'))
         .firstWhere((String l) => l.toLowerCase().startsWith('${name.toLowerCase()}:'),
             orElse: () => '$name: ')
         .substring(name.length + 1)
         .trim();
-    return 'SIP/2.0 200 OK\r\n'
+    return 'SIP/2.0 $status ${status == 200 ? 'OK' : 'Refused'}\r\n'
         'Via: ${h('Via')}\r\n'
         'From: ${h('From')}\r\n'
         'To: ${h('To')};tag=srv\r\n'
         'Call-ID: ${h('Call-ID')}\r\n'
         'CSeq: ${h('CSeq')}\r\n'
-        'Contact: ${h('Contact')};expires=3600\r\n'
+        'Contact: ${h('Contact')};expires=$grant\r\n'
         'Content-Length: 0\r\n\r\n';
   }
 }

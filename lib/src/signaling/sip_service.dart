@@ -558,6 +558,16 @@ class SipDigestAuth {
 /// A second plain 401/407 means the credentials are wrong, and sending them
 /// again would only loop.
 class _AuthRetries {
+  _AuthRetries({this.refresh = false, this.timeout});
+
+  /// A REGISTER refreshing a live registration rather than a sign-in's
+  /// first: no answer then means the transport is dead.
+  final bool refresh;
+
+  /// How long each REGISTER of this attempt waits for a final response;
+  /// null for [SIPService.transactionTimeout].
+  final Duration? timeout;
+
   int _attempts = 0;
   bool _usedStale = false;
 
@@ -595,6 +605,7 @@ class _ClientTransaction {
     required this.socket,
     required this.onResponse,
     this.onTimeout,
+    this.timeout,
   });
 
   final String branch;
@@ -607,6 +618,9 @@ class _ClientTransaction {
   final WebSocketChannel? socket;
   final void Function(_ClientTransaction tx, SipMessage response) onResponse;
   final void Function()? onTimeout;
+
+  /// Overrides [SIPService.transactionTimeout] for this request.
+  final Duration? timeout;
   Timer? timer;
 
   String get key => '$branch $method';
@@ -723,6 +737,13 @@ class SIPService {
   @visibleForTesting
   Duration unregisterTimeout = const Duration(seconds: 2);
 
+  /// How long [refreshRegistration] waits for the registrar before treating
+  /// the socket as dead. After a phone is locked the socket is often dead
+  /// without having been closed, and waiting the full [transactionTimeout]
+  /// would leave the app unreachable that long.
+  @visibleForTesting
+  Duration refreshTimeout = const Duration(seconds: 5);
+
   /// How long [reserveForOutgoingCall] holds the line if [call] never comes.
   @visibleForTesting
   Duration outgoingReservation = const Duration(seconds: 60);
@@ -836,6 +857,10 @@ class SIPService {
   void Function(String reason, int? sipCode)? onCallFailed;
   void Function(String reason)? onSocketError;
 
+  /// The socket stopped answering (a REGISTER refresh timed out) and has been
+  /// closed. Falls back to [onSocketError] when unset.
+  void Function(String reason)? onTransportDead;
+
   /// Answers a re-INVITE or UPDATE that changes the session (new media, a
   /// hold): given the far end's offer, returns the answer SDP, or null to
   /// refuse it. The call then carries on unchanged (488, RFC 3261 14.2).
@@ -881,6 +906,10 @@ class SIPService {
   /// (and digest retry) as the periodic refresh, whose timer is re-armed from
   /// the new grant. A call in progress is not affected.
   ///
+  /// No answer within [refreshTimeout] means the socket is dead: it is closed
+  /// and [onTransportDead] reports it, so the client reconnects. A final
+  /// refusal (403, say) fails the registration as usual.
+  ///
   /// Returns false, sending nothing, unless the socket is connected and the
   /// registration is up; reconnecting is then the caller's job. Returns true
   /// without sending when a REGISTER is already in flight.
@@ -892,7 +921,9 @@ class SIPService {
     }
     if (_transactions.values.any((tx) => tx.method == 'REGISTER')) return true;
     _registrationRefreshTimer?.cancel();
-    _sendRegister(expires: registerExpires, auth: _AuthRetries());
+    _sendRegister(
+        expires: registerExpires,
+        auth: _AuthRetries(refresh: true, timeout: refreshTimeout));
     return true;
   }
 
@@ -1093,6 +1124,7 @@ class SIPService {
     required void Function(_ClientTransaction tx, SipMessage response) onResponse,
     void Function()? onTimeout,
     WebSocketChannel? socket,
+    Duration? timeout,
   }) {
     final tx = _ClientTransaction(
       branch: branch,
@@ -1102,6 +1134,7 @@ class SIPService {
       socket: socket ?? _socket,
       onResponse: onResponse,
       onTimeout: onTimeout,
+      timeout: timeout,
     );
     _transactions[tx.key] = tx;
     _armTimer(tx);
@@ -1110,7 +1143,7 @@ class SIPService {
 
   void _armTimer(_ClientTransaction tx) {
     tx.timer?.cancel();
-    tx.timer = Timer(transactionTimeout, () {
+    tx.timer = Timer(tx.timeout ?? transactionTimeout, () {
       if (!identical(_transactions[tx.key], tx)) return;
       _transactions.remove(tx.key);
       _logger.warn('No final response to ${tx.method} (CSeq ${tx.cseq})');
@@ -1139,6 +1172,7 @@ class SIPService {
     final branch = SipBuilder.newBranch();
     final cseq = _cseq++;
     final unregistering = onUnregistered != null;
+    final sentOn = socket ?? _socket;
     _sendRequest(
       message: SipBuilder.register(
         sipServer: sipServer,
@@ -1157,6 +1191,7 @@ class SIPService {
       cseq: cseq,
       callId: _registerCallId,
       socket: socket,
+      timeout: unregistering ? null : auth.timeout,
       onResponse: (tx, msg) => _handleRegisterResponse(
         tx,
         msg,
@@ -1166,7 +1201,9 @@ class SIPService {
       ),
       onTimeout: unregistering
           ? onUnregistered
-          : () => _failRegistration('Registration timed out: no answer from the registrar'),
+          : auth.refresh
+              ? () => _transportDead(sentOn, 'No answer to the REGISTER refresh')
+              : () => _failRegistration('Registration timed out: no answer from the registrar'),
     );
   }
 
@@ -1927,7 +1964,10 @@ class SIPService {
       // Interval Too Brief: ask again for at least what the registrar wants.
       final minimum = int.tryParse((msg.header('Min-Expires') ?? '').trim());
       if (minimum != null && minimum > expires) {
-        _sendRegister(expires: minimum, auth: _AuthRetries(), socket: tx.socket);
+        _sendRegister(
+            expires: minimum,
+            auth: _AuthRetries(refresh: auth.refresh, timeout: auth.timeout),
+            socket: tx.socket);
         return;
       }
     }
@@ -1991,6 +2031,23 @@ class SIPService {
     } else {
       _closeAfterRegistrationFailure();
     }
+  }
+
+  /// A refresh went unanswered: the socket is dead even though it was never
+  /// closed. Drop it and report it, so the client reconnects (keeping a
+  /// call's dialog) instead of giving up on the registration.
+  void _transportDead(WebSocketChannel? socket, String reason) {
+    if (socket == null || !identical(socket, _socket)) return;
+    _logger.warn('$reason: the WebSocket is dead, closing it');
+    // Its close, whenever it comes, is no longer the current socket's.
+    _socket = null;
+    _registrationRefreshTimer?.cancel();
+    _crlfKeepAlive?.stop();
+    _registrationRefreshDelay = null;
+    _connectionState.value = SipConnectionState.disconnected;
+    _registrationState.value = SipRegistrationState.failed;
+    _closeQuietly(socket);
+    (onTransportDead ?? onSocketError)?.call(reason);
   }
 
   void _closeAfterRegistrationFailure() {
@@ -2223,7 +2280,7 @@ class SIPService {
     _registrationRefreshDelay = delay;
     _registrationRefreshTimer = Timer(delay, () {
       if (_username == null || _password == null) return;
-      _sendRegister(expires: registerExpires, auth: _AuthRetries());
+      _sendRegister(expires: registerExpires, auth: _AuthRetries(refresh: true));
     });
   }
 
