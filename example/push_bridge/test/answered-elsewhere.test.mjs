@@ -2,14 +2,12 @@
 // hangs up, every pushed phone is told at once so it stops ringing.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { postJson, registerDevice, startBridge, until, webhook, xmlAttr } from './helpers.mjs';
+import { answerCall, postJson, registerDevice, startBridge, until, webhook } from './helpers.mjs';
 
 async function ringingCall(ctx, env) {
   const a = await registerDevice(ctx, 'alice', { name: 'phone-a' });
   const b = await registerDevice(ctx, 'alice', { name: 'phone-b' });
-  const answer = await webhook(ctx, '/answer', { CallUUID: 'c1', From: '+919800000001', To: '+918000000001' });
-  const events = new URL(xmlAttr(answer.text, 'Dial', 'callbackUrl')).pathname;
-  const action = new URL(xmlAttr(answer.text, 'Dial', 'action')).pathname;
+  const { events, action } = await answerCall(ctx, { CallUUID: 'c1', From: '+919800000001', To: '+918000000001' });
   const push = await until(() => ctx.pushes.filter((p) => p.data.type === 'incoming_call').length === 2 && ctx.pushes[0]);
   return { a, b, events, action, push, env };
 }

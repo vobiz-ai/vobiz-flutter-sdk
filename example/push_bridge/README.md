@@ -14,21 +14,38 @@ something has to send that push: this bridge.
 ```
 caller ──> your Vobiz number ──> Vobiz ──> POST /answer on this bridge
                                               │
-             ┌────────────────────────────────┴───────────────────────────┐
-             │ 1. <Dial><User>sip:your-endpoint</User></Dial> right away   │
-             │    (only the endpoints ROUTES maps the dialled number to)  │
-             │      app open: it rings at once                             │
-             │      app closed: the endpoint is offline, the dial fails,   │
-             │      and the caller hears ringback while the bridge dials   │
-             │      again every 3 seconds                                  │
-             │ 2. in parallel, a Firebase push to that endpoint's phones   │
-             └─────────────────────────────────────────────────────────────┘
-app's SIP REGISTER succeeds ──> POST /push/registered ──> the bridge dials it now
-user taps Accept ──> the dial reaches the app ──> it answers by itself
+             ┌────────────────────────────────┴────────────────────────────┐
+             │ 1. a Firebase push to the routed endpoints' phones           │
+             │ 2. the caller hears ringback (early media) for up to         │
+             │    PUSH_WAIT_SECONDS while the phones wake and sign in:      │
+             │    <PreAnswer><Play>wait.wav</Play></PreAnswer>              │
+             │    <Redirect>/dial-now/…</Redirect>                          │
+             │ 3. every pushed phone reports POST /push/registered          │
+             │      → the caller is transferred to /dial-now at once        │
+             │    or the wait ends first → the Redirect reaches /dial-now   │
+             │ 4. ONE <Dial> rings everyone at once: the app endpoints,     │
+             │    ALWAYS_RING endpoints (e.g. a browser) and the route's    │
+             │    PSTN <Number>s. First to answer wins; Vobiz cancels the   │
+             │    rest. It is never restarted.                              │
+             └──────────────────────────────────────────────────────────────┘
+user taps Accept ──> the INVITE (PushRef = call_id) is answered by the app
 user taps Decline ──> app tells the bridge ──> caller hears busy, other phones stop
-another phone answers ──> a push stops the other phones (answered_elsewhere)
+another target answers ──> a push stops the phones (answered_elsewhere)
+app signs in after the Dial started ──> "too_late": the others keep ringing, and
+                                        the app's screen closes on call_ended
 caller hangs up ──> Vobiz calls /hangup ──> a push stops the phones ringing
 ```
+
+Nothing to wake (no routed phone has a push token, or the endpoint is already on a
+call through the bridge): no wait, the Dial starts at once.
+
+**Which app endpoints are in the Dial:** every routed endpoint, whether or not its
+app reported in time. An app that is open but did not report still rings; an
+offline one only fails its own leg. An app that signs in after the Dial started is
+not added: the Dial is not restarted, so a ringing browser or phone is not cut off.
+With only app endpoints on a route (no browser, no number), the call therefore
+depends on the app signing in within `PUSH_WAIT_SECONDS`; raise it (up to 9) if
+your phones are slow to wake.
 
 ## What you need
 
@@ -93,6 +110,14 @@ endpoints, e.g. `ROUTES=+919876543210=alice;+918000000000=bob,carol`. Without
 `ROUTES` the bridge rings the one endpoint that has registered a phone; if phones
 are registered for several endpoints it rings none of them and says so in the log.
 
+**Ring a phone number as well:** an entry of `+` and digits (E.164) in a route is a
+PSTN number, rung with `<Number>` in the same Dial:
+`ROUTES=+918000000000=alice,bob,+919876543210`. Endpoint names keep working as
+before. The PSTN leg shows the dialled Vobiz number as caller ID
+(`CALLER_ID_MODE=number`, the default); with `CALLER_ID_MODE=caller` no `callerId` is
+sent and Vobiz derives it from the caller, which the carrier may refuse for an
+outbound leg. PSTN legs are billed as outbound calls.
+
 ## In the app
 
 1. Sign in once with **Remember me** ticked: with the app closed, accepting a call
@@ -120,10 +145,11 @@ Disconnecting in the app unregisters the phone; closing the app does not.
 | `VOBIZ_NUMBER` | — | The number to point at this bridge, in E.164 |
 | `VOBIZ_APP_NAME` | `Vobiz_Flutter_Push_Bridge` | Name of the application it finds or creates |
 | `FORCE_ATTACH` | `false` | Move the number here even if another application has it |
-| `RING_SECONDS` | `45` | How long a caller waits for the app |
+| `RING_SECONDS` | `45` | How long the one Dial rings (its `timeout`) |
+| `PUSH_WAIT_SECONDS` | `5` | How long the caller hears ringback while pushed phones wake and sign in, before the Dial starts without them. Clamped to 3–9 |
 | `CALLER_ID_MODE` | `number` | `number`: the app's SIP call shows your Vobiz number, as the web Playground does. `caller`: pass the real caller through |
 | `SIP_HEADER_STYLE` | `suffix` | How the call reference is written in `<User sipHeaders>`; Vobiz's docs show both `RefX-VH=` and `Ref=` |
-| `ROUTES` | — | Which endpoints each number rings: `+91…=alice,bob;+91…=carol` |
+| `ROUTES` | — | Which endpoints (and PSTN numbers) each number rings: `+91…=alice,bob,+9198…;+91…=carol` |
 | `ALWAYS_RING` | — | Endpoints to ring even if no app registered, comma separated (not pushed) |
 | `BRIDGE_KEY` | generated | The pairing key; saved in `bridge-state.json` |
 | `ALLOW_UNSIGNED_WEBHOOKS` | `false` | `true` accepts webhooks without a Vobiz signature. Local tests only |
@@ -135,16 +161,16 @@ the real caller to the app in a SIP header as well.
 
 | Route | Called by | Purpose |
 |---|---|---|
-| `POST /answer` | Vobiz | An inbound call: dial the endpoint, push its phones |
-| `POST /dial-result/<call>.<tag>` | Vobiz | One dial attempt ended: dial again, or hang up |
+| `POST /answer` | Vobiz | An inbound call: push the phones, hold the caller on ringback (or dial at once if nothing is pushed) |
+| `POST /dial-result/<call>.<tag>` | Vobiz | The Dial ended: hang up (answered, missed, busy, declined). Never dials again |
 | `POST /dial-events/<call>.<tag>` | Vobiz | Live events for the leg ringing the app. Only an answer event here counts as answered: Vobiz can report `DialStatus=completed` for a ring nobody picked up |
-| `POST /dial-now/<call>.<tag>` | Vobiz | The caller's leg, transferred here when the app reports it is registered: dial now |
+| `POST /dial-now/<call>.<tag>` | Vobiz | The one Dial: reached by the hold's `<Redirect>` when the wait ends, or by a transfer when the pushed phones report they are registered |
 | `POST /declined/<call>.<tag>` | Vobiz | The caller's leg, transferred here on Decline: busy tone, then busy |
 | `POST /hangup` | Vobiz | The caller's leg ended: stop the phones ringing |
-| `GET /ringback.wav`, `/busy.wav` | Vobiz | Three seconds of ringback / busy tone |
+| `GET /wait.wav`, `/busy.wav` | Vobiz | `PUSH_WAIT_SECONDS` of ringback / three seconds of busy tone |
 | `POST /push/register` | the app | Pair (bridge key) or update (device token) this phone |
 | `POST /push/unregister`, `/push/test` | the app | Forget / test-push this phone (device token) |
-| `POST /push/registered` | the app | The app's SIP registration succeeded: dial it now (call key or device token) |
+| `POST /push/registered` | the app | The app's SIP registration succeeded: end the wait and dial now (call key or device token) |
 | `POST /push/accept`, `/push/decline` | the app | The user's answer (needs that call's key from the push) |
 | `GET /health` | anyone | `{"ok": true}` |
 
@@ -162,15 +188,16 @@ All app requests are JSON `POST`s. `<device_token>` is what pairing returned.
 | `/push/register` (update, e.g. new FCM token or username) | `Authorization: Bearer <device_token>` | same | `{ok, username, push, device_id}` |
 | `/push/unregister` | `Authorization: Bearer <device_token>` | `{}` | `{ok}`; the device token stops working |
 | `/push/test` | `Authorization: Bearer <device_token>` | `{delay_seconds?}` | `{ok, call_id, sending_in_seconds}`; pushes this phone only |
-| `/push/registered` | none (call key) | `{call_id, call_key}` | `{ok, redial: "transferred" \| "next_attempt" \| "finished" \| "test", finished}` |
+| `/push/registered` | none (call key) | `{call_id, call_key}` | `{ok, redial, finished}`. `redial`: `transferred` (the Dial starts now), `waiting` (it starts when the wait ends, this phone included: other pushed phones have not reported, the wait ends within a second, or the transfer failed), `too_late` (the Dial had started; it is not restarted, and `call_ended` closes this phone's screen), `finished`, `test`. `next_attempt` is no longer sent |
 | `/push/registered` | `Authorization: Bearer <device_token>` | `{}` | `{ok, calls: {<call_id>: …}}` for every call ringing this endpoint |
 | `/push/accept` | none (call key) | `{call_id, call_key}` | `{ok, test}`, or `{ok, finished: true, reason}` if the call is over |
-| `/push/decline` | none (call key) | `{call_id, call_key}` | `{ok, busy: "transferred" \| "next_attempt"}`, or `{ok, finished: true}`. There is no decline by username or caller number any more |
+| `/push/decline` | none (call key) | `{call_id, call_key}` | `{ok, busy: "transferred" \| "next_attempt"}` (`next_attempt`: the transfer failed; busy plays at the end of the wait or the Dial result), or `{ok, finished: true}`. There is no decline by username or caller number any more |
 
 Push messages (FCM data, all values strings):
 
 - `incoming_call`: `call_id`, `call_key`, `caller`, `callee`, `server`, `sent_at`,
-  **`ttl_ms`** (milliseconds the call can still ring when the bridge sent it; expire
+  **`ttl_ms`** (milliseconds the call can still ring when the bridge sent it: the push
+  wait plus `RING_SECONDS`; expire
   the call screen `ttl_ms` after the push arrives, never by comparing `expires_at`
   with the phone's clock), `expires_at` (bridge clock, for older builds only),
   `line_busy: "1"` when the endpoint is already on a call through the bridge (show
@@ -182,10 +209,13 @@ Push messages (FCM data, all values strings):
 
 The SIP INVITE for a pushed call carries a `PushRef` header (written `PushRefX-VH=`
 or `PushRef=` in `<User sipHeaders>`, see `SIP_HEADER_STYLE`) equal to `call_id`, on
-every attempt. The app should auto-answer an
+every `<User>` of the Dial. The app should auto-answer an
 accepted call only when `PushRef` equals that `call_id`, never by caller or callee
 number. The app should call `/push/registered` as soon as its REGISTER gets a 200
-while a pushed call is ringing.
+while a pushed call is ringing, and also when the push arrives while it is already
+registered (otherwise the caller waits the whole `PUSH_WAIT_SECONDS`). The bridge
+dials once every pushed phone has reported; with the call key it cannot tell phones
+apart, so it counts reports.
 
 ## Security
 
@@ -214,16 +244,21 @@ while a pushed call is ringing.
   does not set up.
 - Decline: `<Hangup reason="busy">` rejects a call unbilled only while it is
   unanswered. Whether the caller's leg is already answered (and billed) once the
-  first `<Dial>` has run has not been checked on a CDR yet; the caller hears a busy
+  `<Dial>` has run has not been checked on a CDR yet; the caller hears a busy
   tone either way.
-- The transfer to `/dial-now` and `/declined` uses the Vobiz Transfer API, which
-  needs `VOBIZ_AUTH_ID` and a call in progress; if it fails, the next dial attempt
-  does the same thing a few seconds later.
+- Not checked live yet: whether the Vobiz Transfer API moves a call that is still in
+  `<PreAnswer>` early media (its docs say a call must be `in-progress`), and whether
+  the hold's `<Redirect>` answers the caller's leg. If the transfer is refused, the
+  reply is `waiting` and the Dial starts when the wait ends: correct, only not early.
+  The transfer needs `VOBIZ_AUTH_ID`; it is not attempted in the wait's last second,
+  so it cannot cross the `<Redirect>`.
+- Carriers that ignore early media play the hold as ordinary audio once the call is
+  answered (Vobiz docs: `/xml/preanswer`).
 - Calls in progress live in memory: restarting the bridge mid-call drops them.
 - Swiping the app from Recents is fine; **Force stop** (Settings → Apps) is not:
   Android delivers no push to a force-stopped app until it is opened again.
 - Some Android makers stop pushes to apps swiped from Recents unless the app may run
   in the background (battery optimisation, "autostart"). Pixel and the emulator do not.
-- If Firebase's push arrives more than about 10 seconds late, Android may still have
-  the app frozen when the first INVITE arrives, and that call can fail; the next
-  inbound call is unaffected.
+- If Firebase's push arrives late, or the app takes longer than `PUSH_WAIT_SECONDS`
+  to sign in, the Dial starts without it and its leg fails; the other targets still
+  ring, and the next inbound call is unaffected.

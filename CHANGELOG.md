@@ -98,6 +98,12 @@ call was used. #58 lists what still needs a device.
   only for real misses; a local "Recent calls" log (#9, #19). Call waiting instead of a
   second ringing screen (#45). Incoming calls ring and vibrate with the app open (#40).
 - Decline sends the caller a busy tone and busy hangup at once (#31).
+- Push bridge: inbound calls hold the caller on ringback for up to `PUSH_WAIT_SECONDS`
+  (default 5, 3–9) and dial as soon as the pushed phones report they are registered,
+  then ring every target at once in one `<Dial>`: app endpoints, `ALWAYS_RING`
+  endpoints and, new, PSTN numbers listed in `ROUTES` (`+91…=alice,+9198…`). The
+  re-dial loop is gone, so a ringing leg is never restarted; a late register gets
+  `redial: "too_late"` (#8).
 - Transfer picks `aleg`/`bleg` by call direction and offers `both` (#48).
 - Connect errors show on the Identity tab (#57); the app root no longer rebuilds every
   second during a call (#55); no duplicate connect after Accept (#35).

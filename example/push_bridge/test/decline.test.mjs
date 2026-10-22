@@ -2,12 +2,11 @@
 // caller's leg was already answered by an earlier <Dial>.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { postJson, registerDevice, startBridge, until, webhook, xmlAttr } from './helpers.mjs';
+import { answerCall, postJson, registerDevice, startBridge, until, webhook } from './helpers.mjs';
 
 async function ringingCall(ctx, id = 'c1') {
   await registerDevice(ctx, 'alice');
-  const answer = await webhook(ctx, '/answer', { CallUUID: id, From: '+919800000001', To: '+918000000001' });
-  const action = new URL(xmlAttr(answer.text, 'Dial', 'action')).pathname;
+  const { action } = await answerCall(ctx, { CallUUID: id, From: '+919800000001', To: '+918000000001' });
   const push = await until(() => ctx.pushes.find((p) => p.data.type === 'incoming_call'));
   return { action, push };
 }

@@ -9,13 +9,15 @@
  * answers your Vobiz number instead. For every inbound call it:
  *
  *   1. sends the phone a high-priority Firebase message. That wakes the app,
- *      which shows a full-screen incoming-call screen;
- *   2. rings the app's SIP endpoint straight away (`<Dial><User>`). If the
- *      app is open, it rings at once;
- *   3. while the endpoint is offline, keeps the caller hearing ringback and
- *      dials again, at once when the app reports its SIP registration
- *      (POST /push/registered) and otherwise every few seconds, until it
- *      answers, the user declines, or RING_SECONDS pass.
+ *      which shows a full-screen incoming-call screen and signs in;
+ *   2. holds the caller on ringback (early media) for up to
+ *      PUSH_WAIT_SECONDS, until the pushed phones report their SIP
+ *      registration (POST /push/registered). It dials the moment they do,
+ *      and at the end of the wait without them if they do not;
+ *   3. rings every target at once in ONE <Dial>: the app endpoints, the
+ *      ALWAYS_RING endpoints (e.g. a browser) and the route's PSTN numbers.
+ *      The first to answer wins; Vobiz cancels the rest. The Dial is never
+ *      restarted, so a ringing browser or phone is not cut off.
  *
  * Webhooks must carry a valid Vobiz signature (PUBLIC_URL and
  * VOBIZ_AUTH_TOKEN are required); phones pair once with the bridge key and
@@ -56,6 +58,10 @@ export function createBridge(options = {}) {
     appName: (env.VOBIZ_APP_NAME || 'Vobiz_Flutter_Push_Bridge').trim(),
     forceAttach: env.FORCE_ATTACH === 'true',
     ringSeconds: clampInt(env.RING_SECONDS, 45, 15, 120),
+    // How long the caller waits on ringback for the woken app to sign in
+    // before the Dial starts without it. 3 to 9 seconds: longer delays every
+    // other target (browser, PSTN) by as much.
+    pushWaitSeconds: clampInt(env.PUSH_WAIT_SECONDS, 5, 3, 9),
     callerIdMode: (env.CALLER_ID_MODE || 'number').trim().toLowerCase(),
     headerStyle: (env.SIP_HEADER_STYLE || 'suffix').trim().toLowerCase(),
     alwaysRing: csv(env.ALWAYS_RING),
@@ -74,10 +80,12 @@ export function createBridge(options = {}) {
     throw error;
   }
 
-  /** Seconds of ringback played between two dial attempts (one cadence of ringback.wav). */
-  const RINGBACK_SECONDS = 3;
-  /** After the user taps Accept, the app needs time to start and sign in. */
-  const ACCEPTED_GRACE_SECONDS = 60;
+  /**
+   * A transfer to /dial-now this close to the end of the wait could race the
+   * hold XML's own <Redirect> to /dial-now and restart a Dial that has just
+   * started, so the bridge lets the Redirect dial instead.
+   */
+  const TRANSFER_MARGIN_MS = 1000;
   /**
    * How long a webhook nonce is remembered. Vobiz nonces are random, not
    * time-based, and nothing in the request is timestamped, so replay
@@ -100,7 +108,8 @@ export function createBridge(options = {}) {
 
   /** Inbound calls in progress, by Vobiz CallUUID. Kept in memory only. */
   const calls = new Map();
-  const ringback = makeToneWav(RINGBACK_SECONDS, [[0, 0.4], [0.6, 1.0]]);
+  // Ringback for exactly the push wait: 0.4 s on, 0.2 s off, 0.4 s on, 2 s off.
+  const waitRingback = makeToneWav(config.pushWaitSeconds, ringbackBursts(config.pushWaitSeconds));
   // Indian busy tone: 400 Hz, 0.75 s on, 0.75 s off.
   const busyTone = makeToneWav(3, [[0, 0.75], [1.5, 2.25]]);
 
@@ -109,7 +118,7 @@ export function createBridge(options = {}) {
   const routes = {
     'GET /': (req, res) => sendText(res, 200, 'Vobiz push bridge is running.\n'),
     'GET /health': (req, res) => sendJson(res, 200, { ok: true, service: 'vobiz-push-bridge', instance: INSTANCE }),
-    'GET /ringback.wav': (req, res) => sendWav(res, ringback),
+    'GET /wait.wav': (req, res) => sendWav(res, waitRingback),
     'GET /busy.wav': (req, res) => sendWav(res, busyTone),
     // Vobiz webhooks
     'POST /answer': vobiz(onAnswer),
@@ -125,7 +134,8 @@ export function createBridge(options = {}) {
     'POST /push/test': onTestCall,
     'POST /push/accept': onAccept,
     'POST /push/registered': onRegistered,
-    // Where a call is transferred to when the app reports it is registered
+    // The one Dial: the hold XML redirects here when the wait ends, or the
+    // caller's leg is transferred here when the app reports it is registered
     'POST /dial-now/*': vobiz(onDialNow),
     // Where a call is transferred to when the user taps Decline
     'POST /declined/*': vobiz(onDeclinedXml),
@@ -181,54 +191,79 @@ export function createBridge(options = {}) {
 
   // ── Vobiz webhooks ───────────────────────────────────────────────────────────
 
-  /** Inbound call: wake the app, then ring its endpoint. */
+  /** Inbound call: wake the app, hold the caller briefly, then ring everyone at once. */
   async function onAnswer(req, res, url, params) {
     if (isHangupEvent(params)) return onHangup(req, res, url, params);
 
     const id = params.CallUUID || params.CallUuid || crypto.randomUUID();
     let call = calls.get(id);
     if (call) {
-      log('..', `Vobiz asked again for call ${short(id)}; dialling again`);
-      return sendXml(res, dialXml(call, { ringback: call.attempts > 0 }));
+      log('..', `Vobiz asked again for call ${short(id)}`);
+      return sendXml(res, call.dialStarted ? dialXml(call) : holdXml(call));
     }
 
-    const targets = ringTargets(params.To);
-    if (!targets.length) {
+    const { users: targets, numbers } = ringTargets(params.To);
+    if (!targets.length && !numbers.length) {
       log('..', `Inbound call from ${params.From || 'unknown'}: no app has signed in, so the caller is told`);
       return sendXml(res, '<Speak>Sorry, nobody is signed in to take this call. Please try again later.</Speak><Hangup/>');
     }
 
+    // Every endpoint rung is already on a call through this bridge.
+    const lineBusy = targets.length > 0 && targets.every((user) => onCall(user));
+    // Phones the push goes to. Waiting only makes sense if one of them can
+    // be woken; an endpoint already on a call is registered already.
+    const pushed = canPush() ? devicesOf(targets).filter((d) => d.token).length : 0;
+    const waitSeconds = pushed && !lineBusy ? config.pushWaitSeconds : 0;
+    const now = Date.now();
     call = {
       id,
       key: crypto.randomBytes(16).toString('hex'),
       from: displayNumber(params.From),
       to: displayNumber(params.To),
       targets,
-      createdAt: Date.now(),
-      deadline: Date.now() + config.ringSeconds * 1000,
-      attempts: 0,
+      numbers,
+      createdAt: now,
+      // Until the Dial starts: the wait plus the ring. Then: the ring.
+      deadline: now + (waitSeconds + config.ringSeconds) * 1000,
+      waitUntil: now + waitSeconds * 1000,
+      pushedDevices: pushed,
+      // Phones that reported "registered" for this call (device ids, or one
+      // anonymous entry per call-key report).
+      registered: new Set(),
+      transferred: false,
+      dialStarted: false,
+      lateRegistered: false,
       accepted: false,
       declined: false,
       bridged: false,
       finished: null,
       endedPushSent: false,
-      // The app said it is registered: dial it now, not after the ringback.
-      redialNow: false,
-      ringbackUntil: 0,
-      // Every endpoint rung is already on a call through this bridge.
-      lineBusy: targets.every((user) => onCall(user)),
+      lineBusy,
       over: false,
     };
     calls.set(id, call);
-    log('->', `Inbound call ${short(id)} from ${call.from} to ${call.to}; ringing ${targets.join(', ')}`);
+    const everyone = [...targets, ...numbers].join(', ');
+    log('->', `Inbound call ${short(id)} from ${call.from} to ${call.to}; will ring ${everyone}`);
 
-    // Ring the endpoint at once; the push goes out in parallel. Waiting for
-    // FCM here only delayed the first INVITE to an app that is already open.
+    // The push goes out in parallel; FCM never holds up the reply to Vobiz.
     background(pushToTargets(call, incomingPayload(call)), 'push');
-    return sendXml(res, dialXml(call, { ringback: false }));
+    if (!waitSeconds) return sendXml(res, dialXml(call));
+    log('..', `Call ${short(id)}: ringback for up to ${waitSeconds} s while ${pushed} phone(s) wake and sign in`);
+    return sendXml(res, holdXml(call));
   }
 
-  /** One dial attempt has finished; decide whether to try again. */
+  /**
+   * The caller hears ringback as early media while the app wakes. When it
+   * ends, Vobiz requests /dial-now (the Dial without the app). If the app
+   * reports "registered" first, the caller's leg is transferred to /dial-now
+   * at once and this document is abandoned (see onRegistered).
+   */
+  function holdXml(call) {
+    const base = publicBase();
+    return `  <PreAnswer><Play>${esc(base)}/wait.wav</Play></PreAnswer>\n  <Redirect method="POST">${esc(base)}/dial-now/${callRef(call.id)}</Redirect>`;
+  }
+
+  /** The single Dial attempt has ended: the call is answered, or it is over. */
   async function onDialResult(req, res, url, params) {
     const id = callIdFromPath(url);
     const call = id ? calls.get(id) : null;
@@ -236,59 +271,39 @@ export function createBridge(options = {}) {
     const cause = params.DialHangupCause || params.DialBLegHangupCause || '';
     if (!call) return sendXml(res, '<Hangup/>');
     if (call.finished === 'declined') return sendXml(res, declinedXml());
-
-    const left = Math.round((call.deadline - Date.now()) / 1000);
-    log('..', `Call ${short(id)} attempt ${call.attempts}: ${status || 'no status'}${cause ? ` (${cause})` : ''}, ${Math.max(left, 0)} s left`);
+    log('..', `Call ${short(id)} Dial ended: ${status || 'no status'}${cause ? ` (${cause})` : ''}`);
 
     // "completed" is documented as "bridged, then ended", but Vobiz also sends it
     // when the app was rung and never answered (seen 2026-10-09: a 10 s
     // unanswered B-leg reported as completed / NORMAL_CLEARING). Only a
-    // DialAnswer or DialConnected event on callbackUrl proves the app answered.
+    // DialAnswer or DialConnected event on callbackUrl proves someone answered.
     if (status === 'completed' && call.bridged) {
       finish(call, 'answered');
       call.over = true;
       return sendXml(res, '<Hangup/>');
     }
     // Call waiting: the endpoint is on another call through this bridge, so
-    // "busy" is the app's SIP stack refusing a second call, not an app that is
-    // still starting. Say busy now instead of re-dialling for RING_SECONDS.
+    // "busy" is the app's SIP stack refusing a second call.
     if (status === 'busy' && call.lineBusy && !call.accepted) {
       finish(call, 'busy');
       endRinging(call, 'busy');
       return sendXml(res, declinedXml());
-    }
-    if (status === 'completed') {
-      log('!!', `Call ${short(id)}: Vobiz reported "completed" but the app never answered; trying again`);
     }
     if (status === 'cancel') {
       finish(call, 'caller hung up');
       endRinging(call, 'caller_hung_up');
       return sendXml(res, '<Hangup/>');
     }
-    // An endpoint that is offline (the app closed) comes back "busy" at once
-    // too (seen 2026-10-09), so busy alone is not a decline. The app reports
-    // Decline and "registered" itself; the bridge acts on those as they
-    // arrive instead of sleeping here.
     if (call.declined) {
       finish(call, 'declined');
       endRinging(call, 'declined');
       return sendXml(res, declinedXml());
     }
-    if (left <= RINGBACK_SECONDS + 2) {
-      finish(call, 'missed');
-      endRinging(call, 'missed');
-      return sendXml(res, '<Speak>Sorry, there was no answer. Please try again later.</Speak><Hangup/>');
-    }
-    // The app reported it is registered while this attempt was in flight:
-    // ring it again straight away.
-    if (call.redialNow) {
-      call.redialNow = false;
-      return sendXml(res, dialXml(call, { ringback: false }));
-    }
-    // "failed" is what an endpoint that is not registered produces: the app
-    // is still starting. Play ringback, then ring it again (unless the app
-    // reports "registered" first, see onRegistered).
-    return sendXml(res, dialXml(call, { ringback: true }));
+    // One Dial only: nobody answered (or every leg failed). No second attempt,
+    // so a target that rang is never rung again from the start.
+    finish(call, 'missed');
+    endRinging(call, 'missed');
+    return sendXml(res, '<Speak>Sorry, there was no answer. Please try again later.</Speak><Hangup/>');
   }
 
   /**
@@ -339,26 +354,29 @@ export function createBridge(options = {}) {
     sendText(res, 200, 'OK');
   }
 
-  function dialXml(call, { ringback }) {
-    call.attempts += 1;
+  /**
+   * The one Dial: every app endpoint (all routed users, whether or not their
+   * app reported in time: an open app that did not report still rings, an
+   * offline one just fails its leg), every ALWAYS_RING endpoint and the
+   * route's PSTN numbers, all at once. The first to answer wins.
+   */
+  function dialXml(call) {
+    call.dialStarted = true;
+    call.deadline = Date.now() + config.ringSeconds * 1000;
     const base = publicBase();
-    const ringFor = Math.max(10, Math.round((call.deadline - Date.now()) / 1000));
     const action = `${base}/dial-result/${callRef(call.id)}`;
     const events = `${base}/dial-events/${callRef(call.id)}`;
     const callerId = config.callerIdMode === 'number' && call.to ? ` callerId="${esc(call.to)}"` : '';
-    const users = call.targets
-      .map((user) => `    <User sipHeaders="${esc(sipHeaders(call))}">sip:${esc(user)}@registrar.vobiz.ai</User>`)
-      .join('\n');
-    const pre = ringback
-      ? `  <PreAnswer><Play>${esc(base)}/ringback.wav</Play></PreAnswer>\n`
-      : '';
-    call.ringbackUntil = ringback ? Date.now() + RINGBACK_SECONDS * 1000 : 0;
-    return `${pre}  <Dial${callerId} timeout="${ringFor}" timeLimit="14400" action="${esc(action)}" method="POST" redirect="true" callbackUrl="${esc(events)}" callbackMethod="POST">\n${users}\n  </Dial>`;
+    const legs = [
+      ...call.targets.map((user) => `    <User sipHeaders="${esc(sipHeaders(call))}">sip:${esc(user)}@registrar.vobiz.ai</User>`),
+      ...call.numbers.map((number) => `    <Number>${esc(number)}</Number>`),
+    ].join('\n');
+    return `  <Dial${callerId} timeout="${config.ringSeconds}" timeLimit="14400" action="${esc(action)}" method="POST" redirect="true" callbackUrl="${esc(events)}" callbackMethod="POST">\n${legs}\n  </Dial>`;
   }
 
   /**
    * Metadata on the SIP INVITE, so the app can match the call to the push it
-   * already showed. PushRef is the push's call_id, on every attempt: the app
+   * already showed. PushRef is the push's call_id, on every <User>: the app
    * auto-answers an accepted call only when PushRef equals that call_id, never
    * by caller or callee number (with CALLER_ID_MODE=number every call shows
    * the same number). Vobiz's docs disagree on the key format ("RefX-VH=" on
@@ -394,15 +412,19 @@ export function createBridge(options = {}) {
   }
 
   /**
-   * Who rings for an inbound call to `to`: the users ROUTES maps that number
-   * to, plus ALWAYS_RING. Without ROUTES, the one user that has registered a
-   * phone; with several users and no ROUTES nobody is pushed, because the
-   * bridge cannot know whose number was dialled.
+   * Who rings for an inbound call to `to`: `users`, the endpoints ROUTES
+   * maps that number to plus ALWAYS_RING, and `numbers`, the route's PSTN
+   * numbers. Without ROUTES, the one user that has registered a phone; with
+   * several users and no ROUTES nobody is pushed, because the bridge cannot
+   * know whose number was dialled.
    */
   function ringTargets(to) {
     const names = new Set();
+    let numbers = [];
     if (config.routes.size) {
-      for (const user of config.routes.get(displayNumber(to)) || []) names.add(user);
+      const route = config.routes.get(displayNumber(to));
+      for (const user of route?.users || []) names.add(user);
+      numbers = route?.numbers || [];
     } else {
       const users = new Set(Object.values(state.devices).map((d) => d.username));
       if (users.size === 1) names.add([...users][0]);
@@ -411,7 +433,12 @@ export function createBridge(options = {}) {
       }
     }
     for (const user of config.alwaysRing) names.add(user);
-    return [...names];
+    return { users: [...names], numbers };
+  }
+
+  /** Whether a push can be sent at all (Firebase set up, or a test double). */
+  function canPush() {
+    return Boolean(deps.sendPush) || firebase.ready;
   }
 
   /** Whether `user` is on a call this bridge connected and that has not ended. */
@@ -509,7 +536,6 @@ export function createBridge(options = {}) {
       onlyDevice: device.id,
       createdAt: Date.now() + delay * 1000,
       deadline: Date.now() + (delay + 30) * 1000,
-      attempts: 0,
       accepted: false,
       declined: false,
       finished: null,
@@ -522,35 +548,45 @@ export function createBridge(options = {}) {
     sendJson(res, 200, { ok: true, call_id: call.id, sending_in_seconds: delay });
   }
 
-  /** The user tapped Accept: give the app time to start and sign in. */
+  /**
+   * The user tapped Accept. With one Dial there is no later attempt to hold
+   * the call open for, so this only records it (and says if it is over).
+   */
   async function onAccept(req, res) {
     const body = await readJson(req);
     const call = callFor(body);
     if (!call) return sendJson(res, 404, { error: 'Unknown call' });
     if (call.finished) return sendJson(res, 200, { ok: true, finished: true, reason: endReason(call) });
     call.accepted = true;
-    call.deadline = Math.max(call.deadline, call.createdAt + ACCEPTED_GRACE_SECONDS * 1000);
-    log('ok', `Call ${short(call.id)} accepted on the phone; waiting for the app to sign in`);
+    log('ok', `Call ${short(call.id)} accepted on the phone`);
     sendJson(res, 200, { ok: true, test: Boolean(call.test) });
   }
 
   /**
-   * The app's SIP registration succeeded. Ring it now instead of waiting for
-   * the next timed attempt: during ringback the caller's leg is transferred
-   * (Vobiz Transfer API) to /dial-now, which dials at once; while an attempt
-   * is still in flight, the next dial result dials without ringback.
+   * The app's SIP registration succeeded while a pushed call rings.
    * Body: { call_id, call_key } for one call, or no call with the phone's
-   * device token for every call ringing its endpoint.
+   * device token for every call ringing its endpoint. Replies per call:
+   *   transferred  every pushed phone has reported: the caller's leg is
+   *                transferred (Vobiz Transfer API) to /dial-now, which
+   *                starts the Dial now instead of at the end of the wait;
+   *   waiting      the Dial starts at the end of the wait (other pushed
+   *                phones have not reported yet, the wait is about to end,
+   *                or the transfer failed); this phone is in it;
+   *   too_late     the Dial had already started without this phone. It is
+   *                not restarted (that would cut off a ringing browser or
+   *                PSTN leg); the app gets call_ended when the call ends;
+   *   finished     the call is over;  test  a test call.
    */
   async function onRegistered(req, res) {
     const body = await readJson(req);
     let list;
+    let device = null;
     if (body.call_id) {
       const call = callFor(body);
       if (!call) return sendJson(res, 404, { error: 'Unknown call' });
       list = [call];
     } else {
-      const device = deviceFromRequest(req);
+      device = deviceFromRequest(req);
       if (!device) return sendJson(res, 401, { error: 'Send call_id and call_key, or this phone\'s device token' });
       list = [...calls.values()].filter((c) => c.targets.includes(device.username));
     }
@@ -560,7 +596,7 @@ export function createBridge(options = {}) {
         results[call.id] = call.finished ? 'finished' : 'test';
         continue;
       }
-      results[call.id] = await redialNow(call);
+      results[call.id] = await registeredFor(call, device ? device.id : `report-${call.registered.size}`);
     }
     const single = body.call_id ? results[body.call_id] : undefined;
     sendJson(res, 200, {
@@ -569,34 +605,63 @@ export function createBridge(options = {}) {
     });
   }
 
-  /** Dials the app for `call` as soon as possible. Returns what it did. */
-  async function redialNow(call) {
-    if (call.ringbackUntil > Date.now() && config.authId) {
-      try {
-        await vobizApi('POST', `/Call/${encodeURIComponent(call.id)}/`, {
-          legs: 'aleg',
-          aleg_url: `${publicBase()}/dial-now/${callRef(call.id)}`,
-          aleg_method: 'POST',
-        });
-        call.ringbackUntil = 0;
-        log('ok', `Call ${short(call.id)}: the app is registered; dialling it now`);
-        return 'transferred';
-      } catch (error) {
-        log('!!', `Call ${short(call.id)}: could not transfer to dial now (${error.message}); dialling after the ringback`);
-      }
+  /** One phone reported "registered" for `call`. Returns the reply value. */
+  async function registeredFor(call, reporter) {
+    if (call.dialStarted) {
+      call.lateRegistered = true;
+      log('..', `Call ${short(call.id)}: an app signed in after the Dial started; the others keep ringing (not restarted)`);
+      return 'too_late';
     }
-    call.redialNow = true;
-    log('ok', `Call ${short(call.id)}: the app is registered; the next attempt rings it without ringback`);
-    return 'next_attempt';
+    call.registered.add(reporter);
+    if (call.transferred) return 'transferred';
+    if (call.registered.size < call.pushedDevices) {
+      log('..', `Call ${short(call.id)}: ${call.registered.size} of ${call.pushedDevices} phones signed in; waiting for the rest`);
+      return 'waiting';
+    }
+    return dialNow(call);
   }
 
-  /** The caller's leg, transferred here by redialNow(): ring the app now. */
+  /** Ends the wait early: transfers the caller's leg to /dial-now. */
+  async function dialNow(call) {
+    if (call.waitUntil - Date.now() < TRANSFER_MARGIN_MS) {
+      log('..', `Call ${short(call.id)}: the app is signed in; the wait ends in under a second and dials then`);
+      return 'waiting';
+    }
+    if (!config.authId) {
+      log('..', `Call ${short(call.id)}: the app is signed in, but without VOBIZ_AUTH_ID the bridge cannot cut the wait short`);
+      return 'waiting';
+    }
+    call.transferred = true;
+    try {
+      await vobizApi('POST', `/Call/${encodeURIComponent(call.id)}/`, {
+        legs: 'aleg',
+        aleg_url: `${publicBase()}/dial-now/${callRef(call.id)}`,
+        aleg_method: 'POST',
+      });
+      log('ok', `Call ${short(call.id)}: the app is signed in; dialling everyone now`);
+      return 'transferred';
+    } catch (error) {
+      call.transferred = false;
+      log('!!', `Call ${short(call.id)}: could not transfer to dial now (${error.message}); dialling when the wait ends`);
+      return 'waiting';
+    }
+  }
+
+  /**
+   * Starts the one Dial: requested by the hold XML's <Redirect> when the
+   * wait ends, or after the transfer in dialNow().
+   */
   async function onDialNow(req, res, url) {
     const id = callIdFromPath(url);
     const call = id ? calls.get(id) : null;
+    if (call?.finished === 'declined') return sendXml(res, declinedXml());
     if (!call || call.finished) return sendXml(res, '<Hangup/>');
-    call.redialNow = false;
-    return sendXml(res, dialXml(call, { ringback: false }));
+    if (call.dialStarted) {
+      // Vobiz only asks again if the document running the Dial was replaced
+      // (a transfer that crossed the Redirect): the Dial has to be resent.
+      log('!!', `Call ${short(call.id)}: /dial-now requested again after the Dial started; dialling again`);
+    }
+    return sendXml(res, dialXml(call));
   }
 
   /** The user tapped Decline. Needs the call's own key from the push. */
@@ -613,8 +678,8 @@ export function createBridge(options = {}) {
     if (!call.test) {
       finish(call, 'declined');
       endRinging(call, 'declined');
-      // Act now rather than at the next dial result (up to a ringback later,
-      // or never while the app's other phones are still ringing).
+      // Act now rather than at the Dial result (the end of the wait, or
+      // never while the other targets are still ringing).
       if (config.authId) {
         try {
           await vobizApi('POST', `/Call/${encodeURIComponent(call.id)}/`, {
@@ -1031,7 +1096,8 @@ export function createBridge(options = {}) {
     const registered = Object.entries(state.devices)
       .map(([id, d]) => `${d.username} on ${id} (${d.token ? 'push' : 'no push'})`);
     log('..', `Phones registered: ${registered.length ? registered.join(', ') : 'none yet'}`);
-    for (const [number, users] of config.routes) log('..', `Calls to ${number} ring ${users.join(', ')}`);
+    for (const [number, route] of config.routes) log('..', `Calls to ${number} ring ${[...route.users, ...route.numbers].join(', ')}`);
+    log('..', `Inbound calls wait up to ${config.pushWaitSeconds} s for a pushed app to sign in, then ring for ${config.ringSeconds} s`);
 
     console.log('');
     if (keyIsNew) {
@@ -1110,7 +1176,7 @@ export function createBridge(options = {}) {
     fs.renameSync(tmp, config.stateFile);
   }
 
-  return { server, config, state, calls, start, close, firebase, verifySignatures };
+  return { server, config, state, calls, start, close, firebase, verifySignatures, ringTargets };
 }
 
 // ── Module helpers ───────────────────────────────────────────────────────────
@@ -1128,16 +1194,33 @@ export function configProblems(config, env, allowUnsigned) {
   return problems;
 }
 
-/** ROUTES=+919876543210=alice,bob;+918000000000=carol → Map(number → [users]). */
-function parseRoutes(value) {
+/** A PSTN destination in ROUTES: `+` and 6 to 15 digits (E.164). */
+const PSTN_RE = /^\+\d{6,15}$/;
+
+/**
+ * ROUTES=+919876543210=alice,bob,+919800000001;+918000000000=carol →
+ * Map(number → { users: [endpoints], numbers: [PSTN numbers] }). An entry of
+ * `+` and digits is a phone number rung with <Number>; anything else is an
+ * endpoint username, as before.
+ */
+export function parseRoutes(value) {
   const routes = new Map();
   for (const entry of String(value || '').split(';')) {
-    const [number, users] = entry.split('=');
-    if (!number || !users) continue;
-    const list = csv(users);
-    if (list.length) routes.set(displayNumber(number.trim()), list);
+    const [number, list] = entry.split('=');
+    if (!number || !list) continue;
+    const items = list.split(',').map((s) => s.trim()).filter(Boolean);
+    const numbers = [...new Set(items.filter((s) => PSTN_RE.test(s)))];
+    const users = csv(items.filter((s) => !PSTN_RE.test(s)).join(','));
+    if (users.length || numbers.length) routes.set(displayNumber(number.trim()), { users, numbers });
   }
   return routes;
+}
+
+/** Ringback cadence bursts ([start, end] s) filling `seconds`: 0.4 on, 0.2 off, 0.4 on, 2 off. */
+function ringbackBursts(seconds) {
+  const bursts = [];
+  for (let t = 0; t < seconds; t += 3) bursts.push([t, t + 0.4], [t + 0.6, t + 1.0]);
+  return bursts;
 }
 
 function sha256(value) {
@@ -1259,7 +1342,7 @@ function sendWav(res, wav) {
 /**
  * `seconds` of an Indian call-progress tone (400 Hz modulated at 25 Hz),
  * sounding during `bursts` ([start, end] in seconds), as 8 kHz 16-bit mono
- * WAV. Ringback: 0.4 s on, 0.2 s off, 0.4 s on, 2 s off. Busy: 0.75 s on/off.
+ * WAV. Ringback: see ringbackBursts(). Busy: 0.75 s on/off.
  */
 function makeToneWav(seconds, bursts) {
   const rate = 8000;

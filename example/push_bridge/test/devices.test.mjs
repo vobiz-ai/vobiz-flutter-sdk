@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { test } from 'node:test';
-import { BRIDGE_KEY, fcmToken, postJson, registerDevice, startBridge, webhook } from './helpers.mjs';
+import { BRIDGE_KEY, fcmToken, postJson, registerDevice, startBridge, webhook, answerCall } from './helpers.mjs';
 
 const ROUTES = '+918000000001=alice;+918000000002=bob';
 
@@ -65,8 +65,7 @@ test('an inbound call rings and pushes only the dialled number\'s endpoint', asy
   t.after(ctx.stop);
   const alice = await registerDevice(ctx, 'alice');
   await registerDevice(ctx, 'bob');
-  const r = await webhook(ctx, '/answer', { CallUUID: 'c1', From: '+919800000001', To: '+918000000001' });
-  assert.equal(r.status, 200);
+  const r = await answerCall(ctx, { CallUUID: 'c1', From: '+919800000001', To: '+918000000001' });
   assert.match(r.text, /sip:alice@/);
   assert.doesNotMatch(r.text, /sip:bob@/);
   await new Promise((res) => setTimeout(res, 50));
