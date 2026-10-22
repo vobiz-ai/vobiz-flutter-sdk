@@ -877,6 +877,25 @@ class SIPService {
     _sendRegister(expires: registerExpires, auth: _AuthRetries());
   }
 
+  /// Refreshes the registration now, on the open socket: the same REGISTER
+  /// (and digest retry) as the periodic refresh, whose timer is re-armed from
+  /// the new grant. A call in progress is not affected.
+  ///
+  /// Returns false, sending nothing, unless the socket is connected and the
+  /// registration is up; reconnecting is then the caller's job. Returns true
+  /// without sending when a REGISTER is already in flight.
+  bool refreshRegistration() {
+    if (_username == null || _password == null) return false;
+    if (_connectionState.value != SipConnectionState.connected ||
+        _registrationState.value != SipRegistrationState.registered) {
+      return false;
+    }
+    if (_transactions.values.any((tx) => tx.method == 'REGISTER')) return true;
+    _registrationRefreshTimer?.cancel();
+    _sendRegister(expires: registerExpires, auth: _AuthRetries());
+    return true;
+  }
+
   /// Marks the line busy while an outbound call is being prepared (microphone,
   /// ICE gathering), so an inbound INVITE arriving meanwhile is turned away
   /// with 486 instead of ringing unseen and tangling with the new dialog.
