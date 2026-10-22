@@ -5,10 +5,13 @@ Everything below is exported by `package:vobiz_webrtc/vobiz_webrtc.dart`.
 ## VobizClient
 
 ```dart
-VobizClient({SdkConfig config = const SdkConfig(), Logger? logger, http.Client? httpClient})
+VobizClient({SdkConfig config = const SdkConfig(), Logger? logger, http.Client? httpClient,
+    ConnectivityMonitor? connectivityMonitor, AppLifecycleMonitor? lifecycleMonitor})
 ```
 
-`httpClient` is for tests; leave it out in an app.
+`httpClient` is for tests; leave it out in an app. The two monitors default to the
+platform (`PlatformConnectivityMonitor`, `PlatformAppLifecycleMonitor`); supply your own
+to drive them from elsewhere or in tests.
 
 ### Signing in
 
@@ -126,6 +129,24 @@ Error codes are constants on `VobizErrorCode`: `setupFailed`, `registrationFaile
 `makeCallFailed`, `transferFailed`, `recordingsFailed`, `demoModeRequired`,
 `credentialsFailed`.
 
+### Returning to the foreground
+
+The SDK re-registers by itself each time the app comes back to the foreground
+(`AppLifecycleState.resumed` after `hidden`, `paused` or `detached`), so Vobiz has the
+device's current IP address after it was locked or in the background. No app code is
+needed.
+
+- Registered on a live socket: one REGISTER on that socket; the refresh timer restarts
+  from the new grant. A call in progress keeps its socket and dialog.
+- Socket dropped, reconnecting or given up: reconnects now with the backoff reset
+  (a `NetworkEvent` `reconnecting` with reason `App returned to the foreground`, then
+  `reconnected`).
+- Signed out, or a resume within 2 s of the last one: nothing.
+
+The refresh reports a `ConnectionEvent` with message `Reregistered on foreground` and
+logs `reregistered on foreground`. Turn it off with
+`SdkConfig(reregisterOnForeground: false)`.
+
 ## Errors
 
 | Type | Code | Thrown when |
@@ -160,6 +181,7 @@ exact `PushRef` match only, never by phone number. See
 | `iceConfig` | Google STUN | Add TURN for restrictive networks |
 | `mediaConstraints` | audio with echo cancellation, noise suppression, AGC | |
 | `unsafeDemoZeroConfig` | `false` | **Demo only.** Allows `connectWithAuthToken`, `transferCall` and the demo server's recordings, which send or expose account credentials. Never ship with it set |
+| `reregisterOnForeground` | `true` | Re-register (or reconnect) each time the app returns to the foreground; see [Returning to the foreground](#returning-to-the-foreground) |
 
 ## VobizSipHeaders
 

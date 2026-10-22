@@ -46,6 +46,10 @@ call was used. #58 lists what still needs a device.
   (#17, #20, #23, #30, #41, #44).
 - `VobizIncomingPush` for reading call pushes (`ttl_ms` expiry, `lineBusy`) (#11, #50).
 - CI: analyze and test for the SDK and example, and `node --test` for the bridge (#34).
+- Re-registers by itself whenever the app returns to the foreground, so Vobiz has the
+  device's current IP address: one REGISTER on a live connection (calls untouched), an
+  immediate reconnect otherwise. `SdkConfig.reregisterOnForeground` (default true),
+  `AppLifecycleMonitor` / `PlatformAppLifecycleMonitor` (#18).
 
 ### Fixed
 
