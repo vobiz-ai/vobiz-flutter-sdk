@@ -129,3 +129,29 @@ export async function registerDevice(ctx, username, { name = username } = {}) {
   if (r.status !== 200) throw new Error(`register ${username}: ${r.status} ${r.text}`);
   return { ...r.json, fcm: fcmToken(name), auth: { Authorization: `Bearer ${r.json.device_token}` } };
 }
+
+/**
+ * An inbound call up to its Dial. /answer holds the caller on ringback while
+ * a pushed phone wakes (PreAnswer + Redirect to /dial-now); this follows the
+ * Redirect as Vobiz does when the wait ends. Returns { text: the Dial XML,
+ * hold: the hold XML or null, action, events }.
+ */
+export async function answerCall(ctx, params) {
+  const answer = await webhook(ctx, '/answer', params);
+  let text = answer.text;
+  let hold = null;
+  const redirect = text.match(/<Redirect[^>]*>([^<]+)<\/Redirect>/);
+  if (redirect) {
+    hold = text;
+    text = (await webhook(ctx, new URL(redirect[1].replace(/&amp;/g, '&')).pathname, { CallUUID: params.CallUUID, Event: 'Redirect' })).text;
+  }
+  const action = xmlAttr(text, 'Dial', 'action');
+  const events = xmlAttr(text, 'Dial', 'callbackUrl');
+  return {
+    text,
+    hold,
+    headers: answer.headers,
+    action: action && new URL(action).pathname,
+    events: events && new URL(events).pathname,
+  };
+}

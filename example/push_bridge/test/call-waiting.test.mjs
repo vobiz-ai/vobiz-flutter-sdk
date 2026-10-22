@@ -3,15 +3,10 @@
 // carries the exact call id the push carried.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { registerDevice, startBridge, until, webhook, xmlAttr } from './helpers.mjs';
+import { answerCall, registerDevice, startBridge, until, webhook, xmlAttr } from './helpers.mjs';
 
 async function call(ctx, id) {
-  const answer = await webhook(ctx, '/answer', { CallUUID: id, From: '+919800000001', To: '+918000000001' });
-  return {
-    text: answer.text,
-    action: new URL(xmlAttr(answer.text, 'Dial', 'action')).pathname,
-    events: new URL(xmlAttr(answer.text, 'Dial', 'callbackUrl')).pathname,
-  };
+  return answerCall(ctx, { CallUUID: id, From: '+919800000001', To: '+918000000001' });
 }
 
 const incoming = (ctx, id) => until(() => ctx.pushes.find((p) => p.data.type === 'incoming_call' && p.data.call_id === id));
@@ -40,16 +35,17 @@ test('a second call while the endpoint is on a call is pushed as line_busy and e
 });
 
 for (const style of ['suffix', 'plain']) {
-  test(`every Dial attempt carries PushRef = the push's call_id (${style})`, async (t) => {
-    const ctx = await startBridge({ env: { SIP_HEADER_STYLE: style } });
+  test(`every <User> in the Dial carries PushRef = the push's call_id (${style})`, async (t) => {
+    const ctx = await startBridge({ env: { SIP_HEADER_STYLE: style, ROUTES: '+918000000001=alice,bob' } });
     t.after(ctx.stop);
     await registerDevice(ctx, 'alice');
-    const first = await call(ctx, 'call-uuid-1');
+    await registerDevice(ctx, 'bob');
+    const first = await answerCall(ctx, { CallUUID: 'call-uuid-1', From: '+919800000001', To: '+918000000001' });
     const push = await incoming(ctx, 'call-uuid-1');
     const key = style === 'plain' ? 'PushRef' : 'PushRefX-VH';
     const ref = (xml) => xmlAttr(xml, 'User', 'sipHeaders').split(',').find((p) => p.startsWith(`${key}=`));
-    assert.equal(ref(first.text), `${key}=${push.data.call_id}`);
-    const retry = await webhook(ctx, first.action, { DialStatus: 'failed' });
-    assert.equal(ref(retry.text), `${key}=${push.data.call_id}`);
+    const users = first.text.match(/<User [^>]*>/g);
+    assert.equal(users.length, 2);
+    for (const user of users) assert.equal(ref(user), `${key}=${push.data.call_id}`);
   });
 }
