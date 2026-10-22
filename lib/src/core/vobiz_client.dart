@@ -26,6 +26,7 @@ import '../models/call/call_stats.dart';
 import '../models/call/recording.dart';
 import '../models/call/transfer_leg.dart';
 import '../network/connection_supervisor.dart';
+import '../network/app_lifecycle_monitor.dart';
 import '../network/connectivity_monitor.dart';
 import '../network/network_event.dart';
 import '../signaling/sip_service.dart';
@@ -54,11 +55,13 @@ class VobizClient {
     Logger? logger,
     http.Client? httpClient,
     ConnectivityMonitor? connectivityMonitor,
+    AppLifecycleMonitor? lifecycleMonitor,
   }) : this._(
           config: config,
           logger: logger ?? Logger(writer: config.debug ? debugPrint : null),
           httpClient: httpClient,
           connectivityMonitor: connectivityMonitor,
+          lifecycleMonitor: lifecycleMonitor,
         );
 
   /// Test seam: a client driven by the given SIP and media services, with
@@ -73,11 +76,13 @@ class VobizClient {
     Duration setupTimeout = _defaultSetupTimeout,
     Duration networkLossGrace = _defaultNetworkLossGrace,
     ConnectivityMonitor? connectivityMonitor,
+    AppLifecycleMonitor lifecycleMonitor = const NoAppLifecycleMonitor(),
   }) : this._(
           config: config,
           logger: logger ?? Logger(),
           httpClient: httpClient,
           connectivityMonitor: connectivityMonitor ?? _AlwaysOnlineMonitor(),
+          lifecycleMonitor: lifecycleMonitor,
           sip: sip,
           peer: peer,
           setupTimeout: setupTimeout,
@@ -93,8 +98,10 @@ class VobizClient {
     Duration setupTimeout = _defaultSetupTimeout,
     Duration networkLossGrace = _defaultNetworkLossGrace,
     ConnectivityMonitor? connectivityMonitor,
+    AppLifecycleMonitor? lifecycleMonitor,
   })  : _config = config,
         _logger = logger,
+        _lifecycle = lifecycleMonitor ?? PlatformAppLifecycleMonitor(),
         _sip = sip ??
             SIPService(
               wsUrl: config.wsUrl,
@@ -157,6 +164,15 @@ class VobizClient {
   final Duration _setupTimeout;
   final Duration _networkLossGrace;
   late final ConnectionSupervisor _supervisor;
+  final AppLifecycleMonitor _lifecycle;
+  StreamSubscription<bool>? _lifecycleSub;
+  bool? _inForeground;
+  DateTime? _lastForegroundRegister;
+  bool _reregisteringOnForeground = false;
+
+  /// Resumes closer together than this count as one
+  /// ([SdkConfig.reregisterOnForeground]).
+  static const Duration _foregroundDebounce = Duration(seconds: 2);
   late final AudioInterruptionHandler _interruptions;
   bool _holdInProgress = false;
 
@@ -391,8 +407,9 @@ class VobizClient {
 
   /// Reconnects and re-registers now, resetting the retry backoff.
   ///
-  /// Call it when the app returns to the foreground or a push arrives, or
-  /// from a "retry" button after a `reconnect_failed` error. Does nothing when
+  /// Call it when a push arrives, or from a "retry" button after a
+  /// `reconnect_failed` error. Returning to the foreground needs no call:
+  /// see [SdkConfig.reregisterOnForeground]. Does nothing when
   /// signed out; while offline it waits for the network.
   void reconnect() => _supervisor.reconnectNow();
 
@@ -401,6 +418,7 @@ class VobizClient {
   /// far end is not left talking to a closed socket.
   Future<void> disconnect() async {
     _supervisor.stop();
+    _stopWatchingLifecycle();
     _clearCallSetupTimer();
     final callId = _callId;
     if (callId != null) {
@@ -886,10 +904,13 @@ class VobizClient {
       _registrationState = RegistrationState.registered;
       _connectionState = ConnectionStateStatus.connected;
       _supervisor.connected();
+      final onForeground = _reregisteringOnForeground;
+      _reregisteringOnForeground = false;
+      if (onForeground) _logger.info('reregistered on foreground');
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
-        message: 'Registered',
+        message: onForeground ? 'Reregistered on foreground' : 'Registered',
       ));
       if (_signalingLost) {
         _signalingLost = false;
@@ -898,6 +919,7 @@ class VobizClient {
     };
 
     _sip.onRegistrationFailed = (reason) {
+      _reregisteringOnForeground = false;
       // Wrong credentials are not a network problem: retrying cannot help.
       _supervisor.stop();
       _registrationState = RegistrationState.failed;
@@ -1085,6 +1107,7 @@ class VobizClient {
       message: reconnecting ? 'Reconnecting' : 'Connecting',
     ));
 
+    _watchLifecycle();
     try {
       if (_config.autoReconnect && !_supervisor.isRunning) {
         await _supervisor.start();
@@ -1179,6 +1202,46 @@ class VobizClient {
       case NetworkEventType.reconnected:
         break;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private — app lifecycle
+  // ---------------------------------------------------------------------------
+
+  void _watchLifecycle() {
+    if (!_config.reregisterOnForeground || _lifecycleSub != null) return;
+    _lifecycleSub = _lifecycle.foregroundChanges.listen(_onForegroundChanged);
+  }
+
+  void _stopWatchingLifecycle() {
+    unawaited(_lifecycleSub?.cancel());
+    _lifecycleSub = null;
+    _inForeground = null;
+    _lastForegroundRegister = null;
+    _reregisteringOnForeground = false;
+  }
+
+  /// Back in the foreground: tell the registrar where this device is now.
+  /// A live registration is refreshed on its own socket (a call on it is
+  /// untouched); anything else is reconnected with the backoff reset.
+  void _onForegroundChanged(bool foreground) {
+    final wasForeground = _inForeground;
+    _inForeground = foreground;
+    if (!foreground || wasForeground == true) return;
+    if (_username == null || _password == null) return;
+    final now = DateTime.now();
+    final last = _lastForegroundRegister;
+    if (last != null && now.difference(last) < _foregroundDebounce) return;
+    _lastForegroundRegister = now;
+    // The first REGISTER of a sign-in is still on its way.
+    if (_connectionState == ConnectionStateStatus.connecting) return;
+    if (isConnected && _sip.refreshRegistration()) {
+      _logger.info('App in foreground: refreshing the registration');
+      _reregisteringOnForeground = true;
+      return;
+    }
+    _logger.info('App in foreground: reconnecting');
+    _supervisor.reconnectNow(reason: 'App returned to the foreground');
   }
 
   /// The network changed during a call. The signalling socket is left alone

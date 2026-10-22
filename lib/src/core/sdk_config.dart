@@ -43,6 +43,7 @@ class SdkConfig {
     this.reconnectPolicy = const ReconnectPolicy(),
     this.keepAlive = const KeepAliveConfig(),
     this.watchNetwork = true,
+    this.reregisterOnForeground = true,
   });
 
   /// The hosted Vobiz WebRTC Playground server: the "production webhook
@@ -137,4 +138,13 @@ class SdkConfig {
   /// the network comes back or changes. Without it a lost network is noticed
   /// only by the keep-alive.
   final bool watchNetwork;
+
+  /// Register again each time the app returns to the foreground, so Vobiz
+  /// has the device's current address: a phone's IP often changes while it
+  /// is locked or the app is in the background. On a live connection this is
+  /// one REGISTER on the same socket (a call in progress is not touched); a
+  /// dead or failed connection is reconnected at once with the backoff reset.
+  /// Nothing happens while signed out, and repeated resumes within 2 s count
+  /// as one.
+  final bool reregisterOnForeground;
 }
