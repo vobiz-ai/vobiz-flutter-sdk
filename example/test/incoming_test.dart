@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -62,6 +65,31 @@ void main() {
       expect(client.isConnected, isTrue);
       expect(controller.logs.map((l) => l.message),
           contains(contains('asking the push server to ring this phone now')));
+    });
+
+    test('a push while already signed in reports "registered" at once (no push wait)', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final seen = <String>[];
+      server.listen((request) async {
+        seen.add('${request.uri.path} ${await utf8.decodeStream(request)}');
+        request.response
+          ..headers.contentType = ContentType.json
+          ..write('{"ok":true,"redial":"transferred","finished":false}');
+        await request.response.close();
+      });
+      await start();
+      await signIn();
+      expect(client.isConnected, isTrue);
+      platform.pushController.add(<String, String>{
+        ...incoming('c1'),
+        'server': 'http://127.0.0.1:${server.port}',
+      });
+      for (var i = 0; i < 100 && seen.isEmpty; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(seen, <String>['/push/registered {"call_id":"c1","call_key":"k-c1"}']);
+      expect(controller.logs.map((l) => l.message), contains(contains('already signed in')));
     });
 
     test('the same push from Firebase and from the receiver is handled once', () async {

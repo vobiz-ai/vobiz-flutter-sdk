@@ -140,8 +140,10 @@ class PushBridgeApi {
   static Future<PerCallReply> decline(PushCall call, {http.Client? client}) =>
       _perCall('/push/decline', call, client);
 
-  /// Tells the bridge this phone's SIP registration succeeded while [call]
-  /// rings, so it dials the app now instead of at its next timed attempt.
+  /// Tells the bridge this phone is registered while [call] rings, so it
+  /// dials now instead of at the end of its push wait. A reply of
+  /// `too_late` (the Dial already started) needs nothing: the bridge's
+  /// `call_ended` push closes the call screen.
   static Future<PerCallReply> registered(PushCall call, {http.Client? client}) =>
       _perCall('/push/registered', call, client);
 

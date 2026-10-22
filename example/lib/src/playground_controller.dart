@@ -1167,7 +1167,11 @@ class PlaygroundController extends ChangeNotifier {
     _ringingPushes[call.callId] = call;
     unawaited(_showPushedCall(call));
     if (client.isConnected) {
-      log('📲 Push received for a call from ${call.caller}; it rings here over SIP', LogType.info);
+      log('📲 Push received for a call from ${call.caller}; already signed in, so the push server '
+          'rings this phone now', LogType.info);
+      // Already registered: say so now, or the bridge holds the caller for
+      // its whole push wait before it dials.
+      unawaited(_quietly(() => PushBridgeApi.registered(call)));
       return;
     }
     if (!_hasSavedSignIn) {
@@ -1350,8 +1354,8 @@ class PlaygroundController extends ChangeNotifier {
     _acceptedCall = null;
   }
 
-  /// Signed in after a push woke the app: tell the bridge, so it dials this
-  /// phone now rather than at its next timed attempt.
+  /// Signed in after a push woke the app: tell the bridge, so it dials now
+  /// rather than at the end of its push wait.
   void _reportRegisteredForPushes() {
     for (final call in _ringingPushes.values.toList()) {
       if (call.isTest || call.lineBusy) continue;
