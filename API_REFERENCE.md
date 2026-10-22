@@ -137,7 +137,11 @@ device's current IP address after it was locked or in the background. No app cod
 needed.
 
 - Registered on a live socket: one REGISTER on that socket; the refresh timer restarts
-  from the new grant. A call in progress keeps its socket and dialog.
+  from the new grant. A call in progress keeps its socket and dialog. After a phone is
+  locked the socket is often dead without having been closed: if the registrar does not
+  answer within 5 s the socket is dropped and the client reconnects at once, keeping a
+  call's dialog. The periodic refresh does the same after its 32 s timeout. A refusal
+  (403, say) still fails the registration.
 - Socket dropped, reconnecting or given up: reconnects now with the backoff reset
   (a `NetworkEvent` `reconnecting` with reason `App returned to the foreground`, then
   `reconnected`).

@@ -50,6 +50,10 @@ call was used. #58 lists what still needs a device.
   device's current IP address: one REGISTER on a live connection (calls untouched), an
   immediate reconnect otherwise. `SdkConfig.reregisterOnForeground` (default true),
   `AppLifecycleMonitor` / `PlatformAppLifecycleMonitor` (#18).
+- A REGISTER refresh (periodic or on returning to the foreground) that gets no answer
+  now means a dead socket: it is closed and the client reconnects at once, keeping a
+  call's dialog, instead of failing the registration and giving up. The foreground
+  refresh waits 5 s, not 32 s. Refusals still fail the registration (#18).
 
 ### Fixed
 
