@@ -42,6 +42,12 @@ class FakeClient implements VobizClient {
 
   @override
   bool get isConnected => connected;
+
+  /// Set to reconnecting to act as the SDK does while its network is down.
+  ConnectionStateStatus? connection;
+  @override
+  ConnectionStateStatus get connectionState =>
+      connection ?? (connected ? ConnectionStateStatus.connected : ConnectionStateStatus.disconnected);
   @override
   CallStateStatus get callState => state;
   @override

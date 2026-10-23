@@ -1685,12 +1685,6 @@ class PlaygroundController extends ChangeNotifier {
           _endCallScreen();
         }
         _resetCallState();
-        // Ended because the network went: the SDK reconnects in the
-        // background. Show that instead of leaving the dead call on screen;
-        // registering again (_onConnection) then shows Registered.
-        if (e.reason == 'network_lost' && !client.isConnected) {
-          _setStatus(PhoneStatus.connecting, 'Reconnecting...');
-        }
         break;
       case CallStateStatus.idle:
       case CallStateStatus.outgoing:
@@ -1807,6 +1801,13 @@ class PlaygroundController extends ChangeNotifier {
     transferUser = '';
     if (registered && client.isConnected) {
       _setStatus(PhoneStatus.online, 'Registered');
+    } else if (registered &&
+        status == PhoneStatus.inCall &&
+        client.connectionState == ConnectionStateStatus.reconnecting) {
+      // The call ended while the network is down (the SDK gave up, or the
+      // far end's BYE arrived as it dropped). Leave the call screen and show
+      // the reconnect; registering again (_onConnection) shows Registered.
+      _setStatus(PhoneStatus.connecting, 'Reconnecting...');
     } else {
       notifyListeners();
     }
