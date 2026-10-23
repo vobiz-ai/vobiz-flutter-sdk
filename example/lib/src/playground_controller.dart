@@ -1634,7 +1634,14 @@ class PlaygroundController extends ChangeNotifier {
         // the plugin's service then stops, and no longer anything else.
         _startCallService(outbound: e.direction != CallDirection.inbound);
         if (_callScreenId != null && _callScreenAccepted) _endCallScreen();
-        _startAliveReports(e.callUuid ?? client.lastCallUuid);
+        // A call through the push bridge: report the bridge's own id for it
+        // (PushRef, the caller's leg), which the bridge can act on. The
+        // X-Calluuid on the INVITE to this phone is not a call Vobiz's
+        // live-call API knows.
+        _startAliveReports(pushRefFromHeaders(e.headers) ??
+            pushRefFromHeaders(client.callHeaders) ??
+            e.callUuid ??
+            client.lastCallUuid);
         break;
       case CallStateStatus.failed:
         _failedCallId = e.callId;
