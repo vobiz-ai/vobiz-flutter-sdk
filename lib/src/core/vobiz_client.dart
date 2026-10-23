@@ -174,7 +174,9 @@ class VobizClient {
   /// ([SdkConfig.reregisterOnForeground]).
   static const Duration _foregroundDebounce = Duration(seconds: 2);
   late final AudioInterruptionHandler _interruptions;
-  bool _holdInProgress = false;
+
+  /// A hold, resume or ICE restart re-INVITE is in flight.
+  bool _reInviteInProgress = false;
 
   /// Public base URL of the webhook server (see [SdkConfig.backendUrl]).
   ///
@@ -871,10 +873,10 @@ class VobizClient {
   }
 
   Future<void> _renegotiateHold(String id, bool hold) async {
-    if (_holdInProgress) {
-      throw StateError('A hold or resume is already in progress');
+    if (_reInviteInProgress) {
+      throw StateError('A hold, resume or ICE restart is already in progress');
     }
-    _holdInProgress = true;
+    _reInviteInProgress = true;
     try {
       final offer = await _peer.beginHold(hold);
       try {
@@ -891,7 +893,7 @@ class VobizClient {
             statusCode: e is SipRequestFailed ? e.statusCode : null);
       }
     } finally {
-      _holdInProgress = false;
+      _reInviteInProgress = false;
     }
   }
 
@@ -915,6 +917,12 @@ class VobizClient {
       if (_signalingLost) {
         _signalingLost = false;
         _checkNetworkRecovered();
+        // The socket died with the network, and the call's media went with
+        // it, even when ICE has not noticed yet: Android deletes the ports
+        // WebRTC gathered on a lost network. Move the audio to this one.
+        unawaited(_restartIce('registered again after the connection dropped'));
+      } else if (_mediaLost) {
+        unawaited(_restartIce('registered while the call has no audio'));
       }
     };
 
@@ -1262,8 +1270,9 @@ class VobizClient {
   }
 
   /// The network changed during a call. The signalling socket is left alone
-  /// (replacing it would drop the dialog); this is the hook for moving the
-  /// media to the new interface with an ICE restart (re-INVITE).
+  /// (replacing it would drop the dialog). When the socket died with the
+  /// old network, the reconnect's REGISTER triggers the ICE restart
+  /// ([_restartIce]); a socket that survived keeps its media path too.
   void _onNetworkHandover(NetworkStatus from, NetworkStatus to) {
     _logger.warn('Network changed during a call: $from -> $to');
   }
@@ -1409,6 +1418,52 @@ class VobizClient {
     _networkLossTimer = null;
   }
 
+  /// Moves the call's audio to the network the phone has now: an ICE
+  /// restart (new ICE credentials, candidates gathered on this network)
+  /// offered in a re-INVITE on the current connection. The registrar passes
+  /// the re-INVITE on with this connection in its Contact, so the far end's
+  /// later requests (its BYE) reach the phone here too. The audio is back
+  /// when ICE connects again ([PeerService.onIceConnectionState]); a restart
+  /// that fails leaves the network-loss timer to end the call.
+  Future<void> _restartIce(String why) async {
+    final id = _callId;
+    if (id == null ||
+        (_callState != CallStateStatus.active &&
+            _callState != CallStateStatus.held)) {
+      return;
+    }
+    if (_reInviteInProgress) {
+      _logger.warn('ICE restart for $id skipped: a re-INVITE is in flight');
+      return;
+    }
+    _reInviteInProgress = true;
+    if (_networkLossTimer != null) {
+      // Signalling is back. Gathering, the re-INVITE and the ICE checks take
+      // a few seconds: the audio gets a full grace period from now.
+      _clearNetworkLossTimer();
+      _startNetworkLossTimer(id);
+    }
+    _logger.info('Restarting ICE for call $id: $why');
+    try {
+      final offer = await _peer.beginIceRestart(cancelled: () => _callId != id);
+      if (_callId != id) return;
+      try {
+        final answer = await _sip.reInvite(offer);
+        if (_callId != id) return;
+        await _peer.completeIceRestart(answer);
+        _logger.info('ICE restart for call $id answered; waiting for ICE');
+      } catch (e) {
+        if (_callId != id) return; // the call ended meanwhile
+        _logger.warn('ICE restart for call $id refused: $e');
+        await _peer.abortIceRestart();
+      }
+    } catch (e) {
+      _logger.warn('ICE restart for call $id failed: $e');
+    } finally {
+      if (_callId == id) _reInviteInProgress = false;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Private — WebRTC helpers
   // ---------------------------------------------------------------------------
@@ -1508,7 +1563,7 @@ class VobizClient {
     _callHeaders = const <String, String>{};
     _callState = CallStateStatus.idle;
     _interruptions.reset();
-    _holdInProgress = false;
+    _reInviteInProgress = false;
     await _peer.disposeCall(callId);
   }
 

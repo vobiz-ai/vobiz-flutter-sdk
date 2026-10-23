@@ -102,5 +102,51 @@ void main() {
       expect(h.client.callState, CallStateStatus.active);
       await h.dispose();
     });
+
+    test('re-registering after a socket drop restarts ICE in a re-INVITE, and the call survives', () async {
+      final h = await answeredCall(grace: const Duration(milliseconds: 200));
+      final id = h.client.currentCallId!;
+      h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateDisconnected);
+      h.sip.onSocketError!('SIP socket closed unexpectedly');
+      h.sip.disconnect(keepCall: true);
+      h.sip.register('play1', 'secret');
+      h.registered();
+      await h.settle();
+      expect(h.peer.iceRestarts, <String>['begin']);
+      final reInvite = h.sent.lastWhere((m) => m.startsWith('INVITE '));
+      expect(reInvite, contains('Call-ID: in-1'));
+      expect(reInvite, contains('a=ice-ufrag:new'));
+
+      h.respondToReInvite(200, 'OK', body: 'v=0\r\nanswer');
+      await h.settle();
+      expect(h.peer.iceRestarts, <String>['begin', 'complete']);
+      expect(h.sentRequest('ACK'), isTrue, reason: 'sent: ${h.firstLines}');
+
+      h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateConnected);
+      await h.settle();
+      expect(h.events.last.reason, 'reconnected');
+      await h.settle(300);
+      expect(h.client.callState, CallStateStatus.active);
+      await h.dispose();
+    });
+
+    test('a refused ICE restart is rolled back, and the call ends as network_lost', () async {
+      final h = await answeredCall(grace: const Duration(milliseconds: 100));
+      final id = h.client.currentCallId!;
+      h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateDisconnected);
+      h.sip.onSocketError!('SIP socket closed unexpectedly');
+      h.sip.disconnect(keepCall: true);
+      h.sip.register('play1', 'secret');
+      h.registered();
+      await h.settle();
+      h.respondToReInvite(488, 'Not Acceptable Here');
+      await h.settle();
+      expect(h.peer.iceRestarts, <String>['begin', 'abort']);
+      expect(h.client.callState, CallStateStatus.active);
+      await h.settle(200);
+      expect(h.client.callState, CallStateStatus.idle);
+      expect(h.lastEnded.reason, 'network_lost');
+      await h.dispose();
+    });
   });
 }
