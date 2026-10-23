@@ -173,6 +173,8 @@ the real caller to the app in a SIP header as well.
 | `GET /lost.wav` | Vobiz | The connection-lost beep: 0.25 s of 1 kHz in 2.5 s, played looped |
 | `POST /call/alive` | the app | During a call, every second: this phone still has its network (device token, `call_uuid`) |
 | `POST /call/ended` | the app | The call ended in the app: stop watching it (device token, `call_uuid`) |
+| `POST /dtmf-test` | Vobiz | DTMF test: an answer URL that asks for four digits (`<Gather>`) |
+| `POST /dtmf-test-digits` | Vobiz | DTMF test: logs the digits Vobiz received and reads them back |
 | `POST /push/register` | the app | Pair (bridge key) or update (device token) this phone |
 | `POST /push/unregister`, `/push/test` | the app | Forget / test-push this phone (device token) |
 | `POST /push/registered` | the app | The app's SIP registration succeeded: end the wait and dial now (call key or device token) |
@@ -199,6 +201,22 @@ So after `LOST_HANGUP_SECONDS` without a report the bridge ends the call itself.
 The first report of a call is checked against Vobiz's live call: the bridge acts only
 on calls of the phone's own endpoint. The app sends reports only while "Receive calls"
 is on, since it needs this bridge and the phone's device token.
+
+## DTMF test
+
+The SDK sends keypad presses as RFC 4733 telephone-events, which a phone on the other
+end does not hear as tones. To check that they reach Vobiz, call the app through the
+Vobiz API with this bridge as the answer URL, answer, and press four digits:
+
+```bash
+curl -X POST "https://api.vobiz.ai/api/v1/Account/$VOBIZ_AUTH_ID/Call/" \
+  -H "X-Auth-ID: $VOBIZ_AUTH_ID" -H "X-Auth-Token: $VOBIZ_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"from": "<your Vobiz number, no +>", "to": "sip:<endpoint>@registrar.vobiz.ai",
+       "answer_url": "'"$PUBLIC_URL"'/dtmf-test", "answer_method": "POST"}'
+```
+
+The bridge logs `Vobiz received "1234"` and reads the digits back to the caller.
 
 ## App ↔ bridge protocol
 

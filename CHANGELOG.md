@@ -54,6 +54,14 @@ call was used. #58 lists what still needs a device.
   now means a dead socket: it is closed and the client reconnects at once, keeping a
   call's dialog, instead of failing the registration and giving up. The foreground
   refresh waits 5 s, not 32 s. Refusals still fail the registration (#18).
+- A call keeps its audio through a network drop. Before, the SIP connection came back
+  but the media never did (Android deletes the ICE candidates of a lost network), and
+  the call ended 12 s later. Now the client restarts ICE once it has registered again
+  and offers the new candidates in an in-dialog re-INVITE on the new connection; the
+  12 s grace period starts again with the restart. Verified live on Android against
+  Vobiz, for calls placed and received: audio back about 1.4 s after the network
+  returns, and through a Wi-Fi to mobile data switch and back. See API_REFERENCE.md,
+  "When the network drops during a call".
 
 ### Fixed
 
@@ -107,11 +115,23 @@ call was used. #58 lists what still needs a device.
 - Transfer picks `aleg`/`bleg` by call direction and offers `both` (#48).
 - Connect errors show on the Identity tab (#57); the app root no longer rebuilds every
   second during a call (#55); no duplicate connect after Accept (#35).
+- Connection watch: during a call the app reports "alive" to the bridge every second
+  (`POST /call/alive`). When the reports stop for 3 s the bridge has Vobiz play a short
+  beep to the other party every 2.5 s, and stops it when the app is back. After 15 s it
+  ends the call through the Vobiz API: an offline phone's BYE cannot reach Vobiz, which
+  otherwise keeps the call up and billed for about 5 minutes. `LOST_BEEP_SECONDS`,
+  `LOST_HANGUP_SECONDS`. Calls through the bridge are reported by their PushRef.
+- The example shows "Reconnecting..." while the SDK recovers a dropped call (it used to
+  log a second "Call answered!"), and leaves the call screen when a call ends while
+  the SDK is reconnecting (it used to stay on IN CALL).
+- Push bridge: `POST /dtmf-test`, an answer URL that asks for four digits and reads
+  back what Vobiz received, to check that keypad presses reach Vobiz.
 
 ### Not done here
 
-- iOS PushKit/CallKit (needs Xcode), Telecom/ConnectionService integration, and ICE
-  restart on a network handover (#10, #11, #17, #18).
+- iOS PushKit/CallKit (needs Xcode) and Telecom/ConnectionService integration (#10,
+  #11, #17, #18). ICE restart is done for a connection that drops; a handover that
+  leaves the old connection up does not move the call until that network goes away.
 - Platform work: Opus instead of PCMU, Vobiz-hosted TURN on 443, JWT SIP auth (#20, #29).
 - #36 needs the app's Trace; #58 is the device test plan.
 

@@ -151,6 +151,30 @@ The refresh reports a `ConnectionEvent` with message `Reregistered on foreground
 logs `reregistered on foreground`. Turn it off with
 `SdkConfig(reregisterOnForeground: false)`.
 
+### When the network drops during a call
+
+A connected (or held) call survives a short loss of network, audio included:
+
+- When the SIP connection or the call's media drops, the call gets a `CallEvent` with
+  `reason: 'reconnecting'` (its state does not change) and up to `networkLossGrace`
+  (a `VobizClient` constructor argument, 12 s) to come back. A call still being set up
+  ends at once with `network_lost`.
+- Once the client has registered again on a new connection, it restarts ICE: new ICE
+  credentials and candidates gathered on the network the device has now, offered to
+  Vobiz in an in-dialog re-INVITE on that connection. Vobiz then sends the call's later
+  requests (the far end's BYE, say) to the new connection. The grace period starts
+  again with the restart, so gathering, the re-INVITE and the ICE checks get the full
+  12 s.
+- When ICE connects the call gets `reason: 'reconnected'`. If it is not back in time
+  the call ends with reason `network_lost` and an `ErrorEvent` `network_lost`.
+- Measured on Android against Vobiz: the audio is back about 1.4 s after the network
+  returns, and a switch between Wi-Fi and mobile data leaves a gap of about 2 s.
+
+A device that stays offline cannot tell Vobiz that it gave up: its BYE never leaves
+the phone, and Vobiz keeps the other party connected, and billed, until its media
+servers time the call out (300 s in our tests). The example's push bridge shows one way
+to end such calls from a server (example/push_bridge/README.md, "Connection watch").
+
 ## Errors
 
 | Type | Code | Thrown when |
