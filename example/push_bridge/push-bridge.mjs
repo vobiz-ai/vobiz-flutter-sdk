@@ -36,6 +36,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const USERNAME_RE = /^[A-Za-z0-9_.\-+]{1,120}$/;
+const CALL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * Builds a bridge without starting it. `options.env` replaces process.env,
@@ -62,6 +63,12 @@ export function createBridge(options = {}) {
     // before the Dial starts without it. 3 to 9 seconds: longer delays every
     // other target (browser, PSTN) by as much.
     pushWaitSeconds: clampInt(env.PUSH_WAIT_SECONDS, 5, 3, 9),
+    // Connection watch (see onCallAlive): after this long without word from
+    // the app during a call, the other party hears the connection-lost beep.
+    lostBeepSeconds: clampInt(env.LOST_BEEP_SECONDS, 3, 2, 10),
+    // ...and after this long the call is ended: the SDK gives up at 12 s, but
+    // its hangup cannot leave an offline phone. 0 never ends it.
+    lostHangupSeconds: env.LOST_HANGUP_SECONDS === '0' ? 0 : clampInt(env.LOST_HANGUP_SECONDS, 15, 5, 300),
     callerIdMode: (env.CALLER_ID_MODE || 'number').trim().toLowerCase(),
     headerStyle: (env.SIP_HEADER_STYLE || 'suffix').trim().toLowerCase(),
     alwaysRing: csv(env.ALWAYS_RING),
@@ -112,6 +119,8 @@ export function createBridge(options = {}) {
   const waitRingback = makeToneWav(config.pushWaitSeconds, ringbackBursts(config.pushWaitSeconds));
   // Indian busy tone: 400 Hz, 0.75 s on, 0.75 s off.
   const busyTone = makeToneWav(3, [[0, 0.75], [1.5, 2.25]]);
+  // Connection-lost beep, looped: a short 1 kHz beep every 2.5 s.
+  const lostBeep = makeToneWav(2.5, [[0, 0.25]], [1000]);
 
   // ── HTTP server ──────────────────────────────────────────────────────────────
 
@@ -120,6 +129,7 @@ export function createBridge(options = {}) {
     'GET /health': (req, res) => sendJson(res, 200, { ok: true, service: 'vobiz-push-bridge', instance: INSTANCE }),
     'GET /wait.wav': (req, res) => sendWav(res, waitRingback),
     'GET /busy.wav': (req, res) => sendWav(res, busyTone),
+    'GET /lost.wav': (req, res) => sendWav(res, lostBeep),
     // Vobiz webhooks
     'POST /answer': vobiz(onAnswer),
     'GET /answer': vobiz(onAnswer),
@@ -140,6 +150,9 @@ export function createBridge(options = {}) {
     // Where a call is transferred to when the user taps Decline
     'POST /declined/*': vobiz(onDeclinedXml),
     'POST /push/decline': onDecline,
+    // During a call: the app reports it still has its network
+    'POST /call/alive': onCallAlive,
+    'POST /call/ended': onCallEnded,
   };
 
   const server = http.createServer(async (req, res) => {
@@ -163,6 +176,7 @@ export function createBridge(options = {}) {
   });
 
   let sweeper = null;
+  let watchdog = null;
 
   /** Starts listening. `port` 0 picks a free port (tests). Resolves with the port. */
   function start({ port = config.port, checks = true } = {}) {
@@ -171,6 +185,8 @@ export function createBridge(options = {}) {
       for (const [id, call] of calls) if (call.createdAt < cutoff) calls.delete(id);
     }, 60 * 1000);
     sweeper.unref();
+    watchdog = setInterval(checkWatched, deps.watchTickMs ?? 500);
+    watchdog.unref();
     return new Promise((resolve) => {
       server.listen(port, async () => {
         const actual = server.address().port;
@@ -186,6 +202,7 @@ export function createBridge(options = {}) {
 
   function close() {
     if (sweeper) clearInterval(sweeper);
+    if (watchdog) clearInterval(watchdog);
     return new Promise((resolve) => server.close(() => resolve()));
   }
 
@@ -1112,6 +1129,143 @@ export function createBridge(options = {}) {
     console.log('');
   }
 
+  // ── Connection watch: the other party hears when the app's network drops ─────
+  //
+  // A phone that loses its network cannot tell anyone, so during a call the app
+  // reports "alive" every second. When the reports stop for LOST_BEEP_SECONDS,
+  // the bridge, still online, has Vobiz play a short beep to the other party
+  // every 2.5 s, and stops it when the app is back. The SDK gives a dropped call
+  // 12 s to come back; after LOST_HANGUP_SECONDS without a report it has given
+  // up, but its BYE could not leave the offline phone, and Vobiz would keep the
+  // call up (and billed) for about five minutes. So the bridge ends it.
+
+  /** Calls being watched, by the CallUUID the app reports. Memory only. */
+  const watched = new Map();
+  /** Ownership checks in flight, so a call's first reports look it up once. */
+  const watchLookups = new Map();
+  const lostBeepMs = deps.lostBeepMs ?? config.lostBeepSeconds * 1000;
+  const lostHangupMs = deps.lostHangupMs ?? config.lostHangupSeconds * 1000;
+
+  async function onCallAlive(req, res) {
+    const device = deviceFromRequest(req);
+    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
+    const body = await readJson(req);
+    const uuid = String(body.call_uuid || '').toLowerCase();
+    if (!CALL_UUID_RE.test(uuid)) return sendJson(res, 400, { error: 'call_uuid must be a Vobiz CallUUID' });
+    let watch = watched.get(uuid);
+    if (!watch) {
+      const key = `${uuid} ${device.username}`;
+      if (!watchLookups.has(key)) {
+        watchLookups.set(key, otherPartyLeg(uuid, device.username).finally(() => watchLookups.delete(key)));
+      }
+      const legs = await watchLookups.get(key);
+      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this phone\'s endpoint' });
+      watch = watched.get(uuid);
+      if (!watch) {
+        watch = { uuid, username: device.username, legs, lastSeen: Date.now(), beeping: false, beepFailed: false, busy: false };
+        watched.set(uuid, watch);
+        log('..', `Call ${short(uuid)}: watching ${device.username}'s connection (beeps go to the ${legs === 'aleg' ? 'caller' : 'callee'})`);
+      }
+    }
+    if (watch.username !== device.username) return sendJson(res, 403, { error: 'Not a call of this phone\'s endpoint' });
+    watch.lastSeen = Date.now();
+    watch.beepFailed = false;
+    if (watch.beeping && !watch.busy) await stopBeep(watch, 'the app is back');
+    sendJson(res, 200, { ok: true });
+  }
+
+  /** The call ended in the app: stop watching it. */
+  async function onCallEnded(req, res) {
+    const device = deviceFromRequest(req);
+    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
+    const body = await readJson(req);
+    const watch = watched.get(String(body.call_uuid || '').toLowerCase());
+    if (watch && watch.username === device.username) forget(watch, 'ended in the app');
+    sendJson(res, 200, { ok: true });
+  }
+
+  /**
+   * Which leg of call `uuid` is the app's other party, as Vobiz's Play API
+   * names it ('aleg' or 'bleg'), or null when the call is not live or is not
+   * this endpoint's: a phone can only make the bridge act on its own calls.
+   */
+  async function otherPartyLeg(uuid, username) {
+    // An inbound call this bridge rang: its UUID is the caller's own leg.
+    const own = calls.get(uuid);
+    if (own && own.targets.includes(username)) return 'aleg';
+    let live;
+    try {
+      live = await vobizApi('GET', `/Call/${encodeURIComponent(uuid)}/?status=live`);
+    } catch {
+      return null;
+    }
+    // The app's own leg (it placed or took the call): the other party is the
+    // leg bridged to it.
+    return [live?.from, live?.to].some((end) => endpointUsername(end) === username) ? 'bleg' : null;
+  }
+
+  function checkWatched() {
+    const now = Date.now();
+    for (const watch of watched.values()) {
+      if (watch.busy) continue;
+      const silent = now - watch.lastSeen;
+      if (lostHangupMs && silent >= lostHangupMs) void endLostCall(watch, silent);
+      else if (silent >= lostBeepMs && !watch.beeping && !watch.beepFailed) void startBeep(watch, silent);
+    }
+  }
+
+  async function startBeep(watch, silent) {
+    watch.busy = true;
+    try {
+      await vobizApi('POST', `/Call/${encodeURIComponent(watch.uuid)}/Play/`, {
+        urls: `${publicBase()}/lost.wav`,
+        legs: watch.legs,
+        loop: true,
+        mix: true,
+      });
+      watch.beeping = true;
+      log('..', `Call ${short(watch.uuid)}: no word from the app for ${secs(silent)} s; the other party hears the connection-lost beep`);
+    } catch (error) {
+      if (isGone(error)) return forget(watch, 'the call is over');
+      // Not retried until the app reports again.
+      watch.beepFailed = true;
+      log('!!', `Call ${short(watch.uuid)}: could not play the beep: ${error.message}`);
+    } finally {
+      watch.busy = false;
+    }
+  }
+
+  async function stopBeep(watch, why) {
+    watch.busy = true;
+    watch.beeping = false;
+    try {
+      await vobizApi('DELETE', `/Call/${encodeURIComponent(watch.uuid)}/Play/`);
+      log('ok', `Call ${short(watch.uuid)}: ${why}; beep stopped`);
+    } catch (error) {
+      if (isGone(error)) forget(watch, 'the call is over');
+      else log('!!', `Call ${short(watch.uuid)}: could not stop the beep: ${error.message}`);
+    } finally {
+      watch.busy = false;
+    }
+  }
+
+  /** The app stayed away past its reconnect window: end the call on Vobiz. */
+  async function endLostCall(watch, silent) {
+    watched.delete(watch.uuid);
+    watch.busy = true;
+    try {
+      await vobizApi('DELETE', `/Call/${encodeURIComponent(watch.uuid)}/`);
+      log('ok', `Call ${short(watch.uuid)}: no word from the app for ${secs(silent)} s, past its reconnect window; call ended so it is not billed on`);
+    } catch (error) {
+      if (!isGone(error)) log('!!', `Call ${short(watch.uuid)}: could not end the call: ${error.message}`);
+    }
+  }
+
+  function forget(watch, why) {
+    if (watched.get(watch.uuid) === watch) watched.delete(watch.uuid);
+    log('..', `Call ${short(watch.uuid)}: ${why}; no longer watched`);
+  }
+
   // ── Helpers ──────────────────────────────────────────────────────────────────
 
   /** The registered phone whose device token is in `Authorization: Bearer`, or null. */
@@ -1243,6 +1397,15 @@ function short(id) {
   return String(id).slice(0, 8);
 }
 
+/** A Vobiz API error for a call that no longer exists. */
+function isGone(error) {
+  return / → 404 /.test(String(error?.message || ''));
+}
+
+function secs(ms) {
+  return (ms / 1000).toFixed(1);
+}
+
 function csv(value) {
   return String(value || '').split(',').map((s) => endpointUsername(s)).filter((s) => USERNAME_RE.test(s));
 }
@@ -1342,9 +1505,10 @@ function sendWav(res, wav) {
 /**
  * `seconds` of an Indian call-progress tone (400 Hz modulated at 25 Hz),
  * sounding during `bursts` ([start, end] in seconds), as 8 kHz 16-bit mono
- * WAV. Ringback: see ringbackBursts(). Busy: 0.75 s on/off.
+ * WAV. Ringback: see ringbackBursts(). Busy: 0.75 s on/off. `freqs`
+ * replaces the tone's frequencies (the connection-lost beep is 1 kHz).
  */
-function makeToneWav(seconds, bursts) {
+function makeToneWav(seconds, bursts, freqs = [375, 425]) {
   const rate = 8000;
   const samples = rate * seconds;
   const pcm = Buffer.alloc(samples * 2);
@@ -1355,7 +1519,7 @@ function makeToneWav(seconds, bursts) {
     if (burst) {
       const edge = Math.min(t - burst[0], burst[1] - t);
       const fade = Math.min(1, edge / 0.005);
-      value = 0.3 * fade * (Math.sin(2 * Math.PI * 375 * t) + Math.sin(2 * Math.PI * 425 * t)) / 2;
+      value = 0.3 * fade * freqs.reduce((sum, f) => sum + Math.sin(2 * Math.PI * f * t), 0) / freqs.length;
     }
     pcm.writeInt16LE(Math.round(value * 32767), i * 2);
   }

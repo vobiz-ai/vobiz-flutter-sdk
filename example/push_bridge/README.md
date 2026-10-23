@@ -153,6 +153,8 @@ Disconnecting in the app unregisters the phone; closing the app does not.
 | `ALWAYS_RING` | — | Endpoints to ring even if no app registered, comma separated (not pushed) |
 | `BRIDGE_KEY` | generated | The pairing key; saved in `bridge-state.json` |
 | `ALLOW_UNSIGNED_WEBHOOKS` | `false` | `true` accepts webhooks without a Vobiz signature. Local tests only |
+| `LOST_BEEP_SECONDS` | `3` | Connection watch: seconds without an "alive" report from the app before the other party hears the connection-lost beep. Clamped to 2–10 |
+| `LOST_HANGUP_SECONDS` | `15` | Connection watch: seconds without a report before the bridge ends the call (the SDK gives up at 12 s, but an offline phone's hangup cannot reach Vobiz). Clamped to 5–300; `0` never ends it |
 
 Whatever the caller ID mode, the push shows the real caller, and the bridge passes
 the real caller to the app in a SIP header as well.
@@ -168,6 +170,9 @@ the real caller to the app in a SIP header as well.
 | `POST /declined/<call>.<tag>` | Vobiz | The caller's leg, transferred here on Decline: busy tone, then busy |
 | `POST /hangup` | Vobiz | The caller's leg ended: stop the phones ringing |
 | `GET /wait.wav`, `/busy.wav` | Vobiz | `PUSH_WAIT_SECONDS` of ringback / three seconds of busy tone |
+| `GET /lost.wav` | Vobiz | The connection-lost beep: 0.25 s of 1 kHz in 2.5 s, played looped |
+| `POST /call/alive` | the app | During a call, every second: this phone still has its network (device token, `call_uuid`) |
+| `POST /call/ended` | the app | The call ended in the app: stop watching it (device token, `call_uuid`) |
 | `POST /push/register` | the app | Pair (bridge key) or update (device token) this phone |
 | `POST /push/unregister`, `/push/test` | the app | Forget / test-push this phone (device token) |
 | `POST /push/registered` | the app | The app's SIP registration succeeded: end the wait and dial now (call key or device token) |
@@ -177,6 +182,23 @@ the real caller to the app in a SIP header as well.
 Every Vobiz route needs a valid signature. `<call>.<tag>` is the Vobiz CallUUID and
 an HMAC the bridge made, so the signed URL (Vobiz signs the URL, not the body or
 query string) names the call.
+
+## Connection watch
+
+A phone that loses its network cannot tell anyone, and the other party just hears
+silence. So during a call the app reports `POST /call/alive` every second. When the
+reports stop for `LOST_BEEP_SECONDS`, the bridge (still online) has Vobiz play
+`/lost.wav` to the other party, looped, so they hear a beep every 2.5 s. The beep
+stops when the app reports again (the SDK restarts ICE once the network is back).
+
+The SDK ends a call that is not back within 12 s, but the BYE cannot leave an offline
+phone, and Vobiz then keeps the call up, and billed, for about five minutes (tested:
+its WebRTC server ends it 300 s after the last audio, recorded as a normal hangup).
+So after `LOST_HANGUP_SECONDS` without a report the bridge ends the call itself.
+
+The first report of a call is checked against Vobiz's live call: the bridge acts only
+on calls of the phone's own endpoint. The app sends reports only while "Receive calls"
+is on, since it needs this bridge and the phone's device token.
 
 ## App ↔ bridge protocol
 

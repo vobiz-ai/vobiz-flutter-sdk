@@ -214,6 +214,14 @@ class PlaygroundController extends ChangeNotifier {
   Timer? _callTimer;
   Timer? _statsTimer;
 
+  // Connection watch: during a call the push bridge gets an "alive" report
+  // every second, so it can beep to the other party when this phone's
+  // network drops (see _startAliveReports).
+  Timer? _aliveTimer;
+  PushBridgeApi? _aliveApi;
+  String? _aliveCallUuid;
+  bool _aliveInFlight = false;
+
   /// Ticks once a second during a call, for the call clock and the latency
   /// chart. Only the widgets showing those listen; the timers no longer
   /// notify the whole controller (which rebuilt every screen).
@@ -369,6 +377,7 @@ class PlaygroundController extends ChangeNotifier {
       s.cancel();
     }
     _stopCallTimers();
+    _stopAliveReports(ended: false);
     _loginTimeout?.cancel();
     _acceptedTimer?.cancel();
     for (final t in _pendingMissed.values) {
@@ -1597,6 +1606,19 @@ class PlaygroundController extends ChangeNotifier {
         _setStatus(PhoneStatus.ringing, 'Ringing...');
         break;
       case CallStateStatus.active:
+        // The SDK reports a dropped connection, and its recovery, as events
+        // of the connected call. They are not new answers.
+        if (e.reason == 'reconnecting') {
+          log('📶 Connection lost: reconnecting (the call ends if it is not back in 12 s)',
+              LogType.warning);
+          _setStatus(PhoneStatus.inCall, 'Reconnecting...');
+          break;
+        }
+        if (e.reason == 'reconnected') {
+          log('📶 Reconnected: the audio is back', LogType.success);
+          _setStatus(PhoneStatus.inCall, 'In Call');
+          break;
+        }
         showIncoming = false;
         log('✅ Call answered! (${e.callUuid ?? ''})', LogType.success);
         _recordHeaders('answer', e);
@@ -1612,6 +1634,7 @@ class PlaygroundController extends ChangeNotifier {
         // the plugin's service then stops, and no longer anything else.
         _startCallService(outbound: e.direction != CallDirection.inbound);
         if (_callScreenId != null && _callScreenAccepted) _endCallScreen();
+        _startAliveReports(e.callUuid ?? client.lastCallUuid);
         break;
       case CallStateStatus.failed:
         _failedCallId = e.callId;
@@ -1621,6 +1644,7 @@ class PlaygroundController extends ChangeNotifier {
         _recordRequested = false;
         break;
       case CallStateStatus.ended:
+        _stopAliveReports();
         if (_failedCallId != e.callId) {
           log('📴 Call ended: ${e.reason ?? e.message ?? 'Terminated'}', LogType.warning);
           _recordHeaders('hangup', e);
@@ -1661,6 +1685,12 @@ class PlaygroundController extends ChangeNotifier {
           _endCallScreen();
         }
         _resetCallState();
+        // Ended because the network went: the SDK reconnects in the
+        // background. Show that instead of leaving the dead call on screen;
+        // registering again (_onConnection) then shows Registered.
+        if (e.reason == 'network_lost' && !client.isConnected) {
+          _setStatus(PhoneStatus.connecting, 'Reconnecting...');
+        }
         break;
       case CallStateStatus.idle:
       case CallStateStatus.outgoing:
@@ -1765,6 +1795,7 @@ class PlaygroundController extends ChangeNotifier {
 
   void _resetCallState({bool registered = true}) {
     _stopCallTimers();
+    _stopAliveReports(ended: false);
     callDuration = Duration.zero;
     activeHeaders = null;
     showIncoming = false;
@@ -1778,6 +1809,50 @@ class PlaygroundController extends ChangeNotifier {
       _setStatus(PhoneStatus.online, 'Registered');
     } else {
       notifyListeners();
+    }
+  }
+
+  /// Reports "alive" to the push bridge every second while a call is up. A
+  /// phone that loses its network cannot tell anyone; the bridge notices the
+  /// reports stop and has Vobiz beep to the other party, then ends the call
+  /// if the SDK's 12 s reconnect window passes. Needs the push server.
+  void _startAliveReports(String? callUuid) {
+    _stopAliveReports(ended: false);
+    final config = bridgeConfig;
+    final token = _bridgeDeviceToken;
+    if (!receiveCalls || config == null || token == null || callUuid == null) return;
+    _aliveCallUuid = callUuid;
+    _aliveApi = PushBridgeApi(config, deviceToken: token);
+    _aliveTimer = Timer.periodic(const Duration(seconds: 1), (_) => _sendAlive());
+    _sendAlive();
+  }
+
+  Future<void> _sendAlive() async {
+    final api = _aliveApi;
+    final uuid = _aliveCallUuid;
+    if (api == null || uuid == null || _aliveInFlight) return;
+    _aliveInFlight = true;
+    try {
+      await api.callAlive(uuid);
+    } catch (_) {
+      // Offline, or the bridge is unreachable: the missing reports are the signal.
+    } finally {
+      _aliveInFlight = false;
+    }
+  }
+
+  void _stopAliveReports({bool ended = true}) {
+    _aliveTimer?.cancel();
+    _aliveTimer = null;
+    final api = _aliveApi;
+    final uuid = _aliveCallUuid;
+    _aliveApi = null;
+    _aliveCallUuid = null;
+    if (api == null) return;
+    if (ended && uuid != null) {
+      unawaited(api.callEnded(uuid).catchError((Object _) {}).whenComplete(api.close));
+    } else {
+      api.close();
     }
   }
 

@@ -86,6 +86,9 @@ class PushBridgeApi {
 
   static const Duration _timeout = Duration(seconds: 10);
 
+  /// Shorter for the once-a-second call reports: a late one is useless.
+  static const Duration _aliveTimeout = Duration(seconds: 2);
+
   /// Rings this endpoint for inbound calls, and wakes this device with
   /// [token] when it is closed (no token: rings only while the app is open).
   ///
@@ -124,6 +127,17 @@ class PushBridgeApi {
 
   /// Forgets this phone on the bridge (device token).
   Future<void> unregister() => _post('/push/unregister', const <String, Object?>{});
+
+  /// During a call, every second: this phone still has its network. When the
+  /// reports stop, the bridge (still online) has Vobiz beep to the other
+  /// party, and ends the call once the SDK's 12 s reconnect window is over:
+  /// an offline phone's own hangup cannot reach Vobiz.
+  Future<void> callAlive(String callUuid) =>
+      _post('/call/alive', <String, Object?>{'call_uuid': callUuid}, timeout: _aliveTimeout);
+
+  /// The call ended in the app: the bridge stops watching it.
+  Future<void> callEnded(String callUuid) =>
+      _post('/call/ended', <String, Object?>{'call_uuid': callUuid}, timeout: _aliveTimeout);
 
   /// A pretend incoming call to this phone (device token), pushed after
   /// [delaySeconds] so there is time to lock the phone or swipe the app away.
@@ -169,7 +183,8 @@ class PushBridgeApi {
     }
   }
 
-  Future<Map<String, dynamic>> _post(String path, Map<String, Object?> body, {bool pair = false}) async {
+  Future<Map<String, dynamic>> _post(String path, Map<String, Object?> body,
+      {bool pair = false, Duration timeout = _timeout}) async {
     final device = deviceToken;
     final http.Response response;
     try {
@@ -183,7 +198,7 @@ class PushBridgeApi {
             },
             body: jsonEncode(body),
           )
-          .timeout(_timeout);
+          .timeout(timeout);
     } catch (e) {
       throw PushBridgeException('Could not reach the push server at ${config.baseUrl} ($e)');
     }
