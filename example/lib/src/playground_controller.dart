@@ -371,8 +371,18 @@ class PlaygroundController extends ChangeNotifier {
     await _resumeAcceptedCall();
   }
 
+  bool _disposed = false;
+
+  // Async work can finish after the controller is disposed (a push-server reply
+  // that fails late, say) and log: that must not notify listeners that are gone.
+  @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
   @override
   void dispose() {
+    _disposed = true;
     for (final s in _subs) {
       s.cancel();
     }
