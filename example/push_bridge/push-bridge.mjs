@@ -153,6 +153,9 @@ export function createBridge(options = {}) {
     // During a call: the app reports it still has its network
     'POST /call/alive': onCallAlive,
     'POST /call/ended': onCallEnded,
+    // DTMF test: the answer URL for a call placed through the Vobiz API
+    'POST /dtmf-test': vobiz(onDtmfTest),
+    'POST /dtmf-test-digits': vobiz(onDtmfTestDigits),
   };
 
   const server = http.createServer(async (req, res) => {
@@ -1264,6 +1267,26 @@ export function createBridge(options = {}) {
   function forget(watch, why) {
     if (watched.get(watch.uuid) === watch) watched.delete(watch.uuid);
     log('..', `Call ${short(watch.uuid)}: ${why}; no longer watched`);
+  }
+
+  // ── DTMF test ────────────────────────────────────────────────────────────────
+  //
+  // Checks that keypad presses in the app reach Vobiz. Place a call to the
+  // app's endpoint through the Vobiz API with answer_url = PUBLIC_URL/dtmf-test:
+  // the answering app is asked for four digits, and Vobiz posts what it
+  // received to /dtmf-test-digits, which logs it and reads it back.
+
+  async function onDtmfTest(req, res, url, params) {
+    if (isHangupEvent(params)) return sendText(res, 200, 'OK');
+    log('..', `DTMF test call ${short(params.CallUUID || '')}: asking for four digits`);
+    sendXml(res, `<Gather action="${esc(publicBase())}/dtmf-test-digits" method="POST" inputType="dtmf" numDigits="4" executionTimeout="30" digitEndTimeout="8">`
+      + '<Speak>Please press four digits.</Speak></Gather><Speak>No digits were received.</Speak><Hangup/>');
+  }
+
+  async function onDtmfTestDigits(req, res, url, params) {
+    const digits = String(params.Digits || '').replace(/[^0-9*#A-D]/g, '');
+    log('ok', `DTMF test call ${short(params.CallUUID || '')}: Vobiz received "${digits}"`);
+    sendXml(res, `<Speak>You pressed ${digits ? digits.split('').join(' ') : 'nothing'}.</Speak><Hangup/>`);
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
