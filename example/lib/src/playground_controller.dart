@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
@@ -17,8 +18,9 @@ import 'push/push_bridge_api.dart';
 import 'push/push_call.dart';
 import 'push/push_service.dart';
 
-/// The two ways to sign in, as on the web Playground.
-enum AuthTab { zeroConfig, sipDirect }
+/// The ways to sign in: the web Playground's two, and an access token (JWT)
+/// from a token server, as the Vobiz WebRTC demo does.
+enum AuthTab { zeroConfig, sipDirect, accessToken }
 
 enum PhoneStatus { offline, connecting, online, ringing, inCall, error }
 
@@ -119,7 +121,9 @@ class PlaygroundController extends ChangeNotifier {
     PushService? push,
     CallScreenApi? callScreen,
     CallPlatform? platform,
+    http.Client? httpClient,
   })  : client = client ?? createPlaygroundClient(),
+        _http = httpClient,
         _secure = secureStorage ?? const FlutterSecureStorage(),
         push = push ?? PushService.unavailable('Push is not set up in this build.'),
         callScreen = callScreen ?? const CallScreenApi(),
@@ -127,6 +131,9 @@ class PlaygroundController extends ChangeNotifier {
 
   final VobizClient client;
   final FlutterSecureStorage _secure;
+
+  /// For fetching access tokens; the default client when null (tests pass one).
+  final http.Client? _http;
 
   /// The system incoming-call screen.
   final CallScreenApi callScreen;
@@ -151,6 +158,17 @@ class PlaygroundController extends ChangeNotifier {
   String sipPassword = '';
   bool rememberMe = true;
   String webhookUrl = SdkConfig.defaultWebhookUrl;
+
+  /// Access token sign-in: where to POST for a token (the Vobiz WebRTC demo's
+  /// `/token`, or your own). Empty: the push server's `/token`.
+  String tokenServerUrl = '';
+
+  /// The user id (`sub`) to ask the push server's `/token` for. Empty: its
+  /// JWT_SUB. Your own token server decides `sub` itself.
+  String tokenUser = '';
+  VobizAccessTokenSession? _tokenSession;
+  StreamSubscription<VobizException>? _tokenFailures;
+  VobizBackendAccessTokenProvider? _tokenProvider;
 
   // ── Status ──────────────────────────────────────────────────────────────────
   PhoneStatus status = PhoneStatus.offline;
@@ -333,6 +351,8 @@ class PlaygroundController extends ChangeNotifier {
   static const String _kTheme = 'vobiz_playground_theme';
   static const String _kMode = 'vobiz_playground_mode';
   static const String _kWebhook = 'vobiz_playground_webhook';
+  static const String _kTokenServer = 'vobiz_playground_token_server';
+  static const String _kTokenUser = 'vobiz_playground_token_user';
   static const String _kRemember = 'vobiz_playground_remember';
   static const String _kCallerId = 'vobiz_playground_caller_id';
   static const String _kAuthId = 'vobiz_auth_id';
@@ -388,6 +408,7 @@ class PlaygroundController extends ChangeNotifier {
     }
     _stopCallTimers();
     _stopAliveReports(ended: false);
+    unawaited(_stopTokenSession());
     _loginTimeout?.cancel();
     _acceptedTimer?.cancel();
     for (final t in _pendingMissed.values) {
@@ -427,22 +448,34 @@ class PlaygroundController extends ChangeNotifier {
 
   Future<void> _connect() async {
     final zero = authTab == AuthTab.zeroConfig;
+    final token = authTab == AuthTab.accessToken;
+    final sip = authTab == AuthTab.sipDirect;
     connectError = null;
     missingFields = <String>{
       if (zero && authId.trim().isEmpty) 'authId',
       if (zero && authToken.trim().isEmpty) 'authToken',
-      if (!zero && sipUsername.trim().isEmpty) 'sipUsername',
-      if (!zero && sipPassword.isEmpty) 'sipPassword',
+      if (sip && sipUsername.trim().isEmpty) 'sipUsername',
+      if (sip && sipPassword.isEmpty) 'sipPassword',
+      if (token && tokenServerUrl.trim().isEmpty && bridgeConfig == null) 'tokenServer',
     };
     if (missingFields.isNotEmpty) {
       return _connectFailed(zero
           ? 'Please enter Auth ID and Auth Token'
-          : 'Please enter both SIP username and password');
+          : token
+              ? 'Please enter a token server URL, or set up the push server (its /token mints tokens)'
+              : 'Please enter both SIP username and password');
     }
     final hook = webhookUrl.trim().replaceAll(RegExp(r'/+$'), '');
     if (zero && !hook.startsWith('https://')) {
       return _connectFailed('⚠️ Public Webhook URL is required! Vobiz Cloud cannot reach localhost. '
           'Use the hosted server or an https tunnel.');
+    }
+    if (token && tokenServerUrl.trim().isNotEmpty) {
+      final url = Uri.tryParse(tokenServerUrl.trim());
+      if (url == null || url.host.isEmpty || (url.scheme != 'https' && url.scheme != 'http')) {
+        missingFields = <String>{'tokenServer'};
+        return _connectFailed('The token server must be an http(s) URL, such as https://<your server>/token');
+      }
     }
 
     final session_ = _session;
@@ -470,6 +503,21 @@ class PlaygroundController extends ChangeNotifier {
         sipPassword = session.sipPassword;
         log('Connecting as dynamically generated user: ${session.sipUsername}...',
             LogType.event);
+      } else if (token) {
+        await _startTokenSession();
+        if (session_ != _session) {
+          await _abandonSignIn();
+          return;
+        }
+        final t = client.accessToken;
+        connectedAs = client.sipUsername;
+        if (t != null) {
+          log('Access token for ${t.sipUsername}: valid until ${_clock(t.expiresAt.toLocal())}, '
+              'incoming ${t.canReceiveCalls ? 'allowed' : 'not allowed'}, '
+              'outgoing ${t.canCallOut ? 'allowed' : 'not allowed'}'
+              '${t.appId != null ? ', outbound calls through application ${t.appId}' : ''}',
+              LogType.event);
+        }
       } else {
         connectedAs = sipUsername.trim();
         log('Connecting as ${sipUsername.trim()}...', LogType.event);
@@ -487,7 +535,8 @@ class PlaygroundController extends ChangeNotifier {
       if (session_ != _session) return;
       _loginTimeout?.cancel();
       connectedAs = null;
-      connectError = 'API Setup Error: ${e.message}';
+      await _stopTokenSession();
+      connectError = token ? 'Access token error: ${e.message}' : 'API Setup Error: ${e.message}';
       log(connectError!, LogType.error);
       _setStatus(PhoneStatus.offline, 'Error');
     } catch (e) {
@@ -503,6 +552,63 @@ class PlaygroundController extends ChangeNotifier {
     connectError = message;
     log(message, LogType.error);
   }
+
+  /// Signs in with access tokens that the SDK renews before they expire,
+  /// from the token server, or the push server's /token when none is set.
+  Future<void> _startTokenSession() async {
+    await _stopTokenSession();
+    final server = tokenServerUrl.trim();
+    log('Fetching an access token from ${server.isEmpty ? 'the push server' : server}...',
+        LogType.info);
+    final session = await client.connectWithAccessTokenProvider(_fetchAccessToken);
+    _tokenSession = session;
+    _tokenFailures = session.failures.listen((e) {
+      connectError = 'Access token error: ${e.message}';
+      log(connectError!, LogType.error);
+      notifyListeners();
+    });
+  }
+
+  Future<String> _fetchAccessToken(VobizAccessTokenRequest request) async {
+    final reason = VobizBackendAccessTokenProvider.reasonValue(request);
+    if (request != VobizAccessTokenRequest.signIn) {
+      log('Asking for a new access token ($reason)', LogType.info);
+    }
+    final server = tokenServerUrl.trim();
+    if (server.isNotEmpty) {
+      final provider = _tokenProvider ??=
+          VobizBackendAccessTokenProvider(url: Uri.parse(server), httpClient: _http);
+      return provider(request);
+    }
+    final config = bridgeConfig;
+    if (config == null) {
+      throw const VobizAccessTokenException(
+          'No token server: enter one, or set up the push server');
+    }
+    final api = PushBridgeApi(config, client: _http, deviceToken: _bridgeDeviceToken);
+    try {
+      final user = tokenUser.trim();
+      return await api.accessToken(sub: user.isEmpty ? null : user, reason: reason);
+    } on PushBridgeException catch (e) {
+      throw VobizAccessTokenException('The push server did not give a token: ${e.message}',
+          statusCode: e.statusCode, cause: e);
+    } finally {
+      // A client passed in is the caller's to close.
+      if (_http == null) api.close();
+    }
+  }
+
+  Future<void> _stopTokenSession() async {
+    await _tokenFailures?.cancel();
+    _tokenFailures = null;
+    await _tokenSession?.dispose();
+    _tokenSession = null;
+    _tokenProvider?.close();
+    _tokenProvider = null;
+  }
+
+  static String _clock(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
 
   /// Signed out while the server was still answering: drop what it gave.
   Future<void> _abandonSignIn() async {
@@ -522,6 +628,8 @@ class PlaygroundController extends ChangeNotifier {
     log('Logging out...', LogType.info);
     // Signing out means "stop ringing this phone"; closing the app does not.
     await _unregisterFromBridge(client.sipUsername ?? connectedAs);
+    // Stop renewing the access token before the client lets go of it.
+    await _stopTokenSession();
     await client.disconnect();
     connectedAs = null;
     authToken = '';
@@ -1285,9 +1393,12 @@ class PlaygroundController extends ChangeNotifier {
     await _tellBridgeDeclined(call);
   }
 
-  bool get _hasSavedSignIn => authTab == AuthTab.zeroConfig
-      ? authId.isNotEmpty && authToken.isNotEmpty
-      : sipUsername.isNotEmpty && sipPassword.isNotEmpty;
+  bool get _hasSavedSignIn => switch (authTab) {
+        AuthTab.zeroConfig => authId.isNotEmpty && authToken.isNotEmpty,
+        AuthTab.sipDirect => sipUsername.isNotEmpty && sipPassword.isNotEmpty,
+        // Nothing secret is kept: a token is fetched again at sign-in.
+        AuthTab.accessToken => rememberMe && (tokenServerUrl.isNotEmpty || bridgeConfig != null),
+      };
 
   /// Opened by Accept on the call screen while the app was closed: take it.
   Future<void> _resumeAcceptedCall() async {
@@ -1892,8 +2003,14 @@ class PlaygroundController extends ChangeNotifier {
     if (prefs == null) return;
     final theme = prefs.getString(_kTheme);
     this.theme.value = ThemeMode.values.where((m) => m.name == theme).firstOrNull ?? ThemeMode.system;
-    authTab = prefs.getString(_kMode) == 'sip' ? AuthTab.sipDirect : AuthTab.zeroConfig;
+    authTab = switch (prefs.getString(_kMode)) {
+      'sip' => AuthTab.sipDirect,
+      'token' => AuthTab.accessToken,
+      _ => AuthTab.zeroConfig,
+    };
     webhookUrl = prefs.getString(_kWebhook) ?? SdkConfig.defaultWebhookUrl;
+    tokenServerUrl = prefs.getString(_kTokenServer) ?? '';
+    tokenUser = prefs.getString(_kTokenUser) ?? '';
     rememberMe = prefs.getBool(_kRemember) ?? true;
     receiveCalls = prefs.getBool(_kReceiveCalls) ?? false;
     final cli = prefs.getString(_kCallerId);
@@ -1959,9 +2076,15 @@ class PlaygroundController extends ChangeNotifier {
   /// (Keychain / Keystore). Unticked, anything saved earlier is removed.
   Future<void> _saveCredentials() async {
     final prefs = _prefs;
-    await prefs?.setString(_kMode, authTab == AuthTab.sipDirect ? 'sip' : 'api');
+    await prefs?.setString(_kMode, switch (authTab) {
+      AuthTab.sipDirect => 'sip',
+      AuthTab.accessToken => 'token',
+      AuthTab.zeroConfig => 'api',
+    });
     await prefs?.setBool(_kRemember, rememberMe);
     await prefs?.setString(_kWebhook, webhookUrl.trim());
+    await prefs?.setString(_kTokenServer, tokenServerUrl.trim());
+    await prefs?.setString(_kTokenUser, tokenUser.trim());
     if (callerId.isNotEmpty) await prefs?.setString(_kCallerId, callerId);
     try {
       if (!rememberMe) {
@@ -1973,10 +2096,11 @@ class PlaygroundController extends ChangeNotifier {
       if (authTab == AuthTab.zeroConfig) {
         await _secure.write(key: _kAuthId, value: authId.trim());
         await _secure.write(key: _kAuthToken, value: authToken.trim());
-      } else {
+      } else if (authTab == AuthTab.sipDirect) {
         await _secure.write(key: _kSipUser, value: sipUsername.trim());
         await _secure.write(key: _kSipPass, value: sipPassword);
       }
+      // An access token is never stored: the next sign-in fetches a fresh one.
     } catch (e) {
       log('Could not save credentials on this device: $e', LogType.warning);
     }

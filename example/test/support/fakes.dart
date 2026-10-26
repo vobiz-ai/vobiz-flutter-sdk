@@ -58,6 +58,39 @@ class FakeClient implements VobizClient {
   String? get sipUsername => username;
   @override
   VobizAuthMode get authMode => mode;
+
+  /// The access token sign-in in effect (set by [connectWithAccessToken]).
+  @override
+  VobizAccessToken? accessToken;
+
+  /// Every token passed to [connectWithAccessToken] / [updateAccessToken].
+  final List<String> tokens = <String>[];
+
+  @override
+  Future<void> connectWithAccessToken(String token) async {
+    actions.add('connectWithAccessToken');
+    tokens.add(token);
+    final parsed = VobizAccessToken.parse(token);
+    accessToken = parsed;
+    username = parsed.sipUsername;
+    mode = VobizAuthMode.accessToken;
+    if (registerOnConnect) {
+      connected = true;
+      fakeConnections.add(ConnectionEvent(
+        connectionState: ConnectionStateStatus.connected,
+        registrationState: RegistrationState.registered,
+        message: 'Registered',
+      ));
+    }
+  }
+
+  @override
+  Future<void> updateAccessToken(String token) async {
+    actions.add('updateAccessToken');
+    tokens.add(token);
+    accessToken = VobizAccessToken.parse(token);
+  }
+
   @override
   String? get lastCallUuid => null;
   @override
@@ -95,6 +128,8 @@ class FakeClient implements VobizClient {
     actions.add('disconnect');
     connected = false;
     username = null;
+    accessToken = null;
+    mode = VobizAuthMode.none;
   }
 
   @override
