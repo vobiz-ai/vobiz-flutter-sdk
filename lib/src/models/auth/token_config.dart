@@ -1,16 +1,13 @@
 /// **Not token authentication.** [token] is sent as the SIP digest password
 /// of the user [displayName] (or `token-user`), exactly like
-/// [CredentialConfig]; there is no JWT or access-token sign-in.
+/// [CredentialConfig].
 ///
-/// Vobiz SIP registration authenticates with an endpoint's username and
-/// password only (docs.vobiz.ai: "SIP endpoints do not require a separate
-/// token or JWT"). Access-token sign-in needs platform support that does not
-/// exist yet; when it does, the SDK will add it next to
-/// `connectWithCredentialsProvider`, whose provider callback already gives a
-/// refreshable place to fetch short-lived secrets.
-@Deprecated('TokenConfig is a SIP password under another name. Use '
-    'CredentialConfig, or connectWithCredentialsProvider with credentials '
-    'from your own backend.')
+/// For access-token (JWT) sign-in use `VobizClient.connectWithAccessToken`
+/// or `connectWithAccessTokenProvider`: they send the token as
+/// `X-Vobiz-Jwt`, which the registrar validates in place of a password.
+@Deprecated('TokenConfig is a SIP password under another name. For a JWT use '
+    'connectWithAccessToken or connectWithAccessTokenProvider; for an '
+    'endpoint use CredentialConfig or connectWithCredentialsProvider.')
 class TokenConfig {
   const TokenConfig({
     required this.token,

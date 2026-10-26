@@ -33,7 +33,10 @@ export 'src/media/call_quality.dart' show CallQualityLevel, CallQualitySample;
 export 'src/media/dtmf_transport.dart';
 
 // ── Authentication ────────────────────────────────────────────────────────────
+export 'src/auth/access_token.dart';
+export 'src/auth/access_token_provider.dart';
 export 'src/auth/credentials_provider.dart';
+export 'src/backend/backend_access_token_provider.dart';
 export 'src/backend/backend_credentials_provider.dart';
 export 'src/models/auth/auth_mode.dart';
 export 'src/models/auth/credential_config.dart';

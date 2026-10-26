@@ -8,6 +8,7 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../core/sip_headers.dart';
+import '../errors/vobiz_exception.dart';
 import '../network/keep_alive.dart';
 import '../utils/logger.dart';
 
@@ -157,6 +158,11 @@ class SipBuilder {
   /// INVITE's.
   static String newBranch() => 'z9hG4bK${_branch()}';
 
+  /// The header an access-token (JWT) sign-in sends on REGISTER and INVITE
+  /// instead of answering a digest challenge, spelled as Vobiz's web clients
+  /// send it.
+  static const String accessTokenHeader = 'X-Vobiz-Jwt';
+
   static String register({
     required String sipServer,
     required String username,
@@ -168,6 +174,7 @@ class SipBuilder {
     String? branch,
     String? authHeaderName,
     String? authHeader,
+    Map<String, String> extraHeaders = const <String, String>{},
   }) {
     final from = 'sip:$username@$sipServer';
     // CRLF line ends throughout (RFC 3261 7), as every other message here.
@@ -182,6 +189,7 @@ class SipBuilder {
       'Max-Forwards: 70',
       'User-Agent: vobiz_flutter_sdk',
       'Expires: $expires',
+      for (final header in extraHeaders.entries) '${header.key}: ${header.value}',
       'Content-Length: 0',
       if (authHeader != null) '${authHeaderName ?? 'Authorization'}: $authHeader',
       '',
@@ -777,6 +785,13 @@ class SIPService {
 
   String? _username;
   String? _password;
+
+  // An access-token (JWT) sign-in sends this on REGISTER and INVITE instead
+  // of a password; it never answers a digest challenge.
+  String? _accessToken;
+  int? _accessTokenError;
+  int? _accessTokenExpiresIn;
+  int? _accessTokenExpiresAt;
   int _cseq = 1;
   bool _manualDisconnect = false;
 
@@ -927,6 +942,46 @@ class SIPService {
   void register(String username, String password) {
     _username = username;
     _password = password;
+    _accessToken = null;
+    _startRegistration();
+  }
+
+  /// Registers as [username] with an access token (JWT) instead of a
+  /// password: every REGISTER and INVITE carries it as `X-Vobiz-Jwt`, and the
+  /// registrar validates it in place of a digest challenge.
+  void registerWithAccessToken(String username, String accessToken) {
+    _username = username;
+    _password = null;
+    _accessToken = accessToken;
+    _startRegistration();
+  }
+
+  /// Swaps the access token the next REGISTER and INVITE carry. Sends
+  /// nothing: call [refreshRegistration] to present it now.
+  void updateAccessToken(String accessToken) {
+    if (_password != null) return;
+    _accessToken = accessToken;
+  }
+
+  /// Whether this client signs in with an access token rather than a
+  /// password.
+  bool get usesAccessToken => _accessToken != null;
+
+  /// The registrar's reason for its last refusal of the access token (10001
+  /// to 10010, from `X-vobiz-Jwt-Error-Code`), until the next REGISTER is
+  /// accepted.
+  int? get accessTokenError => _accessTokenError;
+
+  /// From the registrar's last 200 OK (`X-vobiz-Jwt: expires=<s>;epoch-exp=<t>`):
+  /// seconds the token had left by the server's clock, and its expiry.
+  int? get accessTokenExpiresIn => _accessTokenExpiresIn;
+  int? get accessTokenExpiresAt => _accessTokenExpiresAt;
+
+  bool get _hasCredentials =>
+      _username != null && (_password != null || _accessToken != null);
+
+  void _startRegistration() {
+    _accessTokenError = null;
     _closeWhenCallEnds = false;
     _registrationState.value = SipRegistrationState.registering;
     _sendRegister(expires: registerExpires, auth: _AuthRetries());
@@ -944,7 +999,7 @@ class SIPService {
   /// registration is up; reconnecting is then the caller's job. Returns true
   /// without sending when a REGISTER is already in flight.
   bool refreshRegistration() {
-    if (_username == null || _password == null) return false;
+    if (!_hasCredentials) return false;
     if (_connectionState.value != SipConnectionState.connected ||
         _registrationState.value != SipRegistrationState.registered) {
       return false;
@@ -954,6 +1009,23 @@ class SIPService {
     _sendRegister(
         expires: registerExpires,
         auth: _AuthRetries(refresh: true, timeout: refreshTimeout));
+    return true;
+  }
+
+  /// Registers again on the socket that is still open, after the registrar
+  /// refused the last REGISTER: with a fresh access token, say. A call on
+  /// the socket keeps it (a refused registration only closes it once the
+  /// call ends), and this keeps it open afterwards too.
+  ///
+  /// Returns false, sending nothing, when the socket is closed: connect
+  /// again instead. Returns true without sending when a REGISTER is already
+  /// in flight.
+  bool registerAgain() {
+    if (!_hasCredentials) return false;
+    if (_connectionState.value != SipConnectionState.connected) return false;
+    if (_transactions.values.any((tx) => tx.method == 'REGISTER')) return true;
+    _registrationRefreshTimer?.cancel();
+    _startRegistration();
     return true;
   }
 
@@ -1215,6 +1287,7 @@ class SIPService {
         branch: branch,
         authHeaderName: authHeaderName,
         authHeader: authHeader,
+        extraHeaders: _accessTokenHeaders,
       ),
       branch: branch,
       method: 'REGISTER',
@@ -1235,6 +1308,14 @@ class SIPService {
               ? () => _transportDead(sentOn, 'No answer to the REGISTER refresh')
               : () => _failRegistration('Registration timed out: no answer from the registrar'),
     );
+  }
+
+  /// The access token, as the header a REGISTER or INVITE carries it in.
+  Map<String, String> get _accessTokenHeaders {
+    final token = _accessToken;
+    return token == null
+        ? const <String, String>{}
+        : <String, String>{SipBuilder.accessTokenHeader: token};
   }
 
   void _sendInvite(_OutgoingInvite invite, {String? authHeaderName, String? authHeader}) {
@@ -1258,8 +1339,9 @@ class SIPService {
         authHeaderName: authHeaderName,
         authHeader: authHeader,
         // The re-sent INVITE after a 407 must carry the same headers, or the
-        // webhook never sees them.
-        extraHeaders: invite.extraHeaders,
+        // webhook never sees them. A token sign-in adds its token, read now
+        // so a refreshed one is used.
+        extraHeaders: <String, String>{...invite.extraHeaders, ..._accessTokenHeaders},
       ),
       branch: invite.branch,
       method: 'INVITE',
@@ -1998,6 +2080,20 @@ class SIPService {
     if (code < 200) return;
     final unregistering = onUnregistered != null;
 
+    // An access token is validated by the registrar itself. A refusal comes
+    // back as 401 with a digest challenge (and, when the token was the
+    // problem, X-vobiz-Jwt-Error-Code); there is no password to answer it.
+    if (_accessToken != null && code >= 300 && code != 423) {
+      if (unregistering) {
+        onUnregistered();
+        return;
+      }
+      final tokenError = _accessTokenErrorIn(msg);
+      _accessTokenError = tokenError;
+      _failRegistration(_accessTokenRefusal(code, msg, tokenError));
+      return;
+    }
+
     if (code == 401 || code == 407) {
       final challenge = _challenge(msg);
       _logger.info('Auth challenge: $challenge');
@@ -2052,6 +2148,7 @@ class SIPService {
 
     if (code >= 200 && code < 300) {
       final granted = _grantedExpires(msg) ?? expires;
+      if (_accessToken != null) _readAccessTokenExpiry(msg);
       _logger.info('SIP registered as $_username for ${granted}s');
       _registrationState.value = SipRegistrationState.registered;
       _scheduleRegistrationRefresh(granted);
@@ -2067,6 +2164,38 @@ class SIPService {
       return;
     }
     _failRegistration('Registration failed ($code ${_reasonPhrase(msg)})');
+  }
+
+  /// The token error code on a refusal (`X-vobiz-Jwt-Error-Code: 10006`).
+  static int? _accessTokenErrorIn(SipMessage msg) =>
+      int.tryParse((msg.header('X-vobiz-Jwt-Error-Code') ?? '').trim());
+
+  /// Why the registrar refused this token sign-in, in words.
+  String _accessTokenRefusal(int code, SipMessage msg, int? tokenError) {
+    if (tokenError != null) {
+      return 'Access token refused: ${VobizAccessTokenException.errorName(tokenError)} '
+          '($tokenError)';
+    }
+    if (code == 401 || code == 407) {
+      return 'Access token refused ($code ${_reasonPhrase(msg)})';
+    }
+    if (code == 403) return 'Access token refused (403 ${_reasonPhrase(msg)})';
+    return 'Registration failed ($code ${_reasonPhrase(msg)})';
+  }
+
+  /// Why an outbound call was refused for its access token, in words.
+  static String _accessTokenCallRefusal(int tokenError) => 'Call refused: access token '
+      '${VobizAccessTokenException.errorName(tokenError)} ($tokenError)';
+
+  /// The registrar's view of the token on a 200 OK:
+  /// `X-vobiz-Jwt: expires=<seconds left>;epoch-exp=<exp>`.
+  void _readAccessTokenExpiry(SipMessage msg) {
+    final value = msg.header('X-vobiz-Jwt');
+    if (value == null) return;
+    int? param(String name) => int.tryParse(
+        RegExp('(?:^|;)\\s*$name\\s*=\\s*(-?\\d+)').firstMatch(value)?.group(1) ?? '');
+    _accessTokenExpiresIn = param('expires') ?? _accessTokenExpiresIn;
+    _accessTokenExpiresAt = param('epoch-exp') ?? _accessTokenExpiresAt;
   }
 
   /// The lifetime the registrar granted: our Contact's `expires` parameter
@@ -2202,8 +2331,12 @@ class SIPService {
         _failOutgoing(_withDetail('Remote party declined the call', msg), code);
         break;
       default:
+        final tokenError = _accessToken != null ? _accessTokenErrorIn(msg) : null;
         _failOutgoing(
-            _withDetail('Call failed ($code ${_reasonPhrase(msg)})', msg), code);
+            tokenError != null
+                ? _accessTokenCallRefusal(tokenError)
+                : _withDetail('Call failed ($code ${_reasonPhrase(msg)})', msg),
+            code);
     }
   }
 
@@ -2287,6 +2420,18 @@ class SIPService {
   }
 
   void _handleInviteAuthChallenge(_OutgoingInvite invite, SipMessage msg) {
+    // A token sign-in has no password: a challenge means the token was not
+    // accepted for this call.
+    if (_accessToken != null) {
+      final tokenError = _accessTokenErrorIn(msg);
+      _failOutgoing(
+          tokenError != null
+              ? _accessTokenCallRefusal(tokenError)
+              : 'Call refused: the access token was not accepted '
+                  '(${msg.statusCode} ${_reasonPhrase(msg)})',
+          msg.statusCode);
+      return;
+    }
     final challenge = _challenge(msg);
     if (challenge.isEmpty || _username == null || _password == null) {
       _failOutgoing('Call authentication failed', msg.statusCode);
@@ -2352,7 +2497,7 @@ class SIPService {
     final delay = Duration(milliseconds: max(1000, grantedSeconds * 800));
     _registrationRefreshDelay = delay;
     _registrationRefreshTimer = Timer(delay, () {
-      if (_username == null || _password == null) return;
+      if (!_hasCredentials) return;
       _sendRegister(expires: registerExpires, auth: _AuthRetries(refresh: true));
     });
   }

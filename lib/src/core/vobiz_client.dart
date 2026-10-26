@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 
 import '../audio/audio_route.dart';
 import '../audio/proximity.dart';
+import '../auth/access_token.dart';
 import '../backend/webhook_server_api.dart';
 import '../calls/call_session.dart';
 import '../errors/vobiz_exception.dart';
@@ -197,9 +198,13 @@ class VobizClient {
   String? _authId;
   String? _authToken;
 
-  // Credentials stored for reconnection
+  // Credentials stored for reconnection: a password, or an access token.
   String? _username;
   String? _password;
+  VobizAccessToken? _accessToken;
+
+  bool get _hasSignIn =>
+      _username != null && (_password != null || _accessToken != null);
 
   // Inbound call state
   String? _pendingInboundCaller;
@@ -271,8 +276,21 @@ class VobizClient {
   /// How this client signed in.
   VobizAuthMode get authMode => _authMode;
 
-  /// The SIP username this client registers as, once signed in.
+  /// The SIP username this client registers as, once signed in. For an
+  /// access token it is `<sub>_<iss>`.
   String? get sipUsername => _username;
+
+  /// The access token this client signed in with: identity, expiry and
+  /// grants. Null unless [authMode] is [VobizAuthMode.accessToken].
+  VobizAccessToken? get accessToken => _accessToken;
+
+  /// How long the registrar said the access token had left, at the last
+  /// successful REGISTER (from its clock, not the device's). Null before one,
+  /// or without an access token.
+  Duration? get accessTokenTimeLeft {
+    final seconds = _accessToken == null ? null : _sip.accessTokenExpiresIn;
+    return seconds == null ? null : Duration(seconds: seconds);
+  }
 
   /// The current call's state ([CallStateStatus.idle] between calls).
   CallStateStatus get callState => _callState;
@@ -407,6 +425,82 @@ class VobizClient {
     return _connectWithCredentials(config.username, config.password);
   }
 
+  /// Signs in with an access token (JWT) that your backend minted with
+  /// `POST /api/v1/Account/{auth_id}/JWT/Token/`. The same as the web SDK's
+  /// `loginWithAccessToken`.
+  ///
+  /// The client registers as `<sub>_<iss>` ([sipUsername]) with the token in
+  /// an `X-Vobiz-Jwt` header instead of a password, and sends it on every
+  /// outbound INVITE, where its `app` claim picks the application whose
+  /// Answer URL handles the call. No endpoint has to exist in the Console,
+  /// and neither the Auth Token nor a SIP password reaches the device. To
+  /// ring this user, dial `<User>sip:<sub>_<iss>@registrar.vobiz.ai</User>`.
+  ///
+  /// The token is not renewed: once it expires the next REGISTER is refused
+  /// (`ACCESS_TOKEN_EXPIRED`). Pass a fresh one to [updateAccessToken] before
+  /// then, or sign in with `connectWithAccessTokenProvider`, which does it
+  /// for you.
+  ///
+  /// Throws [VobizAccessTokenException] (`INVALID_ACCESS_TOKEN`) before
+  /// connecting when [accessToken] is not a Vobiz token. Like
+  /// [connectWithCredentials] it completes once the REGISTER is sent; watch
+  /// [connectionEvents] for the answer. A refusal arrives as an [ErrorEvent]
+  /// with code [VobizErrorCode.registrationFailed] whose `cause` is a
+  /// [VobizAccessTokenException] carrying the registrar's reason.
+  Future<void> connectWithAccessToken(String accessToken) async {
+    final token = VobizAccessToken.parse(accessToken);
+    _closeExistingConnection();
+    _authMode = VobizAuthMode.accessToken;
+    _authId = null;
+    _authToken = null;
+    _logger.info('Signing in with an access token as ${token.sipUsername}, '
+        'valid until ${token.expiresAt.toIso8601String()}');
+    await _connectWithAccessToken(token);
+  }
+
+  /// Presents a fresh access token for the same user, without dropping the
+  /// connection or a call: the client registers again with it right away.
+  ///
+  /// Call it before the current token expires (the provider session does).
+  /// It also recovers a client whose token was refused: it registers again,
+  /// on the open socket when a call is keeping it up.
+  ///
+  /// Throws [StateError] unless signed in with an access token, and
+  /// [ArgumentError] when [accessToken] is for another user (another `sub`
+  /// or `iss`): sign in again with [connectWithAccessToken] to switch users.
+  Future<void> updateAccessToken(String accessToken) async {
+    final current = _accessToken;
+    if (_authMode != VobizAuthMode.accessToken || current == null) {
+      throw StateError('Not signed in with an access token: call connectWithAccessToken first');
+    }
+    final next = VobizAccessToken.parse(accessToken);
+    if (next.accountId != current.accountId || next.subject != current.subject) {
+      throw ArgumentError.value(next.sipUsername, 'accessToken',
+          'is for another user than ${current.sipUsername}; sign in with connectWithAccessToken to switch');
+    }
+    _accessToken = next;
+    _sip.updateAccessToken(next.token);
+    _logger.info('New access token for $_username, valid until ${next.expiresAt.toIso8601String()}');
+    // Registered: present it now on the same socket. A call is not touched.
+    if (isConnected && _sip.refreshRegistration()) return;
+    // Reconnecting after a drop: the next attempt carries the new token.
+    if (_connectionState == ConnectionStateStatus.reconnecting && _supervisor.isRunning) return;
+    // The last token was refused: register again with this one, on the
+    // socket a call is keeping open if there is one.
+    if (_sip.registerAgain()) {
+      _registrationState = RegistrationState.registering;
+      _connectionState = ConnectionStateStatus.connecting;
+      _connectionEvents.addIfOpen(ConnectionEvent(
+        connectionState: _connectionState,
+        registrationState: _registrationState,
+        message: 'Registering with a new access token',
+      ));
+      if (_config.autoReconnect && !_supervisor.isRunning) await _supervisor.start();
+      return;
+    }
+    await _connectAndRegister(reconnecting: false);
+  }
+
   /// Reconnects and re-registers now, resetting the retry backoff.
   ///
   /// Call it when a push arrives, or from a "retry" button after a
@@ -442,6 +536,7 @@ class VobizClient {
     _authToken = null;
     _username = null;
     _password = null;
+    _accessToken = null;
     _connectionEvents.addIfOpen(ConnectionEvent(
       connectionState: _connectionState,
       registrationState: _registrationState,
@@ -492,6 +587,15 @@ class VobizClient {
     if (!isConnected) throw StateError('Not registered — call connect() first');
     if (_callState != CallStateStatus.idle) {
       throw StateError('Already in a call');
+    }
+    // As the web SDK does: a token that does not grant outgoing calls is
+    // refused here, before the registrar refuses the INVITE.
+    final token = _accessToken;
+    if (token != null && !token.canCallOut) {
+      throw const VobizAccessTokenException(
+          'This access token does not allow outgoing calls '
+          '(per.voice.outgoing_allow is not true)',
+          tokenError: VobizAccessTokenException.invalidGrants);
     }
     final target = destination.trim();
     if (target.isEmpty) throw ArgumentError('A destination is required');
@@ -937,7 +1041,13 @@ class VobizClient {
         registrationState: _registrationState,
         message: 'Registration failed: $reason',
       ));
-      _emitError('registration_failed', reason, null);
+      // A refused access token carries the registrar's reason (10001-10010).
+      _emitError(
+          'registration_failed',
+          reason,
+          _accessToken == null
+              ? null
+              : VobizAccessTokenException(reason, tokenError: _sip.accessTokenError));
     };
 
     _sip.onSocketError = _onSocketLost;
@@ -969,7 +1079,7 @@ class VobizClient {
     _onSignalingLost();
     if (!_config.autoReconnect) return;
     if (immediately) {
-      if (_username != null && _password != null) {
+      if (_hasSignIn) {
         _supervisor.reconnectNow(reason: reason);
       }
     } else {
@@ -1119,9 +1229,25 @@ class VobizClient {
   }
 
   Future<void> _connectWithCredentials(String username, String password,
-      {bool reconnecting = false}) async {
+      {bool reconnecting = false}) {
     _username = username;
     _password = password;
+    _accessToken = null;
+    return _connectAndRegister(reconnecting: reconnecting);
+  }
+
+  Future<void> _connectWithAccessToken(VobizAccessToken token) {
+    _username = token.sipUsername;
+    _password = null;
+    _accessToken = token;
+    return _connectAndRegister(reconnecting: false);
+  }
+
+  /// Opens the socket and sends the first REGISTER with whatever this client
+  /// signs in with: a password, or an access token.
+  Future<void> _connectAndRegister({required bool reconnecting}) async {
+    final username = _username;
+    if (username == null) return;
     _registrationState = RegistrationState.registering;
     _connectionState = reconnecting
         ? ConnectionStateStatus.reconnecting
@@ -1138,7 +1264,12 @@ class VobizClient {
         await _supervisor.start();
       }
       await _sip.connect();
-      _sip.register(username, password);
+      final token = _accessToken;
+      if (token != null) {
+        _sip.registerWithAccessToken(username, token.token);
+      } else {
+        _sip.register(username, _password ?? '');
+      }
     } catch (e) {
       _registrationState = RegistrationState.failed;
       _connectionState = ConnectionStateStatus.failed;
@@ -1178,20 +1309,19 @@ class VobizClient {
   /// Hands a drop to the supervisor, which applies [SdkConfig.reconnectPolicy]
   /// backoff, gives up after its last attempt, and waits while offline.
   void _scheduleReconnect([String reason = 'Connection lost']) {
-    if (_username == null || _password == null) return;
+    if (!_hasSignIn) return;
     _supervisor.connectionLost(reason);
   }
 
-  /// One reconnect attempt for the supervisor: a fresh socket and REGISTER.
+  /// One reconnect attempt for the supervisor: a fresh socket and REGISTER,
+  /// with the password or the current access token.
   Future<void> _reconnectOnce() async {
-    final username = _username;
-    final password = _password;
-    if (username == null || password == null) return;
+    if (!_hasSignIn) return;
     // Keep a connected call's dialog: once registered again it can still
     // be hung up, and the far end's BYE still matches it.
     // Not a sign-out: no unregistration, the REGISTER below replaces it.
     unawaited(_sip.disconnect(keepCall: _callId != null, unregister: false));
-    await _connectWithCredentials(username, password, reconnecting: true);
+    await _connectAndRegister(reconnecting: true);
   }
 
   void _onNetworkEvent(NetworkEvent event) {
@@ -1253,7 +1383,7 @@ class VobizClient {
     final wasForeground = _inForeground;
     _inForeground = foreground;
     if (!foreground || wasForeground == true) return;
-    if (_username == null || _password == null) return;
+    if (!_hasSignIn) return;
     final now = DateTime.now();
     final last = _lastForegroundRegister;
     if (last != null && now.difference(last) < _foregroundDebounce) return;
