@@ -36,6 +36,8 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const USERNAME_RE = /^[A-Za-z0-9_.\-+]{1,120}$/;
+/** An access token's `sub`, as the platform accepts it (letters, digits, _ and -, at most 50). */
+const SUB_RE = /^[A-Za-z0-9_-]{1,50}$/;
 const CALL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
@@ -69,6 +71,13 @@ export function createBridge(options = {}) {
     // ...and after this long the call is ended: the SDK gives up at 12 s, but
     // its hangup cannot leave an offline phone. 0 never ends it.
     lostHangupSeconds: env.LOST_HANGUP_SECONDS === '0' ? 0 : clampInt(env.LOST_HANGUP_SECONDS, 15, 5, 300),
+    // Access tokens (POST /token): who the app signs in as ("<sub>_<auth id>"),
+    // for how long (180 s to 24 h, the platform's limits), and which
+    // application's Answer URL handles its outbound calls (else the account's
+    // default application).
+    jwtSub: (env.JWT_SUB || 'flutter-app').trim(),
+    jwtTtlSeconds: clampInt(env.JWT_TTL_SECONDS, 3600, 180, 86400),
+    jwtAppId: (env.JWT_APP_ID || '').trim(),
     callerIdMode: (env.CALLER_ID_MODE || 'number').trim().toLowerCase(),
     headerStyle: (env.SIP_HEADER_STYLE || 'suffix').trim().toLowerCase(),
     alwaysRing: csv(env.ALWAYS_RING),
@@ -139,6 +148,7 @@ export function createBridge(options = {}) {
     'POST /hangup': vobiz(onHangup),
     'GET /hangup': vobiz(onHangup),
     // The app
+    'POST /token': onToken,
     'POST /push/register': onRegister,
     'POST /push/unregister': onUnregister,
     'POST /push/test': onTestCall,
@@ -475,6 +485,54 @@ export function createBridge(options = {}) {
   }
 
   // ── The app's requests ───────────────────────────────────────────────────────
+
+  let jwtAppWarned = false;
+
+  /**
+   * An access token (JWT) for the app: `POST /Account/{auth id}/JWT/Token/`
+   * mints it with the account's Auth Token, which stays here. The app signs
+   * in with it (the SDK's connectWithAccessTokenProvider) as
+   * "<sub>_<auth id>", and the token renews itself through this route before
+   * it expires. Only a paired phone (device token) or the bridge key may
+   * ask; `sub` comes from the body or ?sub=, else JWT_SUB. Same reply shape
+   * as the Vobiz WebRTC demo's /token.
+   */
+  async function onToken(req, res, url) {
+    const device = deviceFromRequest(req);
+    if (!device && !keyMatches(req)) return sendJson(res, 401, { error: 'Send the bridge key, or this phone\'s device token' });
+    if (!config.authId || !config.authToken) return sendJson(res, 503, { error: 'VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN are not set' });
+    const body = await readJson(req);
+    const sub = String(body.sub || url.searchParams.get('sub') || config.jwtSub).trim();
+    if (!SUB_RE.test(sub)) return sendJson(res, 400, { error: 'sub must be 1 to 50 letters, digits, _ or -' });
+    // nbf a minute in the past: a registrar whose clock is a second behind
+    // this one refuses a token whose nbf has not come yet (10005). The
+    // platform's 180 s to 24 h limits apply to exp - nbf.
+    const nbf = Math.floor(Date.now() / 1000) - 60;
+    const claims = {
+      iss: config.authId,
+      sub,
+      nbf,
+      exp: nbf + config.jwtTtlSeconds,
+      per: { voice: { incoming_allow: true, outgoing_allow: true } },
+      ...(config.jwtAppId ? { app: config.jwtAppId } : {}),
+    };
+    if (!config.jwtAppId && !jwtAppWarned) {
+      jwtAppWarned = true;
+      log('!!', 'JWT_APP_ID is not set: tokens carry no app, so the account\'s default application handles outbound calls, and where that does not work the registrar refuses the token (10001 INVALID_ACCESS_TOKEN). Set JWT_APP_ID.');
+    }
+    let minted;
+    try {
+      minted = await vobizApi('POST', '/JWT/Token/', claims);
+    } catch (error) {
+      log('!!', `Vobiz: could not mint an access token for ${sub}: ${error.message}`);
+      return sendJson(res, 502, { error: 'Vobiz did not mint the token' });
+    }
+    if (typeof minted?.token !== 'string' || !minted.token) return sendJson(res, 502, { error: 'Vobiz returned no token' });
+    const sipUsername = `${sub}_${config.authId}`;
+    const reason = typeof body.reason === 'string' ? ` (${body.reason.slice(0, 20)})` : '';
+    log('ok', `Access token for ${sipUsername}, valid until ${new Date(claims.exp * 1000).toISOString()}${reason}`);
+    sendJson(res, 200, { token: minted.token, sub, exp: claims.exp, sip_username: sipUsername });
+  }
 
   /**
    * The app signed in. A new phone pairs with the bridge key (X-Bridge-Key)
@@ -1051,6 +1109,14 @@ export function createBridge(options = {}) {
 
   const endpointCache = { at: 0, names: null };
 
+  /** An access-token identity on this account: "<sub>_<auth id>" (see /token). */
+  function isTokenIdentity(username) {
+    const suffix = `_${config.authId}`.toLowerCase();
+    const name = String(username || '').toLowerCase();
+    return Boolean(config.authId) && name.length > suffix.length && name.endsWith(suffix)
+      && SUB_RE.test(name.slice(0, -suffix.length));
+  }
+
   /**
    * Whether `username` is an endpoint on VOBIZ_AUTH_ID's account: true,
    * false, null when Vobiz could not be asked, undefined when there is no
@@ -1058,6 +1124,10 @@ export function createBridge(options = {}) {
    */
   async function endpointKnown(username) {
     if (!config.authId || !config.authToken) return undefined;
+    // An app signed in with an access token registers as "<sub>_<auth id>":
+    // an identity the token creates, not a Console endpoint. Ringing
+    // <User>sip:<sub>_<auth id>@registrar.vobiz.ai</User> reaches it.
+    if (isTokenIdentity(username)) return true;
     try {
       if (!endpointCache.names || Date.now() - endpointCache.at > 60 * 1000) {
         const endpoints = await listAll('/Endpoint/');
