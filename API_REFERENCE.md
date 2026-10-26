@@ -18,6 +18,9 @@ to drive them from elsewhere or in tests.
 | Method | Mode | Notes |
 |---|---|---|
 | `Future<VobizCredentialsSession> connectWithCredentialsProvider(VobizCredentialsProvider provider, {int maxRefreshes = 1})` | **Production** | Asks your provider for the user's SIP credentials and registers; asks again when the registrar refuses them. Throws `VobizCredentialsException` when the provider fails. See [CREDENTIALS.md](CREDENTIALS.md) |
+| `Future<VobizAccessTokenSession> connectWithAccessTokenProvider(VobizAccessTokenProvider provider, {Duration refreshBefore = const Duration(seconds: 60), int maxRefreshes = 1})` | **Production**, access token | Asks your provider for an access token (JWT), registers with it, fetches the next one `refreshBefore` ahead of each token's expiry and registers again without touching a call, and asks again when the registrar refuses one. The web SDK's `loginWithAccessTokenGenerator`. Throws `VobizAccessTokenException` when the provider fails |
+| `Future<void> connectWithAccessToken(String accessToken)` | Access token | Registers as `<sub>_<iss>` with the token instead of a password. Not renewed (use the provider, or `updateAccessToken`). The web SDK's `loginWithAccessToken`. Throws `VobizAccessTokenException` (10001) for a token it cannot decode |
+| `Future<void> updateAccessToken(String accessToken)` | Access token | Registers again now with a fresh token for the same user, on the open socket; also recovers a refused sign-in. Throws `StateError` unless signed in with a token, `ArgumentError` for another user's token |
 | `Future<void> connectWithCredentials(CredentialConfig config)` | SIP Direct | Registers as an existing endpoint |
 | `Future<ZeroConfigSession> connectWithAuthToken({required String authId, required String authToken})` | Zero-Config Setup, **demo only** | Throws `VobizDemoModeRequiredException` unless `SdkConfig.unsafeDemoZeroConfig` is true. Then posts the Auth ID and Auth Token to `<backendUrl>/api/setup` and registers as the returned endpoint (whose password it rotates). Throws `VobizException` (`setup_failed`) when refused, `ArgumentError` when either value is blank |
 | `Future<void> connect(Object credentials)` | SIP Direct | Accepts `CredentialConfig`, or the deprecated `TokenConfig` (its token is sent as the SIP password; it is not token auth) |
@@ -38,11 +41,65 @@ watch `connectionEvents` for `RegistrationState.registered` or `.failed`.
 
 | Getter | Meaning |
 |---|---|
-| `VobizAuthMode authMode` | `none`, `zeroConfig` or `sipDirect` |
-| `String? sipUsername` | The endpoint this client registers as |
+| `VobizAuthMode authMode` | `none`, `zeroConfig`, `sipDirect` or `accessToken` |
+| `String? sipUsername` | The SIP user this client registers as: the endpoint, or `<sub>_<iss>` for an access token |
+| `VobizAccessToken? accessToken` | The access token signed in with: `sipUsername`, `accountId` (`iss`), `subject` (`sub`), `appId` (`app`), `notBefore`, `expiresAt`, `canCallOut`, `canReceiveCalls`. Null for other sign-ins |
+| `Duration? accessTokenTimeLeft` | How long the registrar said the token had left at the last REGISTER (its clock, not the device's) |
 | `bool isConnected` | Socket connected and registered |
 | `RegistrationState registrationState`, `ConnectionStateStatus connectionState` | |
 | `String backendUrl` | The webhook server. Mutable: set it before signing in to use another one |
+
+### Access tokens (JWT)
+
+Your backend mints the token with `POST /api/v1/Account/{auth_id}/JWT/Token/` (account
+Auth ID and Auth Token, which stay on the server) and claims
+`{"iss": "<auth_id>", "sub": "<your user id>", "nbf": <s>, "exp": <s>, "app": "<application id>",
+"per": {"voice": {"incoming_allow": true, "outgoing_allow": true}}}`. See
+[CREDENTIALS.md](CREDENTIALS.md#access-tokens-jwt).
+
+- **Identity.** The client registers as `<sub>_<iss>`: no endpoint has to exist in the
+  Console. To ring the user, dial `<User>sip:<sub>_<iss>@registrar.vobiz.ai</User>`.
+- **On the wire.** Every REGISTER and every outbound INVITE carries `X-Vobiz-Jwt: <token>`
+  instead of answering a digest challenge. The registrar validates it and tags the INVITE
+  with the account and the token's `app`, whose Answer URL then handles the call (the
+  account's default application without `app`). The SDK never logs the token.
+- **Grants.** `makeCall` throws `VobizAccessTokenException` (10008
+  `INVALID_ACCESS_TOKEN_GRANTS`) unless `per.voice.outgoing_allow` is true, before
+  anything is sent. The SDK does not check `incoming_allow`; the platform does.
+- **Expiry.** The registrar caps the registration at the token's remaining life and
+  reports it (`X-vobiz-Jwt: expires=<s>;epoch-exp=<t>`, see `accessTokenTimeLeft`). The
+  provider session asks for the next token `refreshBefore` (60 s) ahead of `exp`, never
+  sooner than 5 s from now, and registers with it on the same socket. With
+  `connectWithAccessToken` alone, call `updateAccessToken` yourself.
+- **Refusals.** A refused REGISTER fails the registration: an `ErrorEvent` with code
+  `registration_failed` whose `cause` is a `VobizAccessTokenException` carrying the
+  registrar's `X-vobiz-Jwt-Error-Code`. A refused INVITE fails the call with the same
+  name in its reason. The provider session then asks for a new token (`rejected`),
+  except for 10005 `ACCESS_TOKEN_NOT_VALID_YET`, where it presents the same token again
+  3 s later: the registrar's clock was behind the minting server's.
+- **Minting tips** (seen live): include `app` (without it the registrar can refuse the
+  token with 10001), and set `nbf` a minute in the past (else 10005 while the
+  registrar's clock is behind). `sub` is letters, digits, `_` or `-`, at most 50.
+
+| `tokenError` | `tokenErrorName` (as the web SDK's `getErrorStringByErrorCodes`) | Meaning |
+|---|---|---|
+| 10001 | `INVALID_ACCESS_TOKEN` | Not a JWT, or a claim is missing or has the wrong type |
+| 10002 | `INVALID_ACCESS_TOKEN_HEADER` | `typ`, `alg` or `cty` is not what Vobiz signs |
+| 10003 | `INVALID_ACCESS_TOKEN_ISSUER` | `iss` is not a known Auth ID |
+| 10004 | `INVALID_ACCESS_TOKEN_SUBJECT` | `sub` names no identity on that account |
+| 10005 | `ACCESS_TOKEN_NOT_VALID_YET` | `nbf` is in the future |
+| 10006 | `ACCESS_TOKEN_EXPIRED` | `exp` has passed |
+| 10007 | `INVALID_ACCESS_TOKEN_SIGNATURE` | Not signed with the account's Auth Token |
+| 10008 | `INVALID_ACCESS_TOKEN_GRANTS` | `per.voice` does not allow it |
+| 10009 | `EXPIRATION_EXCEEDS_MAX_ALLOWED_TIME` | `exp - nbf` is outside 180 s to 24 h |
+| 10010 | `MAX_ALLOWED_LOGIN_REACHED` | Too many sign-ins for this identity |
+
+`VobizAccessTokenProvider` is `Future<String> Function(VobizAccessTokenRequest request)`,
+asked with `signIn`, `expiring`, `rejected` or `refresh` (`session.refresh()`).
+`VobizAccessTokenSession` has `nextRefreshAt`, `failures`, `refresh()` and `dispose()`.
+`VobizBackendAccessTokenProvider(url:, headers:)` POSTs `{"reason": ...}` to your backend
+and reads `{"token": ...}` (the Vobiz WebRTC demo's `/token` answers that way); pass
+`provider.call`.
 
 ### Calls
 
@@ -129,7 +186,7 @@ call emits `failed` and then `ended`.
 Error codes are constants on `VobizErrorCode`: `setupFailed`, `registrationFailed`,
 `socketError`, `connectFailed`, `callFailed`, `callTimeout`, `answerFailed`,
 `makeCallFailed`, `transferFailed`, `recordingsFailed`, `demoModeRequired`,
-`credentialsFailed`.
+`credentialsFailed`, `authFailed`, `accessTokenFailed`.
 
 ### Returning to the foreground
 
@@ -201,6 +258,7 @@ was already over) included. Two cases this cannot cover:
 | `VobizDemoModeRequiredException` | `demo_mode_required` | An Auth-Token operation without `unsafeDemoZeroConfig` |
 | `VobizCredentialsException` | `credentials_failed` | Your credentials provider (or backend) failed |
 | `VobizRegistrationException` | `registration_failed` | The registrar kept refusing fresh credentials (on `VobizCredentialsSession.failures`) |
+| `VobizAccessTokenException` | `access_token_failed` | An access token could not be decoded, your token provider failed, the token does not allow an outgoing call, or (on `VobizAccessTokenSession.failures`) the registrar kept refusing fresh tokens. `tokenError` / `tokenErrorName` carry the registrar's reason (10001 to 10010); it is also the `cause` of a `registration_failed` event when a token is refused |
 
 Some methods still throw `StateError` (wrong call state) or `ArgumentError` (invalid
 input) as documented above.
@@ -252,7 +310,8 @@ The custom-header rules, identical to the Vobiz web SDK's:
 | `VobizRecording` | `recordingId`, `callUuid`, `url`, `durationSecs`, `endReason`, `receivedAt` |
 | `CallStats` | `rttMs`, `jitterMs`, `packetLossPercent` |
 | `CredentialConfig` | `username`, `password`, `displayName`, `answerUrl` |
-| `TokenConfig` (deprecated) | `token` (sent as the SIP password), `displayName` (used as the SIP username), `answerUrl` |
+| `TokenConfig` (deprecated) | `token` (sent as the SIP password), `displayName` (used as the SIP username), `answerUrl`. Not a JWT: for one use `connectWithAccessToken` |
+| `VobizAccessToken` | `VobizAccessToken.parse(token)`; `token`, `sipUsername`, `accountId`, `subject`, `appId`, `notBefore`, `expiresAt`, `incomingAllowed`, `outgoingAllowed`, `canCallOut`, `canReceiveCalls`, `isExpired()`, `timeLeft()`. `toString()` never prints the token |
 | `CallSession` | `currentCall`/`calls`/`CallEvent.session`: `callId`, `remoteIdentity`, `isIncoming`, `state`, `callUuid`, `headers`, `actions` (`CallActions`) |
 | `Logger` | `Logger({LogWriter? writer})`: pass to `VobizClient(logger:)` to receive SDK log lines |
 
@@ -260,7 +319,7 @@ The custom-header rules, identical to the Vobiz web SDK's:
 
 | Enum | Values |
 |---|---|
-| `VobizAuthMode` | `none`, `zeroConfig`, `sipDirect` (also after `connectWithCredentialsProvider`) |
+| `VobizAuthMode` | `none`, `zeroConfig`, `sipDirect` (also after `connectWithCredentialsProvider`), `accessToken` (`connectWithAccessToken` and `connectWithAccessTokenProvider`) |
 | `VobizCredentialsRequest` | `signIn`, `rejected`, `refresh` |
 | `VobizPushKind` | `incomingCall`, `callEnded` |
 | `CallStateStatus` | `idle`, `incoming`, `outgoing`, `ringing`, `connecting`, `active`, `held`, `ended`, `failed` |

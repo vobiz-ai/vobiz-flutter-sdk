@@ -30,6 +30,15 @@ call was used. #58 lists what still needs a device.
 
 ### Added
 
+- Access-token (JWT) sign-in, as the web SDK's `loginWithAccessToken` /
+  `loginWithAccessTokenGenerator` and the Vobiz WebRTC demo: `connectWithAccessToken`,
+  `connectWithAccessTokenProvider` (renews the token 60 s before it expires and asks
+  again when the registrar refuses one), `updateAccessToken`,
+  `VobizBackendAccessTokenProvider`, `VobizAccessToken`, `VobizAuthMode.accessToken`,
+  `VobizAccessTokenException` with the registrar's 10001 to 10010 reasons. The client
+  registers as `<sub>_<iss>`, sends the token as `X-Vobiz-Jwt` on REGISTER and outbound
+  INVITEs instead of answering a digest challenge, and refuses outbound calls the token
+  does not grant.
 - `connectWithCredentialsProvider` and `VobizBackendCredentialsProvider`: per-user SIP
   credentials from your own backend, fetched again when the registrar refuses them
   (#14, #29). Typed errors: `VobizErrorCode` (including `auth_failed`),
@@ -99,7 +108,8 @@ call was used. #58 lists what still needs a device.
 
 ### Changed
 
-- `TokenConfig` is deprecated: it is a SIP password. Vobiz has no JWT SIP auth (#29).
+- `TokenConfig` is deprecated: it is a SIP password, not an access token. For access
+  tokens use `connectWithAccessToken` (#29).
 - `hold()`/`resume()` throw when there is no call or Vobiz refuses; legacy
   call-control routes throw `UnsupportedError` instead of failing silently (#30).
 - `CallSession`, `CallActions`, `SdkEvent` and `Logger` are exported (#33).
@@ -109,6 +119,11 @@ call was used. #58 lists what still needs a device.
 
 ### Example app and push bridge
 
+- An **Access token** sign-in tab: a token from your token server (the Vobiz WebRTC
+  demo's `/token` works) or the push bridge's `POST /token`, which mints it through the
+  Vobiz API with `JWT_SUB`, `JWT_TTL_SECONDS` and `JWT_APP_ID`. The bridge registers a
+  phone signed in that way as `<sub>_<auth id>`, so push and inbound calls reach it. No
+  token is stored on the device.
 - Calls woken by push sign in while the phone is still ringing and tell the bridge,
   which dials at once (`POST /push/registered`) (#8). One cached Flutter engine hosts
   SIP and UI (#51).
@@ -151,7 +166,7 @@ call was used. #58 lists what still needs a device.
 - iOS PushKit/CallKit (needs Xcode) and Telecom/ConnectionService integration (#10,
   #11, #17, #18). ICE restart is done for a connection that drops; a handover that
   leaves the old connection up does not move the call until that network goes away.
-- Platform work: Opus instead of PCMU, Vobiz-hosted TURN on 443, JWT SIP auth (#20, #29).
+- Platform work: Opus instead of PCMU, Vobiz-hosted TURN on 443 (#20).
 - #36 needs the app's Trace; #58 is the device test plan.
 
 ---

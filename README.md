@@ -24,16 +24,20 @@ The [`example/`](example) app is a full Playground for Flutter that uses all of 
 
 ## Sign in
 
-| | **Credentials provider** (production) | **SIP Direct** | **Zero-Config Setup** (demo only) |
-|---|---|---|---|
-| Call | `connectWithCredentialsProvider(provider)` | `connectWithCredentials(CredentialConfig(...))` | `connectWithAuthToken(...)` with `SdkConfig(unsafeDemoZeroConfig: true)` |
-| Where credentials come from | Your backend creates one endpoint per user and returns its username and password | You already hold an endpoint's username and password | The webhook server provisions the account's single shared Playground endpoint |
-| On the device | That user's endpoint password | The endpoint password | **The account Auth ID and Auth Token** |
-| Several devices / users | Each has its own endpoint | One endpoint each | One shared endpoint, password rotated on every sign-in: devices log each other out |
-| Refused credentials | The provider is asked again and the client re-registers | Registration fails | Registration fails |
+| | **Access token** (production) | **Credentials provider** (production) | **SIP Direct** | **Zero-Config Setup** (demo only) |
+|---|---|---|---|---|
+| Call | `connectWithAccessTokenProvider(provider)` (or `connectWithAccessToken(jwt)`) | `connectWithCredentialsProvider(provider)` | `connectWithCredentials(CredentialConfig(...))` | `connectWithAuthToken(...)` with `SdkConfig(unsafeDemoZeroConfig: true)` |
+| Where credentials come from | Your backend mints a short-lived JWT with `POST /Account/{auth_id}/JWT/Token/` | Your backend creates one endpoint per user and returns its username and password | You already hold an endpoint's username and password | The webhook server provisions the account's single shared Playground endpoint |
+| On the device | A token that expires (default 1 hour); no endpoint needed | That user's endpoint password | The endpoint password | **The account Auth ID and Auth Token** |
+| Registers as | `<sub>_<auth_id>` | The endpoint | The endpoint | The shared Playground endpoint |
+| Several devices / users | Each user gets their own `sub` | Each has its own endpoint | One endpoint each | One shared endpoint, password rotated on every sign-in: devices log each other out |
+| Expiry and refusals | Renewed 60 s before expiry; a refused token asks the provider again | The provider is asked again and the client re-registers | Registration fails | Registration fails |
 
-There is no JWT / access-token sign-in: Vobiz SIP registration uses endpoint
-credentials only. `TokenConfig` is a deprecated alias for a SIP password.
+Access-token sign-in is the web SDK's `loginWithAccessToken` /
+`loginWithAccessTokenGenerator`: the token travels as `X-Vobiz-Jwt` on REGISTER and on
+outbound INVITEs, and its `app` claim picks the application whose Answer URL handles
+your outbound calls. See [CREDENTIALS.md](CREDENTIALS.md#access-tokens-jwt).
+`TokenConfig` is a deprecated alias for a SIP password, not a JWT.
 
 ## Quick start
 
