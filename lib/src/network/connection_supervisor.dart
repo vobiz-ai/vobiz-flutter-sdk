@@ -22,9 +22,10 @@ import 'reconnect_policy.dart';
 ///   counted; [isOffline] lets callers fail fast.
 /// - When the network comes back, or moves (Wi-Fi to mobile), the socket is
 ///   bound to an interface that no longer exists, so it reconnects at once
-///   instead of waiting for the keep-alive to notice. During a call it leaves
-///   the socket alone and calls [onHandover] instead (ICE restart is the
-///   call layer's job); the keep-alive still catches a dead socket.
+///   instead of waiting for the keep-alive to notice. During a call it calls
+///   [onHandover] (ICE restart is the call layer's job) and leaves a socket
+///   that has not been reported dead alone; the keep-alive still catches a
+///   dead one. Back from no network at all, it reconnects even during a call.
 /// - An attempt that opens the socket but is not registered within
 ///   [registerTimeout] counts as failed.
 @internal
@@ -252,10 +253,18 @@ class ConnectionSupervisor {
     // The first report after start() is not a change.
     if (prev == null) return;
 
+    if (cameBack) {
+      // Every network was down. The old socket may never report its death
+      // (seen live on the emulator: nothing until a WebSocket ping timed out,
+      // after the call's grace period had run out), so it is not trusted:
+      // reconnect now, even during a call. The call keeps its dialog, and its
+      // audio moves with an ICE restart once the client is registered again.
+      _socketAlive = false;
+    }
     if (hasActiveCall?.call() ?? false) {
-      // Replacing the socket now would drop the call's dialog. Let the call
-      // layer move the media (ICE restart); the keep-alive catches a dead
-      // socket and the normal reconnect takes over after the call.
+      // A socket still up is kept during a call. Let the call layer move the
+      // media (ICE restart); the keep-alive catches a dead socket and the
+      // normal reconnect takes over after the call.
       onHandover?.call(prev, next);
       if (_socketAlive) return;
     }
