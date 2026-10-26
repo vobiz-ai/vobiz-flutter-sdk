@@ -989,15 +989,21 @@ export function createBridge(options = {}) {
     return json;
   }
 
-  /** Every object of a paged Vobiz list (`?limit=&offset=`, at most 100 a page). */
+  /**
+   * Every object of a paged Vobiz list (`?limit=&offset=`). Vobiz returns at
+   * most 20 a page whatever the limit, so the next page starts after what
+   * came back: stepping by the limit skipped objects, and missed this
+   * bridge's own application on an account with more than 20.
+   */
   async function listAll(collection) {
     const all = [];
-    for (let offset = 0; offset < 5000; offset += 100) {
+    for (let offset = 0; offset < 5000;) {
       const page = await vobizApi('GET', `${collection}?limit=100&offset=${offset}`);
       const objects = page?.objects || [];
       all.push(...objects);
+      offset += objects.length;
       const total = page?.meta?.total_count ?? 0;
-      if (!objects.length || offset + objects.length >= total) break;
+      if (!objects.length || offset >= total) break;
     }
     return all;
   }
