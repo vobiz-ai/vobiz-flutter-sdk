@@ -110,8 +110,12 @@ export function xmlAttr(xml, element, attr) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Waits until fn() is truthy, up to `ms`. */
-export async function until(fn, ms = 2000) {
+/**
+ * Waits until fn() is truthy, up to `ms`. 5 s, not 2: with every test file
+ * starting bridges in parallel, a push can take over 2 s on a loaded machine;
+ * a passing check returns at once.
+ */
+export async function until(fn, ms = 5000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
     const v = await fn();
