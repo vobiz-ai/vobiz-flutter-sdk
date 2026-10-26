@@ -1819,11 +1819,13 @@ class PlaygroundController extends ChangeNotifier {
     if (registered && client.isConnected) {
       _setStatus(PhoneStatus.online, 'Registered');
     } else if (registered &&
-        status == PhoneStatus.inCall &&
+        (status == PhoneStatus.inCall || status == PhoneStatus.ringing) &&
         client.connectionState == ConnectionStateStatus.reconnecting) {
-      // The call ended while the network is down (the SDK gave up, or the
-      // far end's BYE arrived as it dropped). Leave the call screen and show
-      // the reconnect; registering again (_onConnection) shows Registered.
+      // The call ended while the network is down (the SDK gave up, the far
+      // end's BYE arrived as it dropped, or an outgoing call was still
+      // ringing). Leave the call screen and show the reconnect: registering
+      // again (_onConnection) leaves a call screen alone, but shows
+      // Registered from here.
       _setStatus(PhoneStatus.connecting, 'Reconnecting...');
     } else {
       notifyListeners();
