@@ -682,6 +682,25 @@ class _Dialog {
   final List<String> routes;
 }
 
+/// A BYE or CANCEL that has had no final response yet. One sent while the
+/// connection is down (a call that ran out of network grace) never arrives,
+/// and Vobiz then keeps the far end up, silent and billed, until its media
+/// proxy times the leg out (about 300 s), or keeps a callee ringing. Once the
+/// client has registered on a new connection it is sent again.
+class _PendingEnd {
+  _PendingEnd(this.method, this.callId, this.username, this.resend);
+
+  final String method;
+  final String callId;
+  final String username;
+  final void Function() resend;
+  final DateTime since = DateTime.now();
+
+  /// The socket it last went out on (null: there was none).
+  WebSocketChannel? sentOn;
+  int resends = 0;
+}
+
 // ---------------------------------------------------------------------------
 // SIPService
 // ---------------------------------------------------------------------------
@@ -736,6 +755,14 @@ class SIPService {
   /// unregistration before it closes the socket anyway.
   @visibleForTesting
   Duration unregisterTimeout = const Duration(seconds: 2);
+
+  /// How long a BYE or CANCEL that may not have arrived is sent again after a
+  /// reconnect (at most [_pendingEndMaxResends] times). Vobiz's media proxy
+  /// ends an abandoned leg after about 300 s, so later there is nothing left
+  /// to end.
+  @visibleForTesting
+  Duration pendingEndWindow = const Duration(minutes: 5);
+  static const int _pendingEndMaxResends = 3;
 
   /// How long [refreshRegistration] waits for the registrar before treating
   /// the socket as dead. After a phone is locked the socket is often dead
@@ -804,6 +831,9 @@ class SIPService {
   bool _dtmfInFlight = false;
 
   final Map<String, _ClientTransaction> _transactions = <String, _ClientTransaction>{};
+
+  // BYEs and CANCELs with no final response yet, by "<Call-ID> <method>".
+  final Map<String, _PendingEnd> _pendingEnds = <String, _PendingEnd>{};
 
   // Set while an outbound call is being prepared: an inbound INVITE then gets
   // 486 instead of ringing a client that will never show it.
@@ -1243,6 +1273,16 @@ class SIPService {
   void _sendCancel(_OutgoingInvite invite) {
     if (invite.cancelSent || _username == null) return;
     invite.cancelSent = true;
+    final pendingKey = '${invite.callId} CANCEL';
+    final pending =
+        _pendingEnds[pendingKey] ??= _PendingEnd('CANCEL', invite.callId, _username!, () {
+      // The INVITE's branch and CSeq again, on the connection the client has
+      // now: the registrar matches a CANCEL to its INVITE by those.
+      invite.cancelSent = false;
+      invite.socket = _socket;
+      _sendCancel(invite);
+    });
+    pending.sentOn = invite.socket;
     _sendRequest(
       message: SipBuilder.cancel(
         requestUri: invite.requestUri,
@@ -1262,6 +1302,7 @@ class SIPService {
       // A 200 to the CANCEL only means it arrived; the INVITE's own 487 (or
       // a 2xx that crossed it) is what ends the call.
       onResponse: (_, msg) {
+        if (msg.statusCode >= 200) _pendingEnds.remove(pendingKey);
         if (msg.statusCode >= 300) {
           _logger.warn('CANCEL refused: ${msg.statusCode} ${_reasonPhrase(msg)}');
         }
@@ -1285,6 +1326,10 @@ class SIPService {
     final retries = auth ?? _AuthRetries();
     final branch = SipBuilder.newBranch();
     final cseq = _cseq++;
+    final pendingKey = '${dialog.callId} BYE';
+    final pending = _pendingEnds[pendingKey] ??=
+        _PendingEnd('BYE', dialog.callId, username, () => _sendBye(dialog));
+    pending.sentOn = socket ?? _socket;
     _sendRequest(
       message: SipBuilder.bye(
         requestUri: dialog.remoteTarget,
@@ -1331,9 +1376,36 @@ class SIPService {
             }
           }
         }
+        // Answered, even refused (481: the far end already ended the call):
+        // nothing to send again.
+        _pendingEnds.remove(pendingKey);
         if (code >= 300) _logger.warn('BYE refused: $code ${_reasonPhrase(msg)}');
       },
     );
+  }
+
+  /// Registered on a (possibly new) connection: sends again each BYE and
+  /// CANCEL that went out with no connection, or on one that has since been
+  /// replaced, and has had no answer. Ones that are too old, or belong to
+  /// another sign-in, are dropped.
+  void _resendPendingEnds() {
+    if (_pendingEnds.isEmpty) return;
+    final now = DateTime.now();
+    for (final entry in _pendingEnds.entries.toList()) {
+      final pending = entry.value;
+      if (now.difference(pending.since) > pendingEndWindow ||
+          pending.username != _username ||
+          pending.resends >= _pendingEndMaxResends) {
+        _pendingEnds.remove(entry.key);
+        continue;
+      }
+      // In flight on this very connection: its answer may still come.
+      if (pending.sentOn != null && identical(pending.sentOn, _socket)) continue;
+      pending.resends++;
+      _logger.info('Sending ${pending.method} again for call ${pending.callId}: the '
+          'connection was down when it went out');
+      pending.resend();
+    }
   }
 
   void _sendNextDtmf() {
@@ -1984,6 +2056,7 @@ class SIPService {
       _registrationState.value = SipRegistrationState.registered;
       _scheduleRegistrationRefresh(granted);
       _startKeepAlive();
+      _resendPendingEnds();
       onRegistered?.call();
       return;
     }
