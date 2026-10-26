@@ -179,10 +179,11 @@ the call screen and the push server are still example code. **iOS rings only whi
 app is in the foreground** for now (no PushKit/CallKit yet). See
 [doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md).
 
-The older call-control methods (`hold`, `resume`, `transfer(String)`, `addCall`,
-`swapCalls`, `mergeCalls`, `warmTransferStart`…) call routes such as `/hold-start` that
-only the Node reference server implements. They are unchanged; against the Playground
-server they only log a warning. Use `transferCall` for transfers.
+The older call-control methods (`transfer(String)`, `addCall`, `swapCalls`,
+`mergeCalls`, `warmTransferStart`…) call routes such as `/add-call` that only the Node
+reference server implements. They are unchanged; against the Playground server they
+only log a warning. Use `transferCall` for transfers. `hold` and `resume` are SIP
+re-INVITEs and work against Vobiz directly.
 
 ## Platform setup
 

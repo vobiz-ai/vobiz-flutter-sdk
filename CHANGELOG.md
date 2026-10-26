@@ -84,6 +84,18 @@ call was used. #58 lists what still needs a device.
   survives hold and applies before the mic opens (#43).
 - Keep-alive: the OPTIONS the registrar rejected is gone; a WebSocket ping every 15 s
   notices a dead connection within 30 s (#35).
+- Network loss: a BYE or CANCEL that could not reach Vobiz because the connection was
+  down is sent again as soon as the client has registered on a new connection. Before,
+  it was lost: a call that ended during an outage longer than the 12 s grace period
+  stayed up on the other side, silent and billed, until Vobiz timed the leg out about
+  5 minutes later, and a call given up while ringing kept ringing. Sent again at most
+  3 times, within 5 minutes, and only for the same SIP user; any final response ends it,
+  481 included. Verified live on Android (#3, #18).
+- Network loss: back from no network at all during a call (airplane mode, or Wi-Fi and
+  mobile data both off), the client replaces its connection at once. It used to keep a
+  socket that Android had left looking open, and reconnected only when that socket's
+  ping timed out, after the 12 s grace period had ended the call. Verified live: audio
+  back about 1 s after the network returned (#18).
 
 ### Changed
 
@@ -126,6 +138,13 @@ call was used. #58 lists what still needs a device.
   the SDK is reconnecting (it used to stay on IN CALL).
 - Push bridge: `POST /dtmf-test`, an answer URL that asks for four digits and reads
   back what Vobiz received, to check that keypad presses reach Vobiz.
+- An outgoing call still ringing when the network drops leaves the Ringing screen and
+  shows "Reconnecting..."; the app used to stay on Ringing after it had registered
+  again, with nothing left to hang up.
+- Push bridge: Vobiz returns at most 20 items a page whatever `limit` asks for, and the
+  bridge stepped through its lists by 100, so it read only the first page. It refused
+  endpoints past the 20th as not on the account, and created a second application when
+  its own was not on the first page. It now steps by what each page returned.
 
 ### Not done here
 

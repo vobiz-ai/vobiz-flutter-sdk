@@ -67,7 +67,9 @@ dialled.
 | `Future<void> hangup([String? callId])` | Ends the call |
 | `Future<void> mute([String? callId])`, `unmute(...)` | Microphone |
 | `Future<void> setSpeakerphone(bool enabled)` | Loudspeaker or earpiece |
-| `Future<void> sendDtmf(String digits)` | `0-9 * # A-D`, sent as `application/dtmf-relay` SIP INFO, 500 ms apart. `StateError` without a connected call |
+| `Future<void> sendDtmf(String digits, {DtmfTransport transport = DtmfTransport.auto})` | `0-9 * # A-D`. `auto`: RFC 4733 telephone-events in the audio when the call negotiated `telephone-event`, otherwise `application/dtmf-relay` SIP INFO, 500 ms apart. `StateError` without a connected call |
+| `Future<void> hold([String? callId])`, `resume(...)` | A re-INVITE with `a=sendonly` (hold) or `a=sendrecv` (resume). State `held` / `active`, `HoldChangedEvent`. Throws `VobizException` (`hold_failed` / `resume_failed`) when refused; the call carries on as it was |
+| `Future<void> audioInterruptionBegan()`, `audioInterruptionEnded({bool shouldResume = true})` | Another app's call took the microphone: holds the connected call, and resumes it after |
 | `Future<CallStats?> getCallStats()` | `rttMs`, `jitterMs`, `packetLossPercent` from WebRTC stats; a field is null until measured |
 | `static Map<String, String> buildCallHeaders({...})` | What `makeCall` would send for these options, validated. For checking a form |
 | `static String endpointUsername(String? value)` | `sip:play1@registrar.vobiz.ai` → `play1` |
@@ -105,10 +107,10 @@ travel in XML and are left out (logged). Returns the server's confirmation; thro
 
 ### Legacy call control
 
-`hold`, `resume`, `transfer(String to)`, `warmTransferStart`, `warmTransferComplete`,
-`addCall`, `startSecondCall`, `swapCalls`, `mergeCalls`, `endSecondCall` and
-`removeAddedCall` call routes such as `/hold-start` on `backendUrl`. Only the Node
-reference server implements them.
+`transfer(String to)`, `warmTransferStart`, `warmTransferComplete`, `addCall`,
+`startSecondCall`, `swapCalls`, `mergeCalls`, `endSecondCall` and `removeAddedCall`
+call routes such as `/add-call` on `backendUrl`. Only the Node reference server
+implements them. (`hold` and `resume` are SIP re-INVITEs now; see Calls.)
 
 ### Events
 
@@ -159,6 +161,10 @@ A connected (or held) call survives a short loss of network, audio included:
   `reason: 'reconnecting'` (its state does not change) and up to `networkLossGrace`
   (a `VobizClient` constructor argument, 12 s) to come back. A call still being set up
   ends at once with `network_lost`.
+- When the network returns after a complete outage (airplane mode, or Wi-Fi and mobile
+  data both off), the client opens a new connection at once. It does not wait for the
+  old one to report that it died: Android can leave a dead socket looking open until a
+  keep-alive ping times out, which takes longer than the grace period.
 - Once the client has registered again on a new connection, it restarts ICE: new ICE
   credentials and candidates gathered on the network the device has now, offered to
   Vobiz in an in-dialog re-INVITE on that connection. Vobiz then sends the call's later
@@ -168,12 +174,24 @@ A connected (or held) call survives a short loss of network, audio included:
 - When ICE connects the call gets `reason: 'reconnected'`. If it is not back in time
   the call ends with reason `network_lost` and an `ErrorEvent` `network_lost`.
 - Measured on Android against Vobiz: the audio is back about 1.4 s after the network
-  returns, and a switch between Wi-Fi and mobile data leaves a gap of about 2 s.
+  returns (about 1 s after a complete outage), and a switch between Wi-Fi and mobile
+  data leaves a gap of about 2 s.
 
-A device that stays offline cannot tell Vobiz that it gave up: its BYE never leaves
-the phone, and Vobiz keeps the other party connected, and billed, until its media
-servers time the call out (300 s in our tests). The example's push bridge shows one way
-to end such calls from a server (example/push_bridge/README.md, "Connection watch").
+A call that ends while the device is offline (its grace period ran out, or the user hung
+up) cannot tell Vobiz at that moment: its BYE, or the CANCEL of a call still ringing,
+never leaves the phone. The client keeps it and sends it again as soon as it has
+registered on a new connection, so the other party is hung up, or stops ringing, about
+a second after the network returns. It is sent again at most 3 times, within 5 minutes,
+and only while the same user is signed in; any final response ends it, a 481 (the call
+was already over) included. Two cases this cannot cover:
+
+- **The device stays offline.** Vobiz keeps the other party connected, and billed, until
+  its media servers time the call out (300 s in our tests). The example's push bridge
+  shows one way to end such calls from a server (example/push_bridge/README.md,
+  "Connection watch").
+- **The other party answered during the outage.** A CANCEL cannot end an answered call,
+  and the client never saw the answer, so it has no dialog to send a BYE in. Vobiz ends
+  the call by itself when its answer is never acknowledged (SIP allows 32 s for the ACK).
 
 ## Errors
 
