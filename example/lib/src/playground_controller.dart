@@ -259,6 +259,43 @@ class PlaygroundController extends ChangeNotifier {
   TransferStatus transferStatus = TransferStatus.idle;
   String transferError = '';
 
+  // ── Conference (push bridge) ────────────────────────────────────────────────
+  TransferTarget conferenceTarget = TransferTarget.number;
+  String conferenceIso = 'IN';
+  String conferenceNumber = '';
+  String conferenceUser = '';
+  bool conferenceBusy = false;
+  String conferenceError = '';
+
+  /// People added so far: the sheet keys its input fields with it, so they
+  /// are empty again after each add.
+  int conferenceAdds = 0;
+  VobizConference? _conference;
+  String? _conferenceToken;
+
+  /// The current call's conference, or null when it is not one.
+  VobizConferenceState? get conference => _conference?.state.value;
+
+  /// Who the conference sheet will dial: an E.164 number or a SIP username.
+  String get conferenceDestination => conferenceTarget == TransferTarget.user
+      ? VobizClient.endpointUsername(conferenceUser.trim())
+      : '${findCountry(conferenceIso).dial}$conferenceNumber';
+
+  /// Why the conference controls cannot be used, or null when they can. The
+  /// push bridge holds the Auth Token that moves calls into a room and dials
+  /// people, so it needs the bridge and this phone paired with it.
+  String? get conferenceBlocker {
+    if (bridgeConfig == null) {
+      return 'Conference goes through the push server: paste the line it prints under '
+          'Identity → Incoming calls.';
+    }
+    if (_bridgeDeviceToken == null) {
+      return 'Pair this phone with the push server first: turn on "Receive calls through the '
+          'push server" under Identity → Incoming calls.';
+    }
+    return null;
+  }
+
   // ── Incoming calls (push bridge) ────────────────────────────────────────────
   /// The line the push bridge prints: `https://<tunnel>#key=<key>`.
   String pushServer = '';
@@ -414,6 +451,8 @@ class PlaygroundController extends ChangeNotifier {
     for (final t in _pendingMissed.values) {
       t.cancel();
     }
+    _conference?.state.removeListener(notifyListeners);
+    _conference?.dispose();
     client.dispose();
     history.dispose();
     theme.dispose();
@@ -901,6 +940,110 @@ class PlaygroundController extends ChangeNotifier {
     }
     notifyListeners();
   }
+
+  /// The SDK's conference client for the paired push bridge, made on first
+  /// use and again when the bridge or this phone's token changes.
+  VobizConference? _conferenceClient() {
+    final config = bridgeConfig;
+    final token = _bridgeDeviceToken;
+    if (config == null || token == null) return null;
+    final existing = _conference;
+    if (existing != null && existing.serverUrl.toString() == config.baseUrl && _conferenceToken == token) {
+      return existing;
+    }
+    existing?.state.removeListener(notifyListeners);
+    existing?.dispose();
+    final conference = VobizConference(
+      client: client,
+      serverUrl: Uri.parse(config.baseUrl),
+      headers: () => <String, String>{'Authorization': 'Bearer $token'},
+      // A call the push bridge rang is known there by its own id (PushRef,
+      // the caller's leg); a call this app placed by its own CallUUID.
+      callUuid: () => pushRefFromHeaders(client.callHeaders) ?? client.callUuid,
+    );
+    conference.state.addListener(notifyListeners);
+    _conference = conference;
+    _conferenceToken = token;
+    return conference;
+  }
+
+  /// Dials [conferenceDestination] into a conference of the current call.
+  /// The first person added turns the call into the conference.
+  Future<void> conferenceAdd() async {
+    final conference = _conferenceClient();
+    if (conference == null) {
+      conferenceError = conferenceBlocker ?? '';
+      notifyListeners();
+      return;
+    }
+    final target = conferenceDestination;
+    final user = conferenceTarget == TransferTarget.user;
+    if (user ? !RegExp(r'^[a-zA-Z0-9_.\-+]{1,120}$').hasMatch(target) : !RegExp(r'^\+\d{7,15}$').hasMatch(target)) {
+      conferenceError = user ? 'Enter a SIP endpoint username, e.g. play123' : 'Enter a valid phone number';
+      notifyListeners();
+      return;
+    }
+    conferenceBusy = true;
+    conferenceError = '';
+    final first = conference.state.value == null;
+    log(first ? '👥 Making this call a conference and dialling $target…' : '👥 Dialling $target into the conference…',
+        LogType.event);
+    notifyListeners();
+    try {
+      final state = await conference.add(
+        number: user ? null : target,
+        sipUser: user ? target : null,
+        callerId: callerId.isEmpty ? null : callerId,
+      );
+      log('✅ Conference ${state.room}: dialling $target', LogType.success);
+      conferenceNumber = '';
+      conferenceUser = '';
+      conferenceAdds++;
+    } catch (e) {
+      conferenceError = _conferenceMessage(e);
+      log('❌ Conference: $conferenceError', LogType.error);
+    } finally {
+      conferenceBusy = false;
+      notifyListeners();
+    }
+  }
+
+  /// Mutes, unmutes, holds, resumes or removes one person in the conference.
+  Future<void> conferenceAct(VobizConferenceParticipant person, VobizParticipantAction action) async {
+    final conference = _conference;
+    if (conference == null) return;
+    conferenceError = '';
+    notifyListeners();
+    try {
+      await conference.act(person.id, action);
+      log('👥 ${person.label}: ${action.name}', LogType.event);
+    } catch (e) {
+      conferenceError = _conferenceMessage(e);
+      log('❌ Conference ${action.name} ${person.label}: $conferenceError', LogType.error);
+      notifyListeners();
+    }
+  }
+
+  /// Ends the conference for everyone, this call included.
+  Future<void> conferenceEnd() async {
+    final conference = _conference;
+    if (conference == null) return;
+    try {
+      await conference.end();
+      log('👥 Conference ended for everyone', LogType.event);
+    } catch (e) {
+      conferenceError = _conferenceMessage(e);
+      log('❌ Conference end: $conferenceError', LogType.error);
+      notifyListeners();
+    }
+  }
+
+  static String _conferenceMessage(Object e) => switch (e) {
+        VobizException(:final message) => message,
+        ArgumentError(:final message) => '$message',
+        StateError(:final message) => message,
+        _ => '$e',
+      };
 
   void _transferFailed(String message) {
     transferStatus = TransferStatus.failed;
