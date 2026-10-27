@@ -167,7 +167,60 @@ travel in XML and are left out (logged). Returns the server's confirmation; thro
 `transfer(String to)`, `warmTransferStart`, `warmTransferComplete`, `addCall`,
 `startSecondCall`, `swapCalls`, `mergeCalls`, `endSecondCall` and `removeAddedCall`
 call routes such as `/add-call` on `backendUrl`. Only the Node reference server
-implements them. (`hold` and `resume` are SIP re-INVITEs now; see Calls.)
+implements them. (`hold` and `resume` are SIP re-INVITEs now; see Calls.) For a
+conference, use `VobizConference` below.
+
+## VobizConference
+
+Turns the client's current call into a Vobiz conference room and manages the people in
+it, through your server (which holds the Auth Token).
+
+```dart
+VobizConference({
+  required VobizClient client,
+  required Uri serverUrl,                              // your server's base URL
+  FutureOr<Map<String, String>> Function()? headers,   // e.g. your Authorization
+  String? Function()? callUuid,                        // default: client.callUuid
+  http.Client? httpClient,
+  Duration pollInterval = const Duration(seconds: 2),
+  Duration timeout = const Duration(seconds: 15),
+  bool endCallWithConference = true,                   // hang up when the room ends
+})
+```
+
+When the conference ends (the server reports `active: false`, or `end()` returns), the
+client's call is hung up too unless `endCallWithConference` is false: the call's leg was in
+the room, and Vobiz's own hang-up does not always reach the phone.
+
+| Member | Notes |
+|---|---|
+| `ValueListenable<VobizConferenceState?> state` | The current call's conference; refreshed every `pollInterval` while it is on, null when the call is not one or has ended |
+| `Future<VobizConferenceState> add({String? number, String? sipUser, String? callerId})` | Dials one person in (E.164 `number` or a SIP username). The first call makes the call a conference: both of its sides move into a new room. Needs an answered call |
+| `mute(id)`, `unmute(id)`, `hold(id)`, `resume(id)`, `remove(id)` | One participant, by `VobizConferenceParticipant.id`. Hold takes them out of the room onto music |
+| `act(id, VobizParticipantAction action)` | The same, by value |
+| `Future<VobizConferenceState> end()` | Ends it for everyone, this call included |
+| `Future<VobizConferenceState?> refresh()` | Asks the server now; null when the call is not a conference |
+| `void dispose()` | Stops listening; closes the HTTP client if it made it |
+
+Refusals throw `VobizException` (`conference_failed`, with `statusCode`); malformed input
+throws `ArgumentError`, no answered call or no CallUUID `StateError`.
+
+`VobizConferenceState`: `room`, `active`, `participants`, `endedReason`, and `present`
+(the people still in it). `VobizConferenceParticipant`: `id`, `label`, `status`
+(`VobizParticipantStatus.connecting`, `dialing`, `joined`, `onHold`, `left`, `failed`),
+`isYou`, `role` (`host`, `guest`, `added`, `other`), `muted`, `reason`, `isPresent`.
+
+Server routes (JSON bodies; each answers with the state as JSON:
+`{room, active, ended_reason?, participants: [{id, label, you, role, status, muted, reason?}]}`):
+
+| Route | Body |
+|---|---|
+| `POST /conference/add` | `call_uuid`, `number` or `user`, optional `caller_id` |
+| `POST /conference/state` | `call_uuid` (404 when the call is not a conference) |
+| `POST /conference/participant` | `call_uuid`, `participant_id`, `action` (`mute`, `unmute`, `hold`, `resume`, `remove`) |
+| `POST /conference/end` | `call_uuid` |
+
+An error answers `{error, conference?}`.
 
 ### Events
 

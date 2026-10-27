@@ -30,6 +30,16 @@ call was used. #58 lists what still needs a device.
 
 ### Added
 
+- Conference: `VobizConference` turns the current call into a Vobiz conference room and
+  manages it through your server (which holds the Auth Token): `add` (a number or SIP
+  user; the first one moves both sides of the call into a new room), `mute`, `unmute`,
+  `hold` (out of the room onto music), `resume`, `remove`, `end`, and a polled `state`
+  with `VobizConferenceParticipant`s. Errors are `VobizException`
+  (`VobizErrorCode.conferenceFailed`). The four server routes are in API_REFERENCE.md.
+  When the conference ends, the call is hung up from the phone too
+  (`endCallWithConference`): in a live test a WebRTC gateway dropped the media server's
+  BYE, which came minutes after the call's last SIP message, and left the app on a dead
+  call.
 - Access-token (JWT) sign-in, as the web SDK's `loginWithAccessToken` /
   `loginWithAccessTokenGenerator` and the Vobiz WebRTC demo: `connectWithAccessToken`,
   `connectWithAccessTokenProvider` (renews the token 60 s before it expires and asks
@@ -119,6 +129,13 @@ call was used. #58 lists what still needs a device.
 
 ### Example app and push bridge
 
+- Conference: an **Add** button on the call screen opens a conference sheet (add a
+  number or SIP user, see who is in the room, mute, hold, resume or remove each person,
+  end it for everyone). The push bridge implements the routes: it moves the call into a
+  room with the Transfer API (`legs=both`), dials people with the Call API, keeps the
+  members from Vobiz's enter and exit callbacks, holds a person on looping music outside
+  the room, and ends the room when the app leaves or nobody else is left. Every leg
+  joins with `stayAlone="true"`.
 - An **Access token** sign-in tab: a token from your token server (the Vobiz WebRTC
   demo's `/token` works) or the push bridge's `POST /token`, which mints it through the
   Vobiz API with `JWT_SUB`, `JWT_TTL_SECONDS` and `JWT_APP_ID`. The bridge registers a
