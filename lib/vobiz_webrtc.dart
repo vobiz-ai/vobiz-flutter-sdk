@@ -46,6 +46,7 @@ export 'src/models/auth/zero_config_session.dart';
 // ── Calls ─────────────────────────────────────────────────────────────────────
 export 'src/calls/call_actions.dart';
 export 'src/calls/call_session.dart';
+export 'src/conference/vobiz_conference.dart';
 
 // ── Push ──────────────────────────────────────────────────────────────────────
 export 'src/push/vobiz_push.dart';

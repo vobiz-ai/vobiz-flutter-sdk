@@ -49,6 +49,10 @@ abstract final class VobizErrorCode {
   /// app's token provider failed, or the token does not allow what was
   /// asked. See [VobizAccessTokenException].
   static const String accessTokenFailed = 'access_token_failed';
+
+  /// A conference request failed: your conference server could not be
+  /// reached, or it refused (see [VobizException.statusCode]).
+  static const String conferenceFailed = 'conference_failed';
 }
 
 /// An SDK operation failed.
