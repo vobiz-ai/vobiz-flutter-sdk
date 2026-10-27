@@ -246,6 +246,48 @@ curl -X POST "https://api.vobiz.ai/api/v1/Account/$VOBIZ_AUTH_ID/Call/" \
 
 The bridge logs `Vobiz received "1234"` and reads the digits back to the caller.
 
+## Conference
+
+The app's **Add** button (the SDK's `VobizConference`) asks the bridge to make the call
+a conference. Vobiz mixes conferences in rooms (`<Conference>`); the bridge does the
+REST calls, since they need the Auth Token:
+
+1. **The first add** moves both sides of the app's call into a new room
+   `vc-<call>-<random>` with the Transfer API (`legs=both`): the app's leg as the host
+   (`endConferenceOnExit="true"`), the other side as a guest. The phone's own SIP call
+   is not touched, so its audio carries on through the room.
+2. **Each add** dials the person (`POST /Call/`, `from` = the app's caller ID or
+   `VOBIZ_NUMBER`); when they answer, Vobiz asks `/conf-room/…` for their XML, which is
+   the same room.
+3. **Who is in the room** comes from the room's enter and exit callbacks
+   (`/conf-events/…`) and the dialled calls' `hangup_url` (`/conf-dial/…`): Vobiz's read
+   API does not list a live room's members.
+4. **Mute and unmute** use the member API. **Hold** transfers the person's leg out of
+   the room onto `/hold.wav` (looped `<Play loop="0">`); **resume** transfers it back,
+   as a new member (muted again if they were). **Remove** hangs up their leg.
+5. **The room ends** when the app's leg leaves (Vobiz kicks everyone), when the app asks
+   (`/conference/end`), when nobody but the app is left (in the room, ringing or on
+   hold), or when the connection watch gives up on the app. People on hold and calls
+   still ringing are hung up too.
+
+Every leg joins with `stayAlone="true"`: Vobiz otherwise drops a member who is alone in
+the room, even for the moment both sides of the call are moving in. A conference holds
+at most 20 people (the account's `max_conf_members`). The connection-lost beep is not
+played in a conference: the call's legs are no longer bridged to each other.
+
+| Request | Auth | Body | Response |
+|---|---|---|---|
+| `/conference/add` | `Authorization: Bearer <device_token>`, or `X-Bridge-Key` | `{call_uuid, number \| user, caller_id?}` (with the bridge key also `host_leg`: `aleg` or `bleg`) | the state; 400 bad input, 403 not this phone's live call, 409 room full, 502 Vobiz refused |
+| `/conference/state` | same | `{call_uuid}` | the state; 404 not a conference |
+| `/conference/participant` | same | `{call_uuid, participant_id, action}`, `action` = `mute`, `unmute`, `hold`, `resume`, `remove` | the state; 409 not possible now (e.g. not in the room) |
+| `/conference/end` | same | `{call_uuid}` | the state, `active: false` |
+
+The state: `{room, active, ended_reason?, participants: [{id, label, you, role, status,
+muted, reason?}]}` with `role` `host` (the app), `guest`, `added` or `other`, and
+`status` `connecting`, `dialing`, `joined`, `on_hold`, `left` or `failed`. `call_uuid` is
+the id the app reports to `/call/alive`: its own CallUUID for a call it placed, the
+`PushRef` for a call this bridge rang. A phone may act only on calls its endpoint is on.
+
 ## App ↔ bridge protocol
 
 All app requests are JSON `POST`s. `<device_token>` is what pairing returned.
