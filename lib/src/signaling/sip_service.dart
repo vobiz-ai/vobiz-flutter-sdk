@@ -1127,6 +1127,16 @@ class SIPService {
     _endCall();
   }
 
+  /// Forgets the established call without signalling it. For a call the far
+  /// end no longer has: it answered a request within the dialog with 481
+  /// (Call/Transaction Does Not Exist), so a BYE would only be refused too.
+  /// RFC 3261 12.2.1.2: the UAC SHOULD then terminate the dialog.
+  void abandonCall() {
+    if (_activeCallId == null) return;
+    _endCall();
+    onCallEnded?.call('The call no longer exists');
+  }
+
   void hangup() {
     _releaseReservation();
 

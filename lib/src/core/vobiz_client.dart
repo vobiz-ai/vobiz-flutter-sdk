@@ -1584,6 +1584,20 @@ class VobizClient {
         _logger.info('ICE restart for call $id answered; waiting for ICE');
       } catch (e) {
         if (_callId != id) return; // the call ended meanwhile
+        if (e is SipRequestFailed && e.statusCode == 481) {
+          // Vobiz no longer has this call: it ended while the phone was
+          // offline (the far end hung up, or the call was transferred
+          // away). End it now rather than waiting out the grace period, and
+          // send no BYE: it would only be refused too (RFC 3261 12.2.1.2).
+          _logger.warn('ICE restart for call $id refused with 481: the call '
+              'no longer exists; ending it');
+          final cleanup = _cleanupCall(id,
+              message: 'The call ended while the connection was down',
+              reason: 'ended_while_offline');
+          _sip.abandonCall();
+          await cleanup;
+          return;
+        }
         _logger.warn('ICE restart for call $id refused: $e');
         await _peer.abortIceRestart();
       }
