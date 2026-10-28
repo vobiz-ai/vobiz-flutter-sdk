@@ -118,6 +118,9 @@ call was used. #58 lists what still needs a device.
 
 ### Changed
 
+- Push bridge: a conference ends for everyone `CONF_HOST_LOST_SECONDS` (2 s) after the host
+  app stops reporting, as a phone call ends when one side drops. It used to wait for the
+  one-to-one call's `LOST_HANGUP_SECONDS` (15 s), which one-to-one calls still use.
 - `TokenConfig` is deprecated: it is a SIP password, not an access token. For access
   tokens use `connectWithAccessToken` (#29).
 - `hold()`/`resume()` throw when there is no call or Vobiz refuses; legacy
