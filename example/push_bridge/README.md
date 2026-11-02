@@ -155,6 +155,7 @@ Disconnecting in the app unregisters the phone; closing the app does not.
 | `ALLOW_UNSIGNED_WEBHOOKS` | `false` | `true` accepts webhooks without a Vobiz signature. Local tests only |
 | `LOST_BEEP_SECONDS` | `3` | Connection watch: seconds without an "alive" report from the app before the other party hears the connection-lost beep. Clamped to 2–10 |
 | `LOST_HANGUP_SECONDS` | `15` | Connection watch: seconds without a report before the bridge ends the call (the SDK gives up at 12 s, but an offline phone's hangup cannot reach Vobiz). Clamped to 5–300; `0` never ends it |
+| `CONF_HOST_LOST_SECONDS` | `2` | Connection watch, conferences: seconds without a report from the host app before the bridge ends the whole room, as a phone call ends when one side drops. A Wi-Fi ↔ mobile data switch can take about 2 s, and may end the room. Clamped to 1–300 |
 | `JWT_SUB` | `flutter-app` | Access tokens: the user id (`sub`) `POST /token` mints for when the app sends none. The app registers as `<sub>_<VOBIZ_AUTH_ID>` |
 | `JWT_TTL_SECONDS` | `3600` | Access tokens: lifetime, clamped to 180–86400 (the platform's limits). The SDK renews 60 s before expiry |
 | `JWT_APP_ID` | — | Access tokens: the application whose Answer URL handles the app's outbound calls (the `app` claim). Without it, the account's default application. The bridge's own application only rings phones, so point this at the one your outbound calls use (the Playground application, for example) |
@@ -267,8 +268,9 @@ REST calls, since they need the Auth Token:
    as a new member (muted again if they were). **Remove** hangs up their leg.
 5. **The room ends** when the app's leg leaves (Vobiz kicks everyone), when the app asks
    (`/conference/end`), when nobody but the app is left (in the room, ringing or on
-   hold), or when the connection watch gives up on the app. People on hold and calls
-   still ringing are hung up too.
+   hold), or `CONF_HOST_LOST_SECONDS` (2 s) after the app's phone stops reporting
+   (the connection watch): like a phone call, the call ends for everyone when its
+   host drops. People on hold and calls still ringing are hung up too.
 
 Every leg joins with `stayAlone="true"`: Vobiz otherwise drops a member who is alone in
 the room, even for the moment both sides of the call are moving in. A conference holds

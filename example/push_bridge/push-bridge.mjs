@@ -71,6 +71,9 @@ export function createBridge(options = {}) {
     // ...and after this long the call is ended: the SDK gives up at 12 s, but
     // its hangup cannot leave an offline phone. 0 never ends it.
     lostHangupSeconds: env.LOST_HANGUP_SECONDS === '0' ? 0 : clampInt(env.LOST_HANGUP_SECONDS, 15, 5, 300),
+    // A conference ends with its host, as a phone call does when one side
+    // drops: this long after the app's last report the whole room is ended.
+    confHostLostSeconds: clampInt(env.CONF_HOST_LOST_SECONDS, 2, 1, 300),
     // Access tokens (POST /token): who the app signs in as ("<sub>_<auth id>"),
     // for how long (180 s to 24 h, the platform's limits), and which
     // application's Answer URL handles its outbound calls (else the account's
@@ -1246,6 +1249,7 @@ export function createBridge(options = {}) {
   const watchLookups = new Map();
   const lostBeepMs = deps.lostBeepMs ?? config.lostBeepSeconds * 1000;
   const lostHangupMs = deps.lostHangupMs ?? config.lostHangupSeconds * 1000;
+  const confHostLostMs = deps.confHostLostMs ?? config.confHostLostSeconds * 1000;
 
   async function onCallAlive(req, res) {
     const device = deviceFromRequest(req);
@@ -1310,7 +1314,10 @@ export function createBridge(options = {}) {
     for (const watch of watched.values()) {
       if (watch.busy) continue;
       const silent = now - watch.lastSeen;
-      if (lostHangupMs && silent >= lostHangupMs) void endLostCall(watch, silent);
+      // The app hosts a conference: the room ends CONF_HOST_LOST_SECONDS after
+      // its last report, not after the one-to-one call's reconnect window.
+      const hangupMs = activeRoomOf(watch.uuid) ? confHostLostMs : lostHangupMs;
+      if (hangupMs && silent >= hangupMs) void endLostCall(watch, silent);
       else if (silent >= lostBeepMs && !watch.beeping && !watch.beepFailed) void startBeep(watch, silent);
     }
   }

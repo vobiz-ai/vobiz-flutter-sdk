@@ -272,19 +272,22 @@ test('room webhooks must be signed and their paths written by the bridge', async
   }
 });
 
-test('in a conference the connection watch does not beep, and a lost app ends the room', async () => {
+test('in a conference the connection watch does not beep, and a lost host ends the room after CONF_HOST_LOST_SECONDS', async () => {
   const ctx = await startBridge({
     env: { VOBIZ_NUMBER: CALLER_ID },
     apiHandler: vobiz(),
-    deps: { lostBeepMs: 100, lostHangupMs: 600, watchTickMs: 20 },
+    // The one-to-one reconnect window is far longer: the room must not wait for it.
+    deps: { lostBeepMs: 100, lostHangupMs: 30000, confHostLostMs: 300, watchTickMs: 20 },
   });
   try {
     const alice = await registerDevice(ctx, 'alice');
     const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice.auth);
     assert.equal(added.status, 200);
     await postJson(ctx, '/call/alive', { call_uuid: CALL }, alice.auth);
+    const lastReport = Date.now();
     const ended = await until(() => calls(ctx, 'DELETE', `/Conference/${added.json.room}/`)[0], 3000);
-    assert.ok(ended, 'the room was ended once the app was past its reconnect window');
+    assert.ok(ended, 'the room was ended once the host had been silent for CONF_HOST_LOST_SECONDS');
+    assert.ok(Date.now() - lastReport >= 300, 'not before the host had been silent that long');
     assert.equal(calls(ctx, 'POST', `/Call/${CALL}/Play/`).length, 0, 'no beep into a conference');
     await sleep(50);
     assert.equal(calls(ctx, 'DELETE', `/Call/${CALL}/`).length, 0, 'the room is ended, not one leg');
