@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Incoming calls to a closed app through Vobiz's own push** (Android), for Vobiz's
+  server side that holds a call and pushes the called SIP user's phones:
+  `VobizPushDevices` (register and log out a phone for its SIP user),
+  `VobizIncomingPush.hold` (`index`, `label`, `registrar`), `client.handleIncomingPush`
+  (the next REGISTER claims the held call with `X-Index`, `X-Label` and
+  `X-vobiz-Registrar-Info`), `reportCallScreenAccepted`/`reportCallScreenDeclined`,
+  `pushCallUpdates`, `CallEvent.sipCallId`, `VobizClient.sdkVersion`. The example app
+  has it under *Incoming calls → Vobiz push*. See doc/PUSH_DESIGN.md.
+
+### Fixed
+
+- A push's `expires_at` in Unix seconds (as Vobiz sends it) is no longer read as
+  milliseconds, which made every such push stale on arrival.
+
 Fixes from the end-to-end review of 0.2.0 (tracking issue #56). Verified with unit
 tests (SDK, example app and push bridge) only: no device, emulator or live Vobiz
 call was used. #58 lists what still needs a device.

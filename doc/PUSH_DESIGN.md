@@ -1,6 +1,7 @@
 # Incoming-call push: design note
 
-Status: **design**. Only the plugin-free payload API below ships today.
+Status: **design**, with the Vobiz-side path built (see "Vobiz's own push" below).
+The plugin-free payload API ships today.
 
 ## The problem
 
@@ -64,6 +65,41 @@ Design rules:
   so it reuses cached per-user credentials and never rotates them (issue #14).
 - Correlation is by an opaque push reference carried both in the push and on the
   INVITE; caller-number matching is only the fallback.
+
+## Vobiz's own push (built, waiting on Vobiz's deploy)
+
+Vobiz's platform team built the server side (push-service PR #2 and a registrar change
+in sip-trunking-infrastructure):
+
+1. A call comes in for a SIP user with no live registration.
+2. The registrar holds the call for up to 30 s and asks push-service to push the
+   devices registered for that SIP user (`/v1/notify/voip` with `endpoint`).
+3. The app wakes and REGISTERs with the hold reference from the push.
+4. The registrar sends the held INVITE to the new registration, with the push's
+   `call_id` as its Call-ID.
+
+What the SDK does for it:
+
+| Step | API |
+|---|---|
+| Register the phone for its SIP user | `VobizPushDevices.register(VobizPushDevice(...))`, `POST /api/v1/devices/register`; `logout` at sign-out |
+| Read the push | `VobizIncomingPush.tryParse`: `index`, `label`, `registrar` become `hold`; `expires_at` is Unix **seconds** (the bridge sends milliseconds; told apart by size) |
+| Claim the held call | `client.handleIncomingPush(push)`: the next REGISTER (at once when registered, else the sign-in's) carries `X-Index`, `X-Label`, `X-vobiz-Registrar-Info`, its digest answer too, and only that REGISTER |
+| Tie the INVITE to the push | Call-ID equal to the push's `call_id` (`CallEvent.sipCallId`, `client.isPushedCall`); never by number |
+| Call screen | `reportCallScreenAccepted` answers on arrival; `reportCallScreenDeclined` claims and then turns the call away, so the caller hears busy at once |
+| Expiry | `pushCallUpdates` reports `expired` when no INVITE came by `expires_at` |
+
+Open on Vobiz's side (from the SDK work, 2026-11-12):
+
+- The gateway answers `/v1/devices/register` with 404; `/api/v1/devices/register`
+  reaches push-service.
+- Device registration takes the account's Auth ID and Auth Token: there is no
+  endpoint-scoped sign-in for apps yet.
+- No way to decline a held call without claiming it.
+- A REGISTER that lands on another registrar is forwarded by SIP MESSAGE, and the
+  holding registrar answers the INVITE with a 302: whether the new INVITE keeps the
+  Call-ID decides whether the SDK can match it.
+- `expires_at` depends on the phone's clock agreeing with the server's.
 
 ## Platform work this depends on
 
