@@ -19,14 +19,21 @@ class PushPanel extends StatefulWidget {
 
 class _PushPanelState extends State<PushPanel> {
   late final TextEditingController _server = TextEditingController(text: widget.controller.pushServer);
+  late final TextEditingController _pushAuthId = TextEditingController(text: widget.controller.pushAuthId);
+  late final TextEditingController _pushAuthToken = TextEditingController(text: widget.controller.pushAuthToken);
   bool _showServer = false;
   String? _error;
 
   @override
   void dispose() {
     _server.dispose();
+    _pushAuthId.dispose();
+    _pushAuthToken.dispose();
     super.dispose();
   }
+
+  Future<void> _savePushAccount() => widget.controller
+      .setPushAccount(authId: _pushAuthId.text, authToken: _pushAuthToken.text);
 
   Future<void> _save([String? value]) async {
     final error = await widget.controller.setPushServer(value ?? _server.text);
@@ -150,9 +157,95 @@ class _PushPanelState extends State<PushPanel> {
             icon: const Icon(Icons.notifications_active_outlined, size: 16),
             label: const Text('Send a test call in 10 s'),
           ),
+          const SizedBox(height: 14),
+          Divider(color: pg.border, height: 1),
+          const SizedBox(height: 12),
+          ..._vobizPush(c, pg),
         ],
       ),
     );
+  }
+
+  /// Ringing a closed app through Vobiz's own push, with no push server:
+  /// Vobiz holds the call, pushes, and sends it to the REGISTER that claims it.
+  List<Widget> _vobizPush(PlaygroundController c, PlaygroundColors pg) {
+    final (chipText, chipColor) = switch (c.vobizPushState) {
+      PushState.off => ('OFF', pg.faint),
+      PushState.registering => ('REGISTERING', pg.muted),
+      PushState.ready => ('REGISTERED', pg.success),
+      PushState.failed => ('ERROR', pg.danger),
+    };
+    return <Widget>[
+      Row(children: <Widget>[
+        Icon(Icons.cloud_outlined, size: 15, color: pg.accent.withValues(alpha: 0.85)),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text('VOBIZ PUSH',
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
+        ),
+        Chip2(chipText, color: chipColor),
+      ]),
+      const SizedBox(height: 8),
+      Text(
+        'Ring this phone for calls to the SIP user you sign in as, with no push server: Vobiz '
+        'holds the call, pushes this phone, and the app claims the call as it signs in. Needs '
+        "Vobiz's server side for it, and this app's Firebase key under Push Notifications in "
+        'the Vobiz Console.',
+        style: TextStyle(fontSize: 11, height: 1.45, color: pg.muted),
+      ),
+      Row(children: <Widget>[
+        Expanded(child: Text('Receive calls through Vobiz push', style: TextStyle(fontSize: 13, color: pg.text))),
+        Switch(key: const Key('vobizPush'), value: c.vobizPush, onChanged: c.setVobizPush),
+      ]),
+      if (c.vobizPush) ...<Widget>[
+        Text(
+          'TEST ONLY: registering this phone takes the account\'s Auth ID and Auth Token (its API '
+          'key). Vobiz has no device sign-in for apps yet. Left empty, the Zero-Config ones are used.',
+          style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.warning),
+        ),
+        const SizedBox(height: 8),
+        TextField(
+          key: const Key('pushAuthId'),
+          controller: _pushAuthId,
+          autocorrect: false,
+          enableSuggestions: false,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          decoration: const InputDecoration(labelText: 'Account Auth ID', hintText: 'MA_…'),
+          onSubmitted: (_) => _savePushAccount(),
+        ),
+        const SizedBox(height: 6),
+        TextField(
+          key: const Key('pushAuthToken'),
+          controller: _pushAuthToken,
+          obscureText: true,
+          autocorrect: false,
+          enableSuggestions: false,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          decoration: const InputDecoration(labelText: 'Account Auth Token (test only)'),
+          onSubmitted: (_) => _savePushAccount(),
+        ),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(key: const Key('savePushAccount'), onPressed: _savePushAccount, child: const Text('Save')),
+        ),
+      ],
+      if (c.vobizPushDetail.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Text(c.vobizPushDetail,
+              style: TextStyle(
+                  fontSize: 11,
+                  height: 1.4,
+                  color: c.vobizPushState == PushState.failed ? pg.danger : pg.muted)),
+        ),
+      OutlinedButton.icon(
+        key: const Key('vobizTestPush'),
+        onPressed: c.vobizPushState == PushState.ready ? c.sendVobizTestPush : null,
+        icon: const Icon(Icons.notifications_active_outlined, size: 16),
+        label: const Text('Send a test push through Vobiz'),
+      ),
+    ];
   }
 
   /// One requirement: a tick, a cross, or a dash while unknown.

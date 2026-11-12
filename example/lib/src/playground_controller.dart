@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show Random;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
@@ -335,6 +336,29 @@ class PlaygroundController extends ChangeNotifier {
 
   PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer);
 
+  // ── Incoming calls (Vobiz push, no push bridge) ─────────────────────────────
+  /// Register this phone with Vobiz's own push service after signing in. A
+  /// call to the signed-in SIP user then wakes the app when it is closed:
+  /// Vobiz's registrar holds the call, pushes, and sends it to the REGISTER
+  /// that claims it. Needs Vobiz's server side for it (registrar and
+  /// push-service), and the app's Firebase key saved in the Vobiz Console.
+  bool vobizPush = false;
+  PushState vobizPushState = PushState.off;
+  String vobizPushDetail = '';
+
+  /// The account's Auth ID and Auth Token, to register this phone with
+  /// Vobiz push. TEST ONLY: the Auth Token is the account's API key, and
+  /// Vobiz has no device sign-in for apps yet. Empty, the Zero-Config fields
+  /// are used. Kept in secure storage with "Remember me", like those.
+  String pushAuthId = '';
+  String pushAuthToken = '';
+
+  /// This install's id with Vobiz push, made once and kept.
+  String? _pushDeviceId;
+
+  /// The app's package name: Vobiz pushes with the Firebase key saved for it.
+  static const String appBundleId = 'ai.vobiz.vobiz_webrtc_example';
+
   /// This phone's own token with the push bridge, from pairing.
   String? _bridgeDeviceToken;
 
@@ -399,6 +423,10 @@ class PlaygroundController extends ChangeNotifier {
   static const String _kPushServer = 'vobiz_push_server';
   static const String _kReceiveCalls = 'vobiz_playground_receive_calls';
   static const String _kPushDevice = 'vobiz_push_device_token';
+  static const String _kVobizPush = 'vobiz_playground_vobiz_push';
+  static const String _kPushInstallId = 'vobiz_push_install_id';
+  static const String _kPushAuthId = 'vobiz_push_auth_id';
+  static const String _kPushAuthToken = 'vobiz_push_auth_token';
 
   Future<void> init() async {
     try {
@@ -417,7 +445,11 @@ class PlaygroundController extends ChangeNotifier {
     _subs.add(push.foregroundCalls.listen(_onPush));
     _subs.add(platform.pushes.listen(_onPushData));
     _subs.add(platform.hangUpRequests.listen((_) => hangup()));
-    _subs.add(push.tokenRefresh.listen((_) => _registerWithBridge(quiet: true)));
+    _subs.add(push.tokenRefresh.listen((_) {
+      _registerWithBridge(quiet: true);
+      _registerWithVobizPush(quiet: true);
+    }));
+    _subs.add(client.pushCallUpdates.listen(_onPushCallUpdate));
     notifyListeners();
     // The push that started the app (closed app), if any: handled before
     // anything else so its call screen rings and sign-in starts at once.
@@ -667,6 +699,7 @@ class PlaygroundController extends ChangeNotifier {
     log('Logging out...', LogType.info);
     // Signing out means "stop ringing this phone"; closing the app does not.
     await _unregisterFromBridge(client.sipUsername ?? connectedAs);
+    await _logoutFromVobizPush();
     // Stop renewing the access token before the client lets go of it.
     await _stopTokenSession();
     await client.disconnect();
@@ -682,9 +715,10 @@ class PlaygroundController extends ChangeNotifier {
 
   Future<void> _forgetCredentials() async {
     try {
-      for (final key in <String>[_kAuthId, _kAuthToken, _kSipUser, _kSipPass]) {
+      for (final key in <String>[_kAuthId, _kAuthToken, _kSipUser, _kSipPass, _kPushAuthId, _kPushAuthToken]) {
         await _secure.delete(key: key);
       }
+      pushAuthToken = '';
     } catch (e) {
       log('Could not remove the saved credentials: $e', LogType.warning);
     }
@@ -1233,7 +1267,7 @@ class PlaygroundController extends ChangeNotifier {
   /// out. Only a call the bridge pushed can be declined there: the push
   /// carries the call's key.
   Future<void> _tellBridgeDeclined(PushCall? pushed) async {
-    if (pushed == null || pushed.isTest) return;
+    if (pushed == null || pushed.isTest || pushed.isVobiz) return;
     await _quietly(() => PushBridgeApi.decline(pushed));
   }
 
@@ -1303,6 +1337,10 @@ class PlaygroundController extends ChangeNotifier {
     switch (event) {
       case ck.CallEventActionCallAccept(:final callKitParams):
         final pushed = PushCall.fromExtra(callKitParams.extra);
+        if (pushed != null && pushed.isVobiz) {
+          await _acceptVobizHeldCall(pushed, callKitParams.id);
+          return;
+        }
         final ringingHere = client.callState == CallStateStatus.incoming &&
             (callKitParams.id == _callScreenId ||
                 pushRefFromHeaders(client.callHeaders) == callKitParams.id);
@@ -1320,6 +1358,10 @@ class PlaygroundController extends ChangeNotifier {
         }
       case ck.CallEventActionCallDecline(:final callKitParams):
         final pushed = PushCall.fromExtra(callKitParams.extra);
+        if (pushed != null && pushed.isVobiz && !_isRingingHere(callKitParams.id)) {
+          await _declineVobizHeldCall(pushed);
+          return;
+        }
         if (_acceptedCall?.callId == callKitParams.id) _clearAcceptedCall();
         if (_isRingingHere(callKitParams.id)) {
           _callScreenPush = pushed ?? _callScreenPush;
@@ -1416,6 +1458,10 @@ class PlaygroundController extends ChangeNotifier {
       );
       return;
     }
+    if (call.isVobiz) {
+      _onVobizHeldCall(call);
+      return;
+    }
     final ring = _inbound;
     if (ring != null && ring.id == call.callId) {
       // Already ringing over SIP, with its call screen.
@@ -1458,7 +1504,7 @@ class PlaygroundController extends ChangeNotifier {
     }
     await callScreen.showIncoming(
       id: call.callId,
-      caller: call.caller,
+      caller: call.displayCaller,
       subtitle: call.callee.isEmpty ? 'Vobiz call' : 'Calling ${call.callee}',
       extra: call.toExtra(),
     );
@@ -1518,6 +1564,310 @@ class PlaygroundController extends ChangeNotifier {
     ));
   }
 
+  // ── Calls Vobiz holds while its push wakes this phone ──────────────────────
+
+  /// A push from Vobiz itself: its registrar holds the call (up to 30 s) until
+  /// this phone claims it with a REGISTER carrying the push's hold reference.
+  /// The SDK makes that claim: on the open connection when signed in, else on
+  /// the sign-in this starts.
+  void _onVobizHeldCall(PushCall call) {
+    final sdk = call.sdkPush;
+    if (sdk == null) return;
+    _ringingPushes[call.callId] = call;
+    final busyHere = client.callState != CallStateStatus.idle && client.callState != CallStateStatus.ended;
+    if (busyHere) {
+      // Vobiz does not hold calls for a phone that is registered, so this is a
+      // race: claim it anyway, and the SDK turns it away busy at once.
+      log('📞 ${call.displayCaller} is calling while you are on a call: they hear busy', LogType.warning);
+      client.handleIncomingPush(sdk);
+      return;
+    }
+    unawaited(_showPushedCall(call));
+    client.handleIncomingPush(sdk);
+    if (client.isConnected) {
+      log('📲 Vobiz push: a call from ${call.displayCaller}. Signed in already: claiming it on this connection',
+          LogType.info);
+      return;
+    }
+    if (!_hasSavedSignIn) {
+      log('📲 Call from ${call.displayCaller}. Sign in to take it (no saved sign-in).', LogType.warning);
+      return;
+    }
+    log('📲 Vobiz push: a call from ${call.displayCaller}. Signing in to claim the call Vobiz is holding',
+        LogType.event);
+    unawaited(connect());
+  }
+
+  /// Accept on the call screen of a call Vobiz holds. The SDK answers it as
+  /// soon as its INVITE arrives (at once if it already rings).
+  Future<void> _acceptVobizHeldCall(PushCall call, String screenId) async {
+    final sdk = call.sdkPush;
+    if (sdk == null || !_takenCalls.add(call.callId)) return;
+    _ringingPushes[call.callId] = call;
+    _callScreenId = screenId;
+    _callScreenAccepted = true;
+    _callScreenPush = call;
+    onTabRequest?.call(1);
+    log('📲 Accepted the call from ${call.displayCaller} on the call screen', LogType.event);
+    // Accept is the user's tap: the moment Android allows the call's
+    // microphone service to start.
+    _startCallService(outbound: false, caller: call.displayCaller);
+    client.reportCallScreenAccepted(sdk);
+    if (client.isConnected || status == PhoneStatus.connecting) {
+      if (client.callState != CallStateStatus.incoming) log('Waiting for the call Vobiz is holding...', LogType.info);
+      return;
+    }
+    if (!_hasSavedSignIn) {
+      log('❌ Cannot take the call: no saved sign-in. Tick "Remember me" and connect once.', LogType.error);
+      _endCallScreen();
+      _stopCallService();
+      return;
+    }
+    log('Signing in to take the call...', LogType.info);
+    await connect();
+  }
+
+  /// Decline on the call screen of a call Vobiz holds that has not rung here
+  /// yet. Vobiz has no way to decline a held call without claiming it, so the
+  /// claim still goes and the SDK turns the call away when it arrives: the
+  /// caller hears busy at once instead of ringing out the 30 s hold.
+  Future<void> _declineVobizHeldCall(PushCall call) async {
+    final sdk = call.sdkPush;
+    if (sdk == null) return;
+    _ringingPushes.remove(call.callId);
+    log('📵 Declined the call from ${call.displayCaller}', LogType.warning);
+    _logCall(CallRecord(
+      id: call.callId,
+      inbound: true,
+      party: call.displayCaller,
+      at: DateTime.now(),
+      outcome: CallOutcome.declined,
+    ));
+    client.reportCallScreenDeclined(sdk);
+    if (!client.isConnected && status != PhoneStatus.connecting && _hasSavedSignIn) {
+      log('Signing in to turn the call away...', LogType.info);
+      await connect();
+    }
+  }
+
+  /// What became of a call Vobiz held: claimed, arrived, or never came.
+  void _onPushCallUpdate(VobizPushCallUpdate update) {
+    switch (update.status) {
+      case VobizPushCallStatus.claiming:
+        break;
+      case VobizPushCallStatus.claimed:
+        log('📲 Vobiz took the claim (REGISTER with X-Index/X-Label): the held call should arrive now',
+            LogType.info);
+      case VobizPushCallStatus.ringing:
+        log('📲 The call Vobiz held arrived (Call-ID ${update.push.callId})', LogType.event);
+      case VobizPushCallStatus.answering:
+        break;
+      case VobizPushCallStatus.declining:
+        log('📵 Turning away the call declined on the call screen: the caller hears busy', LogType.warning);
+      case VobizPushCallStatus.expired:
+        final id = update.push.callId;
+        final call = _ringingPushes.remove(id);
+        final accepted = _callScreenAccepted && _callScreenId == id;
+        log('📵 The call Vobiz held did not arrive before the push expired'
+            '${accepted ? ' (it was accepted on the call screen)' : ''}', LogType.warning);
+        if (_callScreenId == id) {
+          _endCallScreen();
+        } else {
+          unawaited(_closeCallScreen(id));
+        }
+        if (accepted) _stopCallService();
+        _logCall(CallRecord(
+          id: id,
+          inbound: true,
+          party: call?.displayCaller ?? update.push.callerNumber,
+          at: DateTime.now(),
+          outcome: CallOutcome.missed,
+        ));
+    }
+  }
+
+  /// Turns "ring this phone through Vobiz push" on or off.
+  Future<void> setVobizPush(bool on) async {
+    vobizPush = on;
+    await _prefs?.setBool(_kVobizPush, on);
+    notifyListeners();
+    if (on) {
+      await requestCallPermissions();
+      if (!rememberMe) {
+        log('⚠️ Tick "Remember me" and sign in again: with the app closed, a call can only '
+            'be answered if the app can sign itself in.', LogType.warning);
+      }
+      if (client.isConnected) {
+        await _registerWithVobizPush();
+      } else {
+        vobizPushDetail = 'Connect to register this phone with Vobiz push.';
+        notifyListeners();
+      }
+    } else {
+      await _logoutFromVobizPush();
+      notifyListeners();
+    }
+  }
+
+  /// Saves the account Auth ID and Auth Token used to register this phone
+  /// with Vobiz push (test only), with "Remember me".
+  Future<void> setPushAccount({required String authId, required String authToken}) async {
+    pushAuthId = authId.trim();
+    pushAuthToken = authToken.trim();
+    try {
+      if (rememberMe && pushAuthId.isNotEmpty && pushAuthToken.isNotEmpty) {
+        await _secure.write(key: _kPushAuthId, value: pushAuthId);
+        await _secure.write(key: _kPushAuthToken, value: pushAuthToken);
+      }
+    } catch (e) {
+      log('Could not save the push account on this device: $e', LogType.warning);
+    }
+    notifyListeners();
+    if (vobizPush && client.isConnected) await _registerWithVobizPush();
+  }
+
+  /// The account's headers for Vobiz push (test only): the push account
+  /// fields, else the Zero-Config ones.
+  Map<String, String>? _vobizPushHeaders() {
+    final id = pushAuthId.trim().isNotEmpty ? pushAuthId.trim() : authId.trim();
+    final token = pushAuthToken.trim().isNotEmpty ? pushAuthToken.trim() : authToken.trim();
+    if (id.isEmpty || token.isEmpty) return null;
+    return VobizPushDevices.accountHeaders(id, token);
+  }
+
+  /// This install's id with Vobiz push: made once, then kept.
+  Future<String> _installId() async {
+    final known = _pushDeviceId ?? _prefs?.getString(_kPushInstallId);
+    if (known != null && known.isNotEmpty) return _pushDeviceId = known;
+    final random = Random.secure();
+    final id = 'vobiz-example-${List<String>.generate(16, (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0')).join()}';
+    _pushDeviceId = id;
+    await _prefs?.setString(_kPushInstallId, id);
+    return id;
+  }
+
+  Future<void> _registerWithVobizPush({bool quiet = false}) async {
+    final user = client.sipUsername;
+    if (!vobizPush || user == null || !client.isConnected) return;
+    final headers = _vobizPushHeaders();
+    if (headers == null) {
+      vobizPushState = PushState.failed;
+      vobizPushDetail = 'Enter the account Auth ID and Auth Token below (test only) to register this '
+          'phone with Vobiz push.';
+      log('❌ Vobiz push: $vobizPushDetail', LogType.error);
+      notifyListeners();
+      return;
+    }
+    if (!push.available) {
+      vobizPushState = PushState.failed;
+      vobizPushDetail = push.problem ?? 'Firebase is not set up in this build.';
+      notifyListeners();
+      return;
+    }
+    vobizPushState = PushState.registering;
+    notifyListeners();
+    final token = await push.token();
+    if (token == null) {
+      vobizPushState = PushState.failed;
+      vobizPushDetail = 'Firebase gave no push token (no network, or Google Play services missing).';
+      log('❌ Vobiz push: $vobizPushDetail', LogType.error);
+      notifyListeners();
+      return;
+    }
+    final devices = VobizPushDevices(authHeaders: () => headers);
+    try {
+      final device = VobizPushDevice(
+        deviceId: await _installId(),
+        pushToken: token,
+        sipUsername: user,
+        appBundleId: appBundleId,
+        appVersion: 'example',
+        sdkVersion: VobizClient.sdkVersion,
+      );
+      await devices.register(device);
+      vobizPushState = PushState.ready;
+      vobizPushDetail = 'This phone is registered with Vobiz push for calls to $user. With the app '
+          'closed, a call to $user wakes it once Vobiz holds such calls for push.';
+      if (!quiet) log('📲 Vobiz push: this phone is registered for calls to $user', LogType.success);
+    } on VobizException catch (e) {
+      vobizPushState = PushState.failed;
+      vobizPushDetail = e.message;
+      log('❌ Vobiz push: ${e.message}', LogType.error);
+    } finally {
+      devices.close();
+    }
+    notifyListeners();
+  }
+
+  Future<void> _logoutFromVobizPush() async {
+    final id = _pushDeviceId ?? _prefs?.getString(_kPushInstallId);
+    final wasOn = vobizPushState != PushState.off;
+    vobizPushState = PushState.off;
+    vobizPushDetail = '';
+    if (!wasOn || id == null) return;
+    final headers = _vobizPushHeaders();
+    if (headers == null) {
+      log('⚠️ Vobiz push: no account Auth ID and Auth Token to remove this phone with; it may still be '
+          'pushed until Firebase replaces its token', LogType.warning);
+      return;
+    }
+    final devices = VobizPushDevices(authHeaders: () => headers);
+    try {
+      await devices.logout(id);
+      log('📴 Vobiz push: this phone is no longer pushed for calls', LogType.info);
+    } on VobizException catch (e) {
+      log('⚠️ Vobiz push: ${e.message}', LogType.warning);
+    } finally {
+      devices.close();
+    }
+  }
+
+  /// Asks Vobiz's push service itself for a pretend call to this phone, as
+  /// the registrar would: the same push path, but marked as a test, so it
+  /// claims nothing. Press Home or swipe the app away right after.
+  Future<void> sendVobizTestPush() async {
+    final user = client.sipUsername;
+    final headers = _vobizPushHeaders();
+    if (user == null || headers == null || vobizPushState != PushState.ready) {
+      log('Turn on "Receive calls through Vobiz push" and connect first', LogType.error);
+      return;
+    }
+    final now = DateTime.now();
+    final callId = 'vobiz-push-test-${now.millisecondsSinceEpoch}';
+    final body = jsonEncode(<String, Object>{
+      'auth_id': headers['X-Auth-ID']!,
+      'call_id': callId,
+      // Pushes only this SIP user's devices once Vobiz targets by user.
+      'endpoint': user,
+      'data': <String, String>{
+        'type': 'incoming_call',
+        'test': '1',
+        'call_id': callId,
+        'caller': 'Vobiz push test',
+        'callee': user,
+        'expires_at': '${now.millisecondsSinceEpoch ~/ 1000 + 30}',
+      },
+    });
+    final web = http.Client();
+    try {
+      final response = await web
+          .post(Uri.parse('https://api.vobiz.ai/api/v1/notify/voip'),
+              headers: <String, String>{...headers, 'Content-Type': 'application/json'}, body: body)
+          .timeout(const Duration(seconds: 15));
+      final reply = response.body.replaceAll(RegExp(r'\s+'), ' ');
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        log('🧪 Vobiz push test sent ($reply). Press Home or swipe the app away: the test call screen '
+            'should appear within seconds.', LogType.event);
+      } else {
+        log('❌ Vobiz push test: HTTP ${response.statusCode} $reply', LogType.error);
+      }
+    } catch (e) {
+      log('❌ Vobiz push test: $e', LogType.error);
+    } finally {
+      web.close();
+    }
+  }
+
   /// Declines the waiting call: the caller hears busy.
   Future<void> declineWaitingCall() async {
     final call = callWaiting;
@@ -1564,6 +1914,7 @@ class PlaygroundController extends ChangeNotifier {
   /// The user accepted a pushed call. Sign in if needed, then answer when
   /// the bridge rings this endpoint again.
   Future<void> _takeAcceptedCall(PushCall call, String screenId) async {
+    if (call.isVobiz) return _acceptVobizHeldCall(call, screenId);
     if (!_takenCalls.add(call.callId)) return;
     onTabRequest?.call(1);
     if (call.isTest) {
@@ -1799,6 +2150,7 @@ class PlaygroundController extends ChangeNotifier {
         _setStatus(PhoneStatus.online, 'Registered');
         onTabRequest?.call(1);
         _registerWithBridge();
+        _registerWithVobizPush();
         _reportRegisteredForPushes();
         if (_acceptedCall != null) log('Waiting for the accepted call to arrive...', LogType.info);
       }
@@ -1837,9 +2189,27 @@ class PlaygroundController extends ChangeNotifier {
         activeHeaders = null;
         _recordHeaders('incoming call', e);
         final ref = pushRefFromHeaders(e.headers);
-        final id = ref ?? e.callId;
+        // A call Vobiz held while its push woke this phone: the push's call
+        // screen is already showing (and may have been accepted).
+        final held = client.isPushedCall(e.callId) ? _ringingPushes[e.sipCallId ?? ''] : null;
+        final id = ref ?? held?.callId ?? e.callId;
         _pendingMissed.remove(id)?.cancel();
         _inbound = _Inbound(id: id, party: remoteParty, fromBridge: ref != null);
+        if (held != null) {
+          _callScreenId ??= held.callId;
+          _callScreenPush = held;
+          onTabRequest?.call(1);
+          if (_callScreenAccepted && _callScreenId == held.callId) {
+            // The SDK answers it: it was accepted on the call screen.
+            log('📲 The call Vobiz held for this phone arrived: answering (accepted on the call screen)',
+                LogType.event);
+            _setStatus(PhoneStatus.ringing, 'Answering...');
+            break;
+          }
+          showIncoming = true;
+          _setStatus(PhoneStatus.ringing, 'Incoming Call');
+          break;
+        }
         if (_isAcceptedCall(e)) {
           log('📲 This is the call you accepted on the call screen — answering', LogType.event);
           _acceptedTimer?.cancel();
@@ -2156,6 +2526,7 @@ class PlaygroundController extends ChangeNotifier {
     tokenUser = prefs.getString(_kTokenUser) ?? '';
     rememberMe = prefs.getBool(_kRemember) ?? true;
     receiveCalls = prefs.getBool(_kReceiveCalls) ?? false;
+    vobizPush = prefs.getBool(_kVobizPush) ?? false;
     final cli = prefs.getString(_kCallerId);
     if (cli != null && cli.startsWith('+')) {
       final split = splitE164(cli);
@@ -2210,6 +2581,8 @@ class PlaygroundController extends ChangeNotifier {
       authToken = await _secure.read(key: _kAuthToken) ?? '';
       sipUsername = await _secure.read(key: _kSipUser) ?? '';
       sipPassword = await _secure.read(key: _kSipPass) ?? '';
+      pushAuthId = await _secure.read(key: _kPushAuthId) ?? '';
+      pushAuthToken = await _secure.read(key: _kPushAuthToken) ?? '';
     } catch (e) {
       log('Could not read saved credentials: $e', LogType.warning);
     }
