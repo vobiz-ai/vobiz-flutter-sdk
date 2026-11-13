@@ -681,7 +681,14 @@ class VobizClient {
   /// Signs out. A call in progress is ended first, while the socket is still
   /// open: a ringing call is declined (480) and any other gets a BYE, so the
   /// far end is not left talking to a closed socket.
-  Future<void> disconnect() async {
+  ///
+  /// [unregister] false closes the connection without a REGISTER
+  /// `Expires: 0`, as when Android kills the app: Vobiz keeps this phone's
+  /// registration until its keep-alive finds the socket gone (a few
+  /// seconds), and a call in that time takes Vobiz's push-to-wake path: the
+  /// registrar holds it and pushes the devices registered for this SIP user
+  /// ([VobizPushDevices]). For testing that path; a sign-out leaves it true.
+  Future<void> disconnect({bool unregister = true}) async {
     _supervisor.stop();
     _stopWatchingLifecycle();
     _clearCallSetupTimer();
@@ -691,8 +698,9 @@ class VobizClient {
       await _terminate(callId,
           message: 'Signed out', reason: 'disconnected', declineCode: 480);
     }
-    // Unregisters (REGISTER Expires: 0, at most ~2 s) before the socket closes.
-    await _sip.disconnect();
+    // Unregisters (REGISTER Expires: 0, at most ~2 s) before the socket
+    // closes, unless asked not to.
+    await _sip.disconnect(unregister: unregister);
     await _peer.disposeAllCalls();
     _callId = null;
     _callState = CallStateStatus.idle;

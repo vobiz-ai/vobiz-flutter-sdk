@@ -292,6 +292,29 @@ void main() {
     });
   });
 
+  group('VobizClient.disconnect', () {
+    test('signs off with REGISTER Expires: 0 by default', () async {
+      final h = harness.Harness();
+      h.sip.connectionState.value = SipConnectionState.connected;
+      await h.client.disconnect();
+      final registers = h.sent.where((m) => m.startsWith('REGISTER ')).toList();
+      expect(registers, hasLength(1));
+      expect(headerOf(registers.single, 'Expires'), '0');
+      await h.dispose();
+    });
+
+    test('unregister false: the connection goes with no sign-off, as a killed app goes, so Vobiz keeps the '
+        'registration and can push', () async {
+      final h = harness.Harness();
+      h.sip.connectionState.value = SipConnectionState.connected;
+      await h.client.disconnect(unregister: false);
+      expect(h.sent.where((m) => m.startsWith('REGISTER ')), isEmpty);
+      expect(h.client.isConnected, isFalse);
+      expect(h.client.sipUsername, isNull, reason: 'signed out locally all the same');
+      await h.dispose();
+    });
+  });
+
   group('VobizPushDevices', () {
     late List<http.Request> requests;
     late int status;
