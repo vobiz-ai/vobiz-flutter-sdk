@@ -124,8 +124,8 @@ class FakeClient implements VobizClient {
   }
 
   @override
-  Future<void> disconnect() async {
-    actions.add('disconnect');
+  Future<void> disconnect({bool unregister = true}) async {
+    actions.add(unregister ? 'disconnect' : 'disconnect:keep-registration');
     connected = false;
     username = null;
     accessToken = null;

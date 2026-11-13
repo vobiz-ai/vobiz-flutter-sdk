@@ -353,6 +353,16 @@ class PlaygroundController extends ChangeNotifier {
   String pushAuthId = '';
   String pushAuthToken = '';
 
+  /// TEST ONLY: what "Call this phone through Vobiz" needs besides the account:
+  /// a caller ID (a number on the account, digits) and an answer URL (any
+  /// address that returns Vobiz XML; Vobiz fetches it when the call is
+  /// answered). Not secret, so kept with the other settings.
+  String vobizCallFrom = '';
+  String vobizCallAnswerUrl = '';
+
+  /// A test call is on its way: its button waits.
+  bool vobizCallPlacing = false;
+
   /// This install's id with Vobiz push, made once and kept.
   String? _pushDeviceId;
 
@@ -427,6 +437,8 @@ class PlaygroundController extends ChangeNotifier {
   static const String _kPushInstallId = 'vobiz_push_install_id';
   static const String _kPushAuthId = 'vobiz_push_auth_id';
   static const String _kPushAuthToken = 'vobiz_push_auth_token';
+  static const String _kVobizCallFrom = 'vobiz_push_test_from';
+  static const String _kVobizCallAnswerUrl = 'vobiz_push_test_answer_url';
 
   Future<void> init() async {
     try {
@@ -1726,6 +1738,15 @@ class PlaygroundController extends ChangeNotifier {
     if (vobizPush && client.isConnected) await _registerWithVobizPush();
   }
 
+  /// Saves the caller ID and answer URL of the test call (not secret).
+  Future<void> setVobizCallTest({required String from, required String answerUrl}) async {
+    vobizCallFrom = from.replaceAll(RegExp(r'[^0-9]'), '');
+    vobizCallAnswerUrl = answerUrl.trim();
+    await _prefs?.setString(_kVobizCallFrom, vobizCallFrom);
+    await _prefs?.setString(_kVobizCallAnswerUrl, vobizCallAnswerUrl);
+    notifyListeners();
+  }
+
   /// The account's headers for Vobiz push (test only): the push account
   /// fields, else the Zero-Config ones.
   Map<String, String>? _vobizPushHeaders() {
@@ -1774,7 +1795,7 @@ class PlaygroundController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    final devices = VobizPushDevices(authHeaders: () => headers);
+    final devices = VobizPushDevices(authHeaders: () => headers, httpClient: _http);
     try {
       final device = VobizPushDevice(
         deviceId: await _installId(),
@@ -1811,7 +1832,7 @@ class PlaygroundController extends ChangeNotifier {
           'pushed until Firebase replaces its token', LogType.warning);
       return;
     }
-    final devices = VobizPushDevices(authHeaders: () => headers);
+    final devices = VobizPushDevices(authHeaders: () => headers, httpClient: _http);
     try {
       await devices.logout(id);
       log('📴 Vobiz push: this phone is no longer pushed for calls', LogType.info);
@@ -1822,49 +1843,76 @@ class PlaygroundController extends ChangeNotifier {
     }
   }
 
-  /// Asks Vobiz's push service itself for a pretend call to this phone, as
-  /// the registrar would: the same push path, but marked as a test, so it
-  /// claims nothing. Press Home or swipe the app away right after.
-  Future<void> sendVobizTestPush() async {
+  /// A real call to this phone's SIP user through Vobiz's Call API, to try the
+  /// whole path: Vobiz holds the call, pushes this phone, and the app claims it.
+  ///
+  /// Pushes are sent by Vobiz's registrar alone (the push service refuses
+  /// everyone else), so there is no pretend push: this is the real thing. The
+  /// registrar pushes when it still has this phone's registration but its
+  /// connection is gone, as after Android kills the app. So the connection is
+  /// dropped first WITHOUT signing off (a sign-off deletes the registration,
+  /// and the call would then be refused), keeping the saved sign-in and the
+  /// push registration, and the call follows a moment later, well inside the
+  /// few seconds before Vobiz's keep-alive notices.
+  Future<void> callThisPhoneThroughVobiz() async {
+    if (vobizCallPlacing) return;
     final user = client.sipUsername;
     final headers = _vobizPushHeaders();
-    if (user == null || headers == null || vobizPushState != PushState.ready) {
-      log('Turn on "Receive calls through Vobiz push" and connect first', LogType.error);
+    if (user == null || headers == null || vobizPushState != PushState.ready || !client.isConnected) {
+      log('Connect, and turn on "Receive calls through Vobiz push", first', LogType.error);
       return;
     }
-    final now = DateTime.now();
-    final callId = 'vobiz-push-test-${now.millisecondsSinceEpoch}';
-    final body = jsonEncode(<String, Object>{
-      'auth_id': headers['X-Auth-ID']!,
-      'call_id': callId,
-      // Pushes only this SIP user's devices once Vobiz targets by user.
-      'endpoint': user,
-      'data': <String, String>{
-        'type': 'incoming_call',
-        'test': '1',
-        'call_id': callId,
-        'caller': 'Vobiz push test',
-        'callee': user,
-        'expires_at': '${now.millisecondsSinceEpoch ~/ 1000 + 30}',
-      },
-    });
-    final web = http.Client();
+    final from = vobizCallFrom.replaceAll(RegExp(r'[^0-9]'), '');
+    if (from.length < 8) {
+      log('Enter the caller ID: a number on this Vobiz account, such as 14155551234', LogType.error);
+      return;
+    }
+    final answer = Uri.tryParse(vobizCallAnswerUrl.trim());
+    if (answer == null || answer.scheme != 'https' || answer.host.isEmpty) {
+      log('Enter an https:// answer URL that returns Vobiz XML (Vobiz fetches it when the call is answered)',
+          LogType.error);
+      return;
+    }
+    vobizCallPlacing = true;
+    notifyListeners();
+    final web = _http ?? http.Client();
     try {
+      // Gone the way a killed app goes: no sign-off, so Vobiz keeps the
+      // registration; the saved sign-in and the push registration stay.
+      _loginTimeout?.cancel();
+      _reconnecting = false;
+      await _stopTokenSession();
+      await client.disconnect(unregister: false);
+      _resetCallState(registered: false);
+      _setStatus(PhoneStatus.offline, 'Offline: waiting for a call through Vobiz push');
+      log('🧪 Connection dropped without signing off, as when Android kills the app. Calling this phone '
+          'through Vobiz…', LogType.event);
+      // A moment for the closed socket to reach the registrar.
+      await Future<void>.delayed(const Duration(seconds: 1));
       final response = await web
-          .post(Uri.parse('https://api.vobiz.ai/api/v1/notify/voip'),
-              headers: <String, String>{...headers, 'Content-Type': 'application/json'}, body: body)
+          .post(Uri.parse('https://api.vobiz.ai/api/v1/Account/${Uri.encodeComponent(headers['X-Auth-ID']!)}/Call/'),
+              headers: <String, String>{...headers, 'Content-Type': 'application/json'},
+              body: jsonEncode(<String, Object>{
+                'from': from,
+                'to': 'sip:${VobizClient.endpointUsername(user)}@registrar.vobiz.ai',
+                'answer_url': answer.toString(),
+                'answer_method': 'POST',
+                'time_limit': 120,
+              }))
           .timeout(const Duration(seconds: 15));
       final reply = response.body.replaceAll(RegExp(r'\s+'), ' ');
       if (response.statusCode >= 200 && response.statusCode < 300) {
-        log('🧪 Vobiz push test sent ($reply). Press Home or swipe the app away: the test call screen '
-            'should appear within seconds.', LogType.event);
+        log('🧪 Vobiz is calling this phone ($reply). Vobiz should push it now, and the app sign back in '
+            'to take the call.', LogType.event);
       } else {
-        log('❌ Vobiz push test: HTTP ${response.statusCode} $reply', LogType.error);
+        log('❌ Test call: HTTP ${response.statusCode} $reply', LogType.error);
       }
     } catch (e) {
-      log('❌ Vobiz push test: $e', LogType.error);
+      log('❌ Test call: $e', LogType.error);
     } finally {
-      web.close();
+      if (_http == null) web.close();
+      vobizCallPlacing = false;
+      notifyListeners();
     }
   }
 
@@ -2527,6 +2575,8 @@ class PlaygroundController extends ChangeNotifier {
     rememberMe = prefs.getBool(_kRemember) ?? true;
     receiveCalls = prefs.getBool(_kReceiveCalls) ?? false;
     vobizPush = prefs.getBool(_kVobizPush) ?? false;
+    vobizCallFrom = prefs.getString(_kVobizCallFrom) ?? '';
+    vobizCallAnswerUrl = prefs.getString(_kVobizCallAnswerUrl) ?? '';
     final cli = prefs.getString(_kCallerId);
     if (cli != null && cli.startsWith('+')) {
       final split = splitE164(cli);
