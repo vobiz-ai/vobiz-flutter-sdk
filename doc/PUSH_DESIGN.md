@@ -66,17 +66,42 @@ Design rules:
 - Correlation is by an opaque push reference carried both in the push and on the
   INVITE; caller-number matching is only the fallback.
 
-## Vobiz's own push (built, waiting on Vobiz's deploy)
+## Vobiz's own push (deployed 2026-11-13; the last step does not work yet)
 
-Vobiz's platform team built the server side (push-service PR #2 and a registrar change
-in sip-trunking-infrastructure):
+Vobiz's platform team built the server side (push-service #2 and #3, and a registrar
+change in sip-trunking-infrastructure), deployed on 2026-11-13:
 
-1. A call comes in for a SIP user with no live registration.
+1. A call for a SIP user reaches the registrar's "Outbound Call" branch.
 2. The registrar holds the call for up to 30 s and asks push-service to push the
-   devices registered for that SIP user (`/v1/notify/voip` with `endpoint`).
+   devices registered for that SIP user (`/v1/notify/voip` with `endpoint`; only the
+   registrar may call it, with its internal token).
 3. The app wakes and REGISTERs with the hold reference from the push.
 4. The registrar sends the held INVITE to the new registration, with the push's
    `call_id` as its Call-ID.
+
+Live on Android, 2026-11-13 (emulator; Vobiz's registrar logs and the SDK's SIP log):
+
+- **Steps 1 to 3 work.** With the app's registration left behind (killed, or
+  `disconnect(unregister: false)`), a call took the Outbound branch, the relay to the
+  dead socket failed, and the registrar logged `push sent to 1 device(s) … index …
+  label …`. The push woke a killed app in about 1.3 s and its call screen showed in
+  about 5 s; the app's claim REGISTER got `200 OK` (`Register for …;transport=wss
+  user-agent external - index …`).
+- **Step 4 fails.** The registrar relays the held INVITE to the claim's contact as
+  `transport=wss` and gets no reply: `failure` after 10 s. The SDK's SIP log shows
+  nothing arriving on that socket after the claim's `200 OK`. Normal deliveries to the
+  same SDK use `transport=ws` and get `180 Ringing` at once, even on the very socket
+  the claim had registered (once a plain REGISTER refreshed its contact as `ws`).
+- **Push only starts while a registration is left behind.** The registrar's
+  keep-alive deletes a WSS registration whose socket is gone within about 3 to 8 s
+  (`OPTIONS … entry deleted`). After that a call goes out the media server's external
+  route, arrives as an "Inbound Call", vapor `IncomingRoute` answers 500, and the call
+  ends at once: no push. A clean sign-out (REGISTER `Expires: 0`) has the same effect
+  straight away.
+- A call placed by the Call API straight to `sip:<user>@registrar.vobiz.ai` (or a
+  `<Dial><User>`) takes the Outbound branch only while the user has a registration.
+- With the app in the background and its connection alive, calls come straight in: the
+  call screen shows, Accept connects and Decline sends `486 Busy Here`.
 
 What the SDK does for it:
 
@@ -89,10 +114,17 @@ What the SDK does for it:
 | Call screen | `reportCallScreenAccepted` answers on arrival; `reportCallScreenDeclined` claims and then turns the call away, so the caller hears busy at once |
 | Expiry | `pushCallUpdates` reports `expired` when no INVITE came by `expires_at` |
 
-Open on Vobiz's side (from the SDK work, 2026-11-12):
+Trying it: in the example, Incoming calls → Vobiz push → **Call this phone through
+Vobiz**. It drops the connection without signing off (`disconnect(unregister: false)`),
+then has Vobiz's Call API call this phone's SIP user, so the registrar pushes it.
 
-- The gateway answers `/v1/devices/register` with 404; `/api/v1/devices/register`
-  reaches push-service.
+Open on Vobiz's side (from the SDK work, 2026-11-12 and the live test on 2026-11-13):
+
+- The held INVITE is relayed to the claim as `transport=wss` and never delivered (above).
+- A WSS registration is deleted seconds after its socket goes, so a killed app is pushed
+  only if the call comes in those seconds.
+- The address is `/api/v1/devices/register` (confirmed by the platform team; `/v1/…`
+  is 404 through the gateway).
 - Device registration takes the account's Auth ID and Auth Token: there is no
   endpoint-scoped sign-in for apps yet.
 - No way to decline a held call without claiming it.
