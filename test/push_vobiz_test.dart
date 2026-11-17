@@ -160,8 +160,8 @@ void main() {
     test('a 423 asks again with the reference', () {
       s.claimHeldCall(hold);
       s.register('play1', 'secret');
-      s.debugReceive(respond(sent.single, 423, 'Interval Too Brief', headers: <String>['Min-Expires: 900']));
-      expect(headerOf(sent.last, 'Expires'), '900');
+      s.debugReceive(respond(sent.single, 423, 'Interval Too Brief', headers: <String>['Min-Expires: 7200']));
+      expect(headerOf(sent.last, 'Expires'), '7200');
       expectClaims(sent.last);
     });
 
