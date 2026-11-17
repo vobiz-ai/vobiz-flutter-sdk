@@ -103,6 +103,32 @@ Live on Android, 2026-11-13 (emulator; Vobiz's registrar logs and the SDK's SIP 
 - With the app in the background and its connection alive, calls come straight in: the
   call screen shows, Accept connects and Decline sends `486 Busy Here`.
 
+**Fixed on Vobiz's side, re-tested live on 2026-11-17** (emulator; the registrar's logs
+and the SDK's SIP log). The registrar now relays the held INVITE to the claim as
+`transport=ws`, and keeps a registration whose User-Agent is `vobiz_flutter_sdk` after
+its socket closes (it logs `… kept after websocket close (push-capable)`), until it
+expires:
+
+| Case | Result |
+|---|---|
+| App in the background, connection alive | The call came straight in, rang, and Accept connected it. |
+| Killed, called 2 s later | Pushed (the relay to the dead socket failed at once); the app woke, its claim REGISTER got `200 OK` and the held INVITE arrived 34 ms later, as `transport=ws`; it rang, and Accept connected it (audio). |
+| Killed, called 90 s later | Same: the registration was still there, so the call was pushed; it rang and connected. Before the fix, an instant busy with no push. |
+| Killed, called 6 min 40 s later | Pushed and rang, so the registrar keeps the lifetime the SDK asked for (600 s then). |
+| Killed, called 11 min later, with `Expires: 600` | Busy at once, no push: the registration had expired. |
+| Killed, called 11 min later, with `Expires: 3600` (twice) | The registration was still there and the call was pushed. The app then missed it: see below. |
+
+How long a closed app stays reachable is therefore the lifetime of its last REGISTER:
+this SDK now asks for an hour (`Expires: 3600`), and every REGISTER (sign-in, the
+refresh at 80 %, the return to the foreground, the claim of a pushed call) starts it
+again.
+
+The registrar holds a pushed call at most 30 s for the claim. On the test emulator
+(headless, software graphics, a debug build) the time from the push to the claim's
+`200 OK` grew with how long the app had been closed: 16 s and 11 s after 2 s and 90 s,
+26 s after 6 min 40 s, and 32 s and 37 s after 11 min, so those last two calls ended
+before the claim. Release builds on real phones start far faster; check them there.
+
 What the SDK does for it:
 
 | Step | API |
@@ -120,9 +146,11 @@ then has Vobiz's Call API call this phone's SIP user, so the registrar pushes it
 
 Open on Vobiz's side (from the SDK work, 2026-11-12 and the live test on 2026-11-13):
 
-- The held INVITE is relayed to the claim as `transport=wss` and never delivered (above).
-- A WSS registration is deleted seconds after its socket goes, so a killed app is pushed
-  only if the call comes in those seconds.
+- ~~The held INVITE is relayed to the claim as `transport=wss` and never delivered.~~
+  Fixed (re-tested 2026-11-17, above).
+- ~~A WSS registration is deleted seconds after its socket goes.~~ Fixed for this SDK:
+  it is kept until it expires (above). After that, a call to a killed app is busy with no
+  push, until the app registers again.
 - The address is `/api/v1/devices/register` (confirmed by the platform team; `/v1/…`
   is 404 through the gateway).
 - Device registration takes the account's Auth ID and Auth Token: there is no
