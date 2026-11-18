@@ -14,4 +14,9 @@ enum VobizAuthMode {
   /// SIP Direct: an existing endpoint's SIP username and password. Nothing is
   /// provisioned and no account credentials reach the device.
   sipDirect,
+
+  /// An access token (JWT) minted by the app's backend: the client registers
+  /// as `<sub>_<iss>` with the token instead of a password. No endpoint is
+  /// needed and no long-lived secret reaches the device.
+  accessToken,
 }

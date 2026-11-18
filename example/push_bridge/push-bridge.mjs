@@ -36,6 +36,8 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const USERNAME_RE = /^[A-Za-z0-9_.\-+]{1,120}$/;
+/** An access token's `sub`, as the platform accepts it (letters, digits, _ and -, at most 50). */
+const SUB_RE = /^[A-Za-z0-9_-]{1,50}$/;
 const CALL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
@@ -69,6 +71,16 @@ export function createBridge(options = {}) {
     // ...and after this long the call is ended: the SDK gives up at 12 s, but
     // its hangup cannot leave an offline phone. 0 never ends it.
     lostHangupSeconds: env.LOST_HANGUP_SECONDS === '0' ? 0 : clampInt(env.LOST_HANGUP_SECONDS, 15, 5, 300),
+    // A conference ends with its host, as a phone call does when one side
+    // drops: this long after the app's last report the whole room is ended.
+    confHostLostSeconds: clampInt(env.CONF_HOST_LOST_SECONDS, 2, 1, 300),
+    // Access tokens (POST /token): who the app signs in as ("<sub>_<auth id>"),
+    // for how long (180 s to 24 h, the platform's limits), and which
+    // application's Answer URL handles its outbound calls (else the account's
+    // default application).
+    jwtSub: (env.JWT_SUB || 'flutter-app').trim(),
+    jwtTtlSeconds: clampInt(env.JWT_TTL_SECONDS, 3600, 180, 86400),
+    jwtAppId: (env.JWT_APP_ID || '').trim(),
     callerIdMode: (env.CALLER_ID_MODE || 'number').trim().toLowerCase(),
     headerStyle: (env.SIP_HEADER_STYLE || 'suffix').trim().toLowerCase(),
     alwaysRing: csv(env.ALWAYS_RING),
@@ -121,6 +133,8 @@ export function createBridge(options = {}) {
   const busyTone = makeToneWav(3, [[0, 0.75], [1.5, 2.25]]);
   // Connection-lost beep, looped: a short 1 kHz beep every 2.5 s.
   const lostBeep = makeToneWav(2.5, [[0, 0.25]], [1000]);
+  // Hold music for a conference participant, looped by <Play loop="0">.
+  const holdMusic = makeHoldMusicWav();
 
   // ── HTTP server ──────────────────────────────────────────────────────────────
 
@@ -130,6 +144,7 @@ export function createBridge(options = {}) {
     'GET /wait.wav': (req, res) => sendWav(res, waitRingback),
     'GET /busy.wav': (req, res) => sendWav(res, busyTone),
     'GET /lost.wav': (req, res) => sendWav(res, lostBeep),
+    'GET /hold.wav': (req, res) => sendWav(res, holdMusic),
     // Vobiz webhooks
     'POST /answer': vobiz(onAnswer),
     'GET /answer': vobiz(onAnswer),
@@ -139,6 +154,7 @@ export function createBridge(options = {}) {
     'POST /hangup': vobiz(onHangup),
     'GET /hangup': vobiz(onHangup),
     // The app
+    'POST /token': onToken,
     'POST /push/register': onRegister,
     'POST /push/unregister': onUnregister,
     'POST /push/test': onTestCall,
@@ -156,6 +172,19 @@ export function createBridge(options = {}) {
     // DTMF test: the answer URL for a call placed through the Vobiz API
     'POST /dtmf-test': vobiz(onDtmfTest),
     'POST /dtmf-test-digits': vobiz(onDtmfTestDigits),
+    // Conference: the app turns its call into a conference and manages it
+    'POST /conference/add': onConferenceAdd,
+    'POST /conference/state': onConferenceState,
+    'POST /conference/participant': onConferenceParticipant,
+    'POST /conference/end': onConferenceEnd,
+    // Conference: Vobiz asks for a leg's XML and reports enter, exit and
+    // hangup. The room and the leg's role are in the signed path.
+    'POST /conf-room/*': vobiz(onConfRoom),
+    'GET /conf-room/*': vobiz(onConfRoom),
+    'POST /conf-hold/*': vobiz(onConfHold),
+    'GET /conf-hold/*': vobiz(onConfHold),
+    'POST /conf-events/*': vobiz(onConfEvents),
+    'POST /conf-dial/*': vobiz(onConfDialEnded),
   };
 
   const server = http.createServer(async (req, res) => {
@@ -169,7 +198,7 @@ export function createBridge(options = {}) {
     } catch (error) {
       log('!!', `${req.method} ${url.pathname} failed: ${error.stack || error}`);
       if (!res.headersSent) {
-        if (url.pathname === '/answer' || /^\/(dial-result|dial-now|declined)\//.test(url.pathname)) {
+        if (url.pathname === '/answer' || /^\/(dial-result|dial-now|declined|conf-room|conf-hold)\//.test(url.pathname)) {
           sendXml(res, '<Speak>Sorry, something went wrong. Please try again.</Speak><Hangup/>');
         } else {
           sendJson(res, 500, { error: 'Internal error' });
@@ -186,6 +215,12 @@ export function createBridge(options = {}) {
     sweeper = setInterval(() => {
       const cutoff = Date.now() - 10 * 60 * 1000;
       for (const [id, call] of calls) if (call.createdAt < cutoff) calls.delete(id);
+      // A room is kept 10 minutes after it ends (the app reads its last
+      // state), and dropped after 5 hours however it ended (timeLimit is 4).
+      for (const room of rooms.values()) {
+        const age = Date.now() - room.createdAt;
+        if ((room.over && room.endedAt < cutoff) || age > 5 * 60 * 60 * 1000) forgetRoom(room);
+      }
     }, 60 * 1000);
     sweeper.unref();
     watchdog = setInterval(checkWatched, deps.watchTickMs ?? 500);
@@ -475,6 +510,54 @@ export function createBridge(options = {}) {
   }
 
   // ── The app's requests ───────────────────────────────────────────────────────
+
+  let jwtAppWarned = false;
+
+  /**
+   * An access token (JWT) for the app: `POST /Account/{auth id}/JWT/Token/`
+   * mints it with the account's Auth Token, which stays here. The app signs
+   * in with it (the SDK's connectWithAccessTokenProvider) as
+   * "<sub>_<auth id>", and the token renews itself through this route before
+   * it expires. Only a paired phone (device token) or the bridge key may
+   * ask; `sub` comes from the body or ?sub=, else JWT_SUB. Same reply shape
+   * as the Vobiz WebRTC demo's /token.
+   */
+  async function onToken(req, res, url) {
+    const device = deviceFromRequest(req);
+    if (!device && !keyMatches(req)) return sendJson(res, 401, { error: 'Send the bridge key, or this phone\'s device token' });
+    if (!config.authId || !config.authToken) return sendJson(res, 503, { error: 'VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN are not set' });
+    const body = await readJson(req);
+    const sub = String(body.sub || url.searchParams.get('sub') || config.jwtSub).trim();
+    if (!SUB_RE.test(sub)) return sendJson(res, 400, { error: 'sub must be 1 to 50 letters, digits, _ or -' });
+    // nbf a minute in the past: a registrar whose clock is a second behind
+    // this one refuses a token whose nbf has not come yet (10005). The
+    // platform's 180 s to 24 h limits apply to exp - nbf.
+    const nbf = Math.floor(Date.now() / 1000) - 60;
+    const claims = {
+      iss: config.authId,
+      sub,
+      nbf,
+      exp: nbf + config.jwtTtlSeconds,
+      per: { voice: { incoming_allow: true, outgoing_allow: true } },
+      ...(config.jwtAppId ? { app: config.jwtAppId } : {}),
+    };
+    if (!config.jwtAppId && !jwtAppWarned) {
+      jwtAppWarned = true;
+      log('!!', 'JWT_APP_ID is not set: tokens carry no app, so the account\'s default application handles outbound calls, and where that does not work the registrar refuses the token (10001 INVALID_ACCESS_TOKEN). Set JWT_APP_ID.');
+    }
+    let minted;
+    try {
+      minted = await vobizApi('POST', '/JWT/Token/', claims);
+    } catch (error) {
+      log('!!', `Vobiz: could not mint an access token for ${sub}: ${error.message}`);
+      return sendJson(res, 502, { error: 'Vobiz did not mint the token' });
+    }
+    if (typeof minted?.token !== 'string' || !minted.token) return sendJson(res, 502, { error: 'Vobiz returned no token' });
+    const sipUsername = `${sub}_${config.authId}`;
+    const reason = typeof body.reason === 'string' ? ` (${body.reason.slice(0, 20)})` : '';
+    log('ok', `Access token for ${sipUsername}, valid until ${new Date(claims.exp * 1000).toISOString()}${reason}`);
+    sendJson(res, 200, { token: minted.token, sub, exp: claims.exp, sip_username: sipUsername });
+  }
 
   /**
    * The app signed in. A new phone pairs with the bridge key (X-Bridge-Key)
@@ -1051,6 +1134,14 @@ export function createBridge(options = {}) {
 
   const endpointCache = { at: 0, names: null };
 
+  /** An access-token identity on this account: "<sub>_<auth id>" (see /token). */
+  function isTokenIdentity(username) {
+    const suffix = `_${config.authId}`.toLowerCase();
+    const name = String(username || '').toLowerCase();
+    return Boolean(config.authId) && name.length > suffix.length && name.endsWith(suffix)
+      && SUB_RE.test(name.slice(0, -suffix.length));
+  }
+
   /**
    * Whether `username` is an endpoint on VOBIZ_AUTH_ID's account: true,
    * false, null when Vobiz could not be asked, undefined when there is no
@@ -1058,6 +1149,10 @@ export function createBridge(options = {}) {
    */
   async function endpointKnown(username) {
     if (!config.authId || !config.authToken) return undefined;
+    // An app signed in with an access token registers as "<sub>_<auth id>":
+    // an identity the token creates, not a Console endpoint. Ringing
+    // <User>sip:<sub>_<auth id>@registrar.vobiz.ai</User> reaches it.
+    if (isTokenIdentity(username)) return true;
     try {
       if (!endpointCache.names || Date.now() - endpointCache.at > 60 * 1000) {
         const endpoints = await listAll('/Endpoint/');
@@ -1154,6 +1249,7 @@ export function createBridge(options = {}) {
   const watchLookups = new Map();
   const lostBeepMs = deps.lostBeepMs ?? config.lostBeepSeconds * 1000;
   const lostHangupMs = deps.lostHangupMs ?? config.lostHangupSeconds * 1000;
+  const confHostLostMs = deps.confHostLostMs ?? config.confHostLostSeconds * 1000;
 
   async function onCallAlive(req, res) {
     const device = deviceFromRequest(req);
@@ -1218,12 +1314,21 @@ export function createBridge(options = {}) {
     for (const watch of watched.values()) {
       if (watch.busy) continue;
       const silent = now - watch.lastSeen;
-      if (lostHangupMs && silent >= lostHangupMs) void endLostCall(watch, silent);
+      // The app hosts a conference: the room ends CONF_HOST_LOST_SECONDS after
+      // its last report, not after the one-to-one call's reconnect window.
+      const hangupMs = activeRoomOf(watch.uuid) ? confHostLostMs : lostHangupMs;
+      if (hangupMs && silent >= hangupMs) void endLostCall(watch, silent);
       else if (silent >= lostBeepMs && !watch.beeping && !watch.beepFailed) void startBeep(watch, silent);
     }
   }
 
   async function startBeep(watch, silent) {
+    // In a conference the call's legs are no longer bridged to each other, so
+    // there is no "other party" leg to beep to. The room carries on.
+    if (activeRoomOf(watch.uuid)) {
+      watch.beepFailed = true;
+      return;
+    }
     watch.busy = true;
     try {
       await vobizApi('POST', `/Call/${encodeURIComponent(watch.uuid)}/Play/`, {
@@ -1262,6 +1367,13 @@ export function createBridge(options = {}) {
   async function endLostCall(watch, silent) {
     watched.delete(watch.uuid);
     watch.busy = true;
+    // The app hosts a conference: it ends with the app (and for an inbound
+    // call the reported UUID is the caller's leg, not the app's).
+    const room = activeRoomOf(watch.uuid);
+    if (room) {
+      await endRoom(room, `the app lost its connection for ${secs(silent)} s`);
+      return;
+    }
     try {
       await vobizApi('DELETE', `/Call/${encodeURIComponent(watch.uuid)}/`);
       log('ok', `Call ${short(watch.uuid)}: no word from the app for ${secs(silent)} s, past its reconnect window; call ended so it is not billed on`);
@@ -1293,6 +1405,563 @@ export function createBridge(options = {}) {
     const digits = String(params.Digits || '').replace(/[^0-9*#A-D]/g, '');
     log('ok', `DTMF test call ${short(params.CallUUID || '')}: Vobiz received "${digits}"`);
     sendXml(res, `<Speak>You pressed ${digits ? digits.split('').join(' ') : 'nothing'}.</Speak><Hangup/>`);
+  }
+
+  // ── Conference: the app's call becomes a conference room ────────────────────
+  //
+  // Vobiz mixes a conference in a room (<Conference>). Moving the app's call
+  // into a room, dialling people into it and muting them are REST calls that
+  // need the Auth Token, so the app asks this bridge:
+  //
+  //   POST /conference/add          the first time, both sides of the app's
+  //                                 call move into a new room (Transfer API,
+  //                                 legs=both); then the new person is dialled
+  //                                 (Call API) with the room as answer XML
+  //   POST /conference/state        who is in the room
+  //   POST /conference/participant  mute, unmute, hold, resume or remove one
+  //   POST /conference/end          end the room for everyone
+  //
+  // Vobiz's read API does not list a live room's members (its docs say so),
+  // so the bridge keeps them from the enter and exit callbacks. Every leg
+  // joins with stayAlone="true": Vobiz otherwise drops a member who is alone
+  // in the room, even for the moment both sides of the call are moving in.
+  // The app's own leg ends the room when it leaves (endConferenceOnExit), and
+  // the bridge ends it when nobody else is left. Hold takes a person out of
+  // the room onto looping music (Transfer API) and resume brings them back:
+  // Vobiz has no hold for a member.
+  //
+  // A phone acts on its own calls only (its device token, and its endpoint
+  // must be on the live call); the bridge key may act on any live call of
+  // the account.
+
+  /** Conference rooms by name, and the room of every CallUUID in one. Memory only. */
+  const rooms = new Map();
+  const roomOfCall = new Map();
+  /** Vobiz's account cap on conference members (max_conf_members). */
+  const MAX_CONF_MEMBERS = 20;
+  /** A leg on its way into the room that has not entered after this long is gone. */
+  const MOVE_TIMEOUT_MS = deps.confMoveTimeoutMs ?? 20000;
+  /** How often, at most, the bridge asks Vobiz whether people on hold are still there. */
+  const HOLD_CHECK_MS = 5000;
+  /** Member states in which a person is still part of the conference. */
+  const PRESENT = new Set(['moving', 'dialing', 'joined', 'holding', 'on_hold', 'resuming']);
+  const ACTIONS = new Set(['mute', 'unmute', 'hold', 'resume', 'remove']);
+
+  async function onConferenceAdd(req, res) {
+    const who = conferenceCaller(req);
+    if (!who) return sendJson(res, 401, { error: 'Send this phone\'s device token, or the bridge key' });
+    if (!config.authId || !config.authToken) return sendJson(res, 503, { error: 'VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN are not set' });
+    const body = await readJson(req);
+    const uuid = String(body.call_uuid || '').toLowerCase();
+    if (!CALL_UUID_RE.test(uuid)) return sendJson(res, 400, { error: 'call_uuid must be a Vobiz CallUUID' });
+    const target = conferenceTarget(body);
+    if (!target) return sendJson(res, 400, { error: 'Send number (E.164, e.g. +919876543210) or user (a SIP endpoint username)' });
+    const callerId = String(body.caller_id || config.number || '').trim();
+    if (!PSTN_RE.test(callerId)) {
+      return sendJson(res, 400, { error: 'caller_id must be one of your Vobiz numbers in E.164 (VOBIZ_NUMBER is the default)' });
+    }
+
+    let room = roomForCall(uuid);
+    if (room && !mayControl(room, who)) return sendJson(res, 403, { error: 'Not a conference of this phone\'s endpoint' });
+    if (room?.over) room = null;
+    if (!room) {
+      const legs = await conferenceLegs(uuid, who, body);
+      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this phone\'s endpoint' });
+      room = openRoom(uuid, legs);
+      try {
+        await moveIntoRoom(room);
+      } catch (error) {
+        log('!!', `Conference ${room.name}: Vobiz did not move call ${short(uuid)} into it: ${error.message}`);
+        forgetRoom(room);
+        return sendJson(res, 502, { error: 'Vobiz did not move the call into a conference' });
+      }
+    }
+    if (room.members.filter((m) => PRESENT.has(m.status)).length >= MAX_CONF_MEMBERS) {
+      return sendJson(res, 409, { error: `A conference holds at most ${MAX_CONF_MEMBERS} people`, conference: publicRoom(room) });
+    }
+
+    const member = addMember(room, { role: 'added', label: target.label, status: 'dialing' });
+    try {
+      const placed = await vobizApi('POST', '/Call/', {
+        from: callerId,
+        to: target.to,
+        answer_url: `${publicBase()}/conf-room/${roomRef(room.name, 'added')}`,
+        answer_method: 'POST',
+        hangup_url: `${publicBase()}/conf-dial/${roomRef(room.name, 'dial')}`,
+        hangup_method: 'POST',
+        ring_timeout: String(config.ringSeconds),
+      });
+      member.requestUuid = String(placed?.request_uuid || placed?.RequestUUID || '').toLowerCase() || null;
+      if (member.requestUuid) roomOfCall.set(member.requestUuid, room.name);
+      log('->', `Conference ${room.name}: dialling ${target.label}`);
+    } catch (error) {
+      member.status = 'failed';
+      member.reason = 'not dialled';
+      log('!!', `Conference ${room.name}: Vobiz did not dial ${target.label}: ${error.message}`);
+      return sendJson(res, 502, { error: `Vobiz did not dial ${target.label}`, conference: publicRoom(room) });
+    }
+    sendJson(res, 200, publicRoom(room));
+  }
+
+  async function onConferenceState(req, res) {
+    const found = await conferenceRequest(req, res);
+    if (!found) return;
+    await checkHeld(found.room);
+    sendJson(res, 200, publicRoom(found.room));
+  }
+
+  async function onConferenceParticipant(req, res) {
+    const found = await conferenceRequest(req, res);
+    if (!found) return;
+    const { room, body } = found;
+    const action = String(body.action || '');
+    if (!ACTIONS.has(action)) return sendJson(res, 400, { error: 'action must be mute, unmute, hold, resume or remove' });
+    const member = room.members.find((m) => m.id === String(body.participant_id || ''));
+    if (!member) return sendJson(res, 404, { error: 'No such participant' });
+    if (member.role === 'host') return sendJson(res, 400, { error: 'That is you: use the call\'s own Mute and Hang up' });
+    if (room.over) return sendJson(res, 409, { error: 'The conference has ended', conference: publicRoom(room) });
+    let refused;
+    try {
+      refused = await participantAction(room, member, action);
+    } catch (error) {
+      log('!!', `Conference ${room.name}: could not ${action} ${member.label}: ${error.message}`);
+      return sendJson(res, 502, { error: `Vobiz did not ${action} ${member.label}`, conference: publicRoom(room) });
+    }
+    if (refused) return sendJson(res, 409, { error: refused, conference: publicRoom(room) });
+    sendJson(res, 200, publicRoom(room));
+  }
+
+  async function onConferenceEnd(req, res) {
+    const found = await conferenceRequest(req, res);
+    if (!found) return;
+    await endRoom(found.room, 'ended by the app');
+    sendJson(res, 200, publicRoom(found.room));
+  }
+
+  /**
+   * The room of the request's call_uuid, after the caller has shown it may
+   * act on it; otherwise answers the request itself and returns null.
+   */
+  async function conferenceRequest(req, res) {
+    const who = conferenceCaller(req);
+    if (!who) {
+      sendJson(res, 401, { error: 'Send this phone\'s device token, or the bridge key' });
+      return null;
+    }
+    const body = await readJson(req);
+    const uuid = String(body.call_uuid || '').toLowerCase();
+    const room = CALL_UUID_RE.test(uuid) ? roomForCall(uuid) : null;
+    if (!room) {
+      sendJson(res, 404, { error: 'No conference for this call' });
+      return null;
+    }
+    if (!mayControl(room, who)) {
+      sendJson(res, 403, { error: 'Not a conference of this phone\'s endpoint' });
+      return null;
+    }
+    return { room, body, who };
+  }
+
+  /** A paired phone (its endpoint), or the operator with the bridge key. */
+  function conferenceCaller(req) {
+    const device = deviceFromRequest(req);
+    if (device) return { username: device.username, operator: false };
+    if (keyMatches(req)) return { username: null, operator: true };
+    return null;
+  }
+
+  function mayControl(room, who) {
+    return who.operator || room.hostUser === who.username;
+  }
+
+  /** Who to dial: { to, label } from `number` (E.164) or `user` (a SIP endpoint), or null. */
+  function conferenceTarget(body) {
+    const number = String(body.number || '').trim();
+    const user = endpointUsername(body.user || '');
+    if (number && !user) return PSTN_RE.test(number) ? { to: number, label: number } : null;
+    if (user && !number) return USERNAME_RE.test(user) ? { to: `sip:${user}@registrar.vobiz.ai`, label: user } : null;
+    return null;
+  }
+
+  /**
+   * Which leg of call `uuid` is the app's (the host) and who is at the other
+   * end, or null when the call is not live or not this phone's.
+   */
+  async function conferenceLegs(uuid, who, body) {
+    // An inbound call this bridge rang: `uuid` is the caller's own leg and
+    // the app is the leg the Dial reached.
+    const own = calls.get(uuid);
+    if (own && own.bridged && !own.over && (who.operator || own.targets.includes(who.username))) {
+      return { hostLeg: 'bleg', hostUser: who.username || own.targets[0] || '', guestLabel: own.from || 'Caller' };
+    }
+    let live;
+    try {
+      live = await vobizApi('GET', `/Call/${encodeURIComponent(uuid)}/?status=live`);
+    } catch {
+      return null;
+    }
+    if (!live) return null;
+    const from = endpointUsername(live.from);
+    const to = endpointUsername(live.to);
+    let hostLeg;
+    if (who.operator) hostLeg = body.host_leg === 'bleg' ? 'bleg' : 'aleg';
+    else if (from === who.username) hostLeg = 'aleg';
+    else if (to === who.username) hostLeg = 'bleg';
+    else return null;
+    return {
+      hostLeg,
+      hostUser: hostLeg === 'aleg' ? from : to,
+      guestLabel: displayNumber(hostLeg === 'aleg' ? live.to : live.from) || 'Caller',
+    };
+  }
+
+  function openRoom(uuid, legs) {
+    const name = `vc-${uuid.slice(0, 8)}-${crypto.randomBytes(3).toString('hex')}`;
+    const room = {
+      name,
+      aLeg: uuid,
+      hostLeg: legs.hostLeg,
+      hostUser: legs.hostUser,
+      members: [],
+      nextId: 1,
+      createdAt: Date.now(),
+      over: false,
+      endedAt: 0,
+      endReason: null,
+      holdCheckAt: 0,
+    };
+    rooms.set(name, room);
+    roomOfCall.set(uuid, name);
+    addMember(room, { role: 'host', label: legs.hostUser || 'You', status: 'moving' });
+    addMember(room, { role: 'guest', label: legs.guestLabel, status: 'moving' });
+    const timer = setTimeout(() => void movedCheck(room), MOVE_TIMEOUT_MS);
+    timer.unref?.();
+    log('->', `Conference ${name}: call ${short(uuid)} becomes a conference hosted by ${legs.hostUser || 'the app'}`);
+    return room;
+  }
+
+  /** Both sides of the call go into the room: the app's leg as host, the other as guest. */
+  async function moveIntoRoom(room) {
+    const host = room.hostLeg;
+    const guest = host === 'aleg' ? 'bleg' : 'aleg';
+    await vobizApi('POST', `/Call/${encodeURIComponent(room.aLeg)}/`, {
+      legs: 'both',
+      [`${host}_url`]: `${publicBase()}/conf-room/${roomRef(room.name, 'host')}`,
+      [`${host}_method`]: 'POST',
+      [`${guest}_url`]: `${publicBase()}/conf-room/${roomRef(room.name, 'guest')}`,
+      [`${guest}_method`]: 'POST',
+    });
+  }
+
+  /**
+   * A side of the call that Vobiz never asked for the room's XML did not
+   * move (the transfer failed for it, or it hung up first). One that did ask
+   * is on its way in, even if its enter callback is late.
+   */
+  async function movedCheck(room) {
+    if (room.over) return;
+    for (const member of room.members) {
+      if (member.status === 'moving' && !member.callUuid && (member.role === 'host' || member.role === 'guest')) {
+        member.status = 'left';
+        member.reason = 'did not reach the room';
+        log('!!', `Conference ${room.name}: ${member.label} did not reach the room`);
+      }
+    }
+    if (room.members.find((m) => m.role === 'host')?.status === 'left') {
+      await endRoom(room, 'the app did not reach the room');
+    } else {
+      await maybeEndRoom(room);
+    }
+  }
+
+  function addMember(room, fields) {
+    const member = {
+      id: `p${room.nextId++}`,
+      role: 'added',
+      label: '',
+      status: 'dialing',
+      callUuid: null,
+      requestUuid: null,
+      memberId: null,
+      muted: false,
+      reason: null,
+      ...fields,
+    };
+    room.members.push(member);
+    return member;
+  }
+
+  /** The member a leg asking for the room's XML is: by its CallUUID, else by its role. */
+  function legMember(room, role, uuid, params) {
+    const known = uuid && room.members.find((m) => m.callUuid === uuid || m.requestUuid === uuid);
+    if (known) return known;
+    if (role === 'host' || role === 'guest') return room.members.find((m) => m.role === role && !m.callUuid) || null;
+    const to = displayNumber(params.To || '');
+    const dialing = room.members.filter((m) => m.role === 'added' && m.status === 'dialing' && !m.callUuid);
+    return dialing.find((m) => displayNumber(m.label) === to) || dialing[0] || null;
+  }
+
+  /** Vobiz asks for a leg's XML: the leg moving in, a dialled person who answered, or a resume. */
+  async function onConfRoom(req, res, url, params) {
+    const ref = roomFromPath(url);
+    if (!ref || !['host', 'guest', 'added'].includes(ref.role)) return sendXml(res, '<Hangup/>');
+    if (isHangupEvent(params)) return sendText(res, 200, 'OK');
+    const room = ref.room;
+    if (!room || room.over) return sendXml(res, '<Hangup/>');
+    const uuid = String(params.CallUUID || '').toLowerCase();
+    const member = legMember(room, ref.role, uuid, params);
+    if (member) {
+      if (uuid) {
+        member.callUuid = uuid;
+        roomOfCall.set(uuid, room.name);
+      }
+      if (member.status !== 'resuming') member.status = 'moving';
+    }
+    return sendXml(res, roomXml(room, ref.role === 'host'));
+  }
+
+  function roomXml(room, host) {
+    const events = `${publicBase()}/conf-events/${roomRef(room.name, 'events')}`;
+    return `  <Conference stayAlone="true" startConferenceOnEnter="true" endConferenceOnExit="${host ? 'true' : 'false'}" callbackUrl="${esc(events)}" callbackMethod="POST">${esc(room.name)}</Conference>`;
+  }
+
+  /** A person on hold: out of the room, on looping music until resumed. */
+  async function onConfHold(req, res, url) {
+    const ref = roomFromPath(url);
+    if (!ref || ref.role !== 'hold' || !ref.room || ref.room.over) return sendXml(res, '<Hangup/>');
+    return sendXml(res, `  <Play loop="0">${esc(publicBase())}/hold.wav</Play>`);
+  }
+
+  /** Vobiz: someone entered or left the room. */
+  async function onConfEvents(req, res, url, params) {
+    sendText(res, 200, 'OK');
+    const ref = roomFromPath(url);
+    const room = ref?.role === 'events' ? ref.room : null;
+    if (!room || (params.ConferenceName && params.ConferenceName !== room.name)) return;
+    const event = String(params.Event || '');
+    const action = String(params.ConferenceAction || '').toLowerCase()
+      || (event === 'ConferenceEnter' ? 'enter' : event === 'ConferenceExit' ? 'exit' : '');
+    const uuid = String(params.CallUUID || '').toLowerCase();
+    let member = uuid ? room.members.find((m) => m.callUuid === uuid || m.requestUuid === uuid) : null;
+
+    if (action === 'enter') {
+      if (!member) {
+        member = addMember(room, { role: 'other', label: displayNumber(params.From) || 'Participant', status: 'moving', callUuid: uuid || null });
+        if (uuid) roomOfCall.set(uuid, room.name);
+      }
+      member.memberId = String(params.ConferenceMemberID || '') || null;
+      member.status = 'joined';
+      member.reason = null;
+      log('ok', `Conference ${room.name}: ${member.label} joined`);
+      // Back from hold: the new member is unmuted; mute it again if it was.
+      if (member.muted && member.memberId) {
+        background(vobizApi('POST', memberPath(room, member, 'Mute/')), 'mute after resume');
+      }
+      return;
+    }
+    if (action !== 'exit' || !member || !PRESENT.has(member.status)) return;
+    member.memberId = null;
+    if (member.status === 'holding') {
+      member.status = 'on_hold';
+      log('..', `Conference ${room.name}: ${member.label} is on hold`);
+      return;
+    }
+    if (member.status === 'on_hold' || member.status === 'resuming') return;
+    member.status = 'left';
+    log('..', `Conference ${room.name}: ${member.label} left`);
+    if (member.role === 'host') await endRoom(room, 'the app left');
+    else await maybeEndRoom(room);
+  }
+
+  /** Vobiz: a call the bridge dialled into the room has ended (hangup_url). */
+  async function onConfDialEnded(req, res, url, params) {
+    sendText(res, 200, 'OK');
+    const ref = roomFromPath(url);
+    const room = ref?.role === 'dial' ? ref.room : null;
+    if (!room) return;
+    const ids = [params.CallUUID, params.RequestUUID].map((v) => String(v || '').toLowerCase()).filter(Boolean);
+    const member = room.members.find((m) => ids.includes(m.callUuid) || ids.includes(m.requestUuid));
+    if (!member || !PRESENT.has(member.status)) return;
+    if (member.status === 'dialing') {
+      member.status = 'failed';
+      member.reason = hangupReason(params);
+      log('..', `Conference ${room.name}: ${member.label} did not join (${member.reason})`);
+    } else {
+      member.status = 'left';
+      log('..', `Conference ${room.name}: ${member.label} hung up`);
+    }
+    member.memberId = null;
+    await maybeEndRoom(room);
+  }
+
+  /** Does `action` to `member`. Returns why it cannot be done now, or null when done. */
+  async function participantAction(room, member, action) {
+    const inRoom = member.status === 'joined' && Boolean(member.memberId);
+    if (action === 'mute' || action === 'unmute') {
+      if (!inRoom) return `${member.label} is not in the room`;
+      await vobizApi(action === 'mute' ? 'POST' : 'DELETE', memberPath(room, member, 'Mute/'));
+      member.muted = action === 'mute';
+      log('ok', `Conference ${room.name}: ${member.label} ${action}d`);
+      return null;
+    }
+    if (action === 'hold') {
+      if (!inRoom || !member.callUuid) return `${member.label} is not in the room`;
+      member.status = 'holding';
+      try {
+        await vobizApi('POST', `/Call/${encodeURIComponent(member.callUuid)}/`, {
+          legs: 'aleg',
+          aleg_url: `${publicBase()}/conf-hold/${roomRef(room.name, 'hold')}`,
+          aleg_method: 'POST',
+        });
+      } catch (error) {
+        member.status = 'joined';
+        throw error;
+      }
+      log('ok', `Conference ${room.name}: ${member.label} goes on hold`);
+      return null;
+    }
+    if (action === 'resume') {
+      if (!['on_hold', 'holding'].includes(member.status) || !member.callUuid) return `${member.label} is not on hold`;
+      const previous = member.status;
+      member.status = 'resuming';
+      try {
+        await vobizApi('POST', `/Call/${encodeURIComponent(member.callUuid)}/`, {
+          legs: 'aleg',
+          aleg_url: `${publicBase()}/conf-room/${roomRef(room.name, member.role === 'guest' ? 'guest' : 'added')}`,
+          aleg_method: 'POST',
+        });
+      } catch (error) {
+        member.status = previous;
+        throw error;
+      }
+      log('ok', `Conference ${room.name}: ${member.label} comes back from hold`);
+      return null;
+    }
+    // remove
+    if (inRoom) {
+      await vobizApi('DELETE', memberPath(room, member, ''));
+    } else if (PRESENT.has(member.status) && (member.callUuid || member.requestUuid)) {
+      try {
+        await vobizApi('DELETE', `/Call/${encodeURIComponent(member.callUuid || member.requestUuid)}/`);
+      } catch (error) {
+        if (!isGone(error)) throw error;
+      }
+    } else {
+      return `${member.label} is not on the call`;
+    }
+    member.status = 'left';
+    member.reason = 'removed';
+    member.memberId = null;
+    log('ok', `Conference ${room.name}: ${member.label} removed`);
+    await maybeEndRoom(room);
+    return null;
+  }
+
+  /**
+   * People on hold are outside the room, so no exit event says when they
+   * hang up: now and then ask Vobiz whether their calls are still live.
+   */
+  async function checkHeld(room) {
+    if (room.over || Date.now() - room.holdCheckAt < HOLD_CHECK_MS) return;
+    const held = room.members.filter((m) => m.status === 'on_hold' && m.callUuid);
+    if (!held.length) return;
+    room.holdCheckAt = Date.now();
+    for (const member of held) {
+      try {
+        await vobizApi('GET', `/Call/${encodeURIComponent(member.callUuid)}/?status=live`);
+      } catch (error) {
+        if (!isGone(error)) continue;
+        member.status = 'left';
+        log('..', `Conference ${room.name}: ${member.label} hung up while on hold`);
+      }
+    }
+    await maybeEndRoom(room);
+  }
+
+  /** Only the app is left (nobody else in the room, ringing or on hold): end the room. */
+  async function maybeEndRoom(room) {
+    if (room.over) return;
+    if (room.members.some((m) => m.role !== 'host' && PRESENT.has(m.status))) return;
+    await endRoom(room, 'everyone else left');
+  }
+
+  /** Ends the room for everyone, including people on hold and calls still ringing. */
+  async function endRoom(room, why) {
+    if (room.over) return;
+    room.over = true;
+    room.endedAt = Date.now();
+    room.endReason = why;
+    const outside = room.members.filter((m) => ['dialing', 'moving', 'holding', 'on_hold', 'resuming'].includes(m.status)
+      && m.role !== 'host' && (m.callUuid || m.requestUuid));
+    for (const member of room.members) {
+      if (PRESENT.has(member.status)) member.status = 'left';
+      member.memberId = null;
+    }
+    try {
+      await vobizApi('DELETE', `/Conference/${encodeURIComponent(room.name)}/`);
+    } catch (error) {
+      if (!isGone(error)) log('!!', `Conference ${room.name}: could not end it: ${error.message}`);
+    }
+    await Promise.all(outside.map((member) => vobizApi('DELETE', `/Call/${encodeURIComponent(member.callUuid || member.requestUuid)}/`)
+      .catch((error) => { if (!isGone(error)) log('!!', `Conference ${room.name}: could not hang up ${member.label}: ${error.message}`); })));
+    log('ok', `Conference ${room.name} ended: ${why}`);
+  }
+
+  function forgetRoom(room) {
+    rooms.delete(room.name);
+    for (const [uuid, name] of roomOfCall) if (name === room.name) roomOfCall.delete(uuid);
+  }
+
+  /** The room `uuid` is in (the app's call or any member's leg), or null. */
+  function roomForCall(uuid) {
+    const name = roomOfCall.get(uuid);
+    return (name && rooms.get(name)) || null;
+  }
+
+  function activeRoomOf(uuid) {
+    const room = roomForCall(String(uuid || '').toLowerCase());
+    return room && !room.over ? room : null;
+  }
+
+  function memberPath(room, member, suffix) {
+    return `/Conference/${encodeURIComponent(room.name)}/Member/${encodeURIComponent(member.memberId)}/${suffix}`;
+  }
+
+  /** `<room>.<role>.<tag>`: the tag proves the bridge wrote this path for this room and role. */
+  function roomRef(name, role) {
+    return `${encodeURIComponent(name)}.${role}.${roomTag(name, role)}`;
+  }
+
+  function roomTag(name, role) {
+    return crypto.createHmac('sha256', state.webhookSecret).update(`conf:${name}:${role}`).digest('base64url').slice(0, 22);
+  }
+
+  /** { room (or null when it is gone), role } from a /conf-… path, or null if the tag is wrong. */
+  function roomFromPath(url) {
+    const parts = (url.pathname.split('/')[2] || '').split('.');
+    if (parts.length !== 3) return null;
+    let name;
+    try { name = decodeURIComponent(parts[0]); } catch { return null; }
+    if (!safeEqual(parts[2], roomTag(name, parts[1]))) return null;
+    return { room: rooms.get(name) || null, role: parts[1] };
+  }
+
+  /** The state the app shows. */
+  function publicRoom(room) {
+    return {
+      room: room.name,
+      active: !room.over,
+      ...(room.over && room.endReason ? { ended_reason: room.endReason } : {}),
+      participants: room.members.map((m) => ({
+        id: m.id,
+        label: m.label,
+        you: m.role === 'host',
+        role: m.role,
+        status: ({ moving: 'connecting', resuming: 'connecting', holding: 'on_hold' })[m.status] || m.status,
+        muted: m.muted,
+        ...(m.reason ? { reason: m.reason } : {}),
+      })),
+    };
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1359,7 +2028,7 @@ export function createBridge(options = {}) {
     fs.renameSync(tmp, config.stateFile);
   }
 
-  return { server, config, state, calls, start, close, firebase, verifySignatures, ringTargets };
+  return { server, config, state, calls, rooms, start, close, firebase, verifySignatures, ringTargets };
 }
 
 // ── Module helpers ───────────────────────────────────────────────────────────
@@ -1429,6 +2098,15 @@ function short(id) {
 /** A Vobiz API error for a call that no longer exists. */
 function isGone(error) {
   return / → 404 /.test(String(error?.message || ''));
+}
+
+/** Why a dialled call ended before it was answered, in a few words. */
+function hangupReason(params) {
+  const cause = String(params.HangupCauseName || params.HangupCause || params.CallStatus || '').toLowerCase();
+  if (/busy/.test(cause)) return 'busy';
+  if (/no.?answer|no_user_response|timeout|cancel/.test(cause)) return 'no answer';
+  if (/reject|declin/.test(cause)) return 'declined';
+  return cause ? cause.replace(/_/g, ' ') : 'not answered';
 }
 
 function secs(ms) {
@@ -1552,6 +2230,34 @@ function makeToneWav(seconds, bursts, freqs = [375, 425]) {
     }
     pcm.writeInt16LE(Math.round(value * 32767), i * 2);
   }
+  return wavFile(pcm, rate);
+}
+
+/**
+ * Eight seconds of quiet hold music (a slow arpeggio, half a second a note,
+ * each faded in and out so the loop has no clicks) as 8 kHz 16-bit mono WAV.
+ */
+function makeHoldMusicWav() {
+  const rate = 8000;
+  const notes = [261.63, 329.63, 392.0, 523.25, 392.0, 329.63, 293.66, 349.23,
+    440.0, 587.33, 440.0, 349.23, 261.63, 329.63, 392.0, 329.63];
+  const noteSeconds = 0.5;
+  const samples = Math.round(rate * noteSeconds * notes.length);
+  const pcm = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i += 1) {
+    const t = i / rate;
+    const n = Math.min(notes.length - 1, Math.floor(t / noteSeconds));
+    const local = t - n * noteSeconds;
+    const envelope = Math.min(1, local / 0.03) * Math.min(1, (noteSeconds - local) / 0.15);
+    const f = notes[n];
+    const value = 0.12 * envelope * (Math.sin(2 * Math.PI * f * t) + 0.3 * Math.sin(4 * Math.PI * f * t)) / 1.3;
+    pcm.writeInt16LE(Math.round(value * 32767), i * 2);
+  }
+  return wavFile(pcm, rate);
+}
+
+/** 16-bit mono PCM samples as a WAV file. */
+function wavFile(pcm, rate) {
   const header = Buffer.alloc(44);
   header.write('RIFF', 0);
   header.writeUInt32LE(36 + pcm.length, 4);

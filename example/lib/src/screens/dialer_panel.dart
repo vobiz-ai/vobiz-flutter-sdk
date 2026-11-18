@@ -5,6 +5,7 @@ import '../playground_controller.dart';
 import '../theme.dart';
 import '../widgets/call_headers_panel.dart';
 import '../widgets/common.dart';
+import '../widgets/conference_sheet.dart';
 import '../widgets/keypad.dart';
 import '../widgets/latency_chart.dart';
 import '../widgets/phone_number_field.dart';
@@ -358,6 +359,13 @@ class _DialerPanelState extends State<DialerPanel> {
               label: 'Transfer',
               active: false,
               onTap: live ? () => showTransferSheet(context, c) : null,
+              pg: pg,
+            ),
+            _control(
+              icon: c.conference?.active == true ? Icons.groups : Icons.group_add,
+              label: c.conference?.active == true ? 'People (${c.conference!.present.length})' : 'Add',
+              active: c.conference?.active == true,
+              onTap: live ? () => showConferenceSheet(context, c) : null,
               pg: pg,
             ),
           ],

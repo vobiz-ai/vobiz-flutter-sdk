@@ -15,8 +15,14 @@ class CallEvent extends SdkEvent {
     this.headers = const <String, String>{},
     this.sipCode,
     this.reason,
+    this.sipCallId,
     super.timestamp,
   });
+
+  /// The call's SIP Call-ID: for an incoming call, its INVITE's. A call Vobiz
+  /// held while a push woke the app arrives with the push's `call_id` here
+  /// (see `VobizIncomingPush.matchesIncomingCall`).
+  final String? sipCallId;
 
   final String callId;
   final CallStateStatus state;

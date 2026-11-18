@@ -128,6 +128,27 @@ class PushBridgeApi {
   /// Forgets this phone on the bridge (device token).
   Future<void> unregister() => _post('/push/unregister', const <String, Object?>{});
 
+  /// An access token (JWT) the bridge mints with the account's Auth Token,
+  /// for signing in as `<sub>_<auth id>` (the bridge's JWT_SUB unless [sub]
+  /// is given). [reason] is the SDK's (`sign_in`, `expiring`, `rejected`,
+  /// `refresh`). Sends the device token when this phone has paired, else
+  /// the bridge key.
+  Future<String> accessToken({String? sub, required String reason}) async {
+    final body = <String, Object?>{'reason': reason, if (sub != null) 'sub': sub};
+    Map<String, dynamic> json;
+    try {
+      json = await _post('/token', body);
+    } on PushBridgeException catch (e) {
+      if (e.statusCode != 401 || deviceToken == null) rethrow;
+      json = await _post('/token', body, pair: true);
+    }
+    final token = json['token'];
+    if (token is! String || token.isEmpty) {
+      throw PushBridgeException('The push server returned no token');
+    }
+    return token;
+  }
+
   /// During a call, every second: this phone still has its network. When the
   /// reports stop, the bridge (still online) has Vobiz beep to the other
   /// party, and ends the call once the SDK's 12 s reconnect window is over:

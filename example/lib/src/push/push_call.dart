@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:vobiz_webrtc/vobiz_webrtc.dart' show VobizIncomingPush;
 
 /// What a push message from the push bridge asks the app to do.
 enum PushKind {
@@ -49,13 +50,20 @@ class PushCall {
     this.isTest = false,
     this.lineBusy = false,
     this.answeredBy = '',
+    this.callUuid = '',
+    this.callerNumber = '',
+    this.holdIndex = '',
+    this.holdLabel = '',
+    this.registrar = '',
   });
 
-  /// Reads a Firebase data message. Null when it is not from the push bridge.
+  /// Reads a Firebase data message: from the push bridge, or from Vobiz
+  /// itself (a call its registrar holds: [isVobiz]). Null for anything else.
   ///
   /// The call screen expires `ttl_ms` after [receivedAt] (default: now), so
-  /// a phone whose clock is off still stops ringing on time. Only without
-  /// `ttl_ms` (older bridges) is the bridge's absolute `expires_at` used.
+  /// a phone whose clock is off still stops ringing on time. Without
+  /// `ttl_ms` the absolute `expires_at` is used: Unix seconds from Vobiz,
+  /// milliseconds from the bridge, told apart by size.
   static PushCall? fromData(Map<String, dynamic> data, {DateTime? receivedAt}) {
     final kind = switch ('${data['type'] ?? ''}') {
       'incoming_call' => PushKind.incomingCall,
@@ -68,7 +76,9 @@ class PushCall {
     final at = int.tryParse('${data['expires_at'] ?? ''}');
     final expires = ttl != null
         ? (receivedAt ?? DateTime.now()).add(Duration(milliseconds: ttl)).millisecondsSinceEpoch
-        : at;
+        : at == null
+            ? null
+            : VobizIncomingPush.epochToDateTime(at).millisecondsSinceEpoch;
     return PushCall(
       kind: kind,
       callId: callId,
@@ -81,6 +91,11 @@ class PushCall {
       isTest: '${data['test'] ?? ''}' == '1',
       lineBusy: '${data['line_busy'] ?? ''}' == '1',
       answeredBy: '${data['answered_by'] ?? ''}',
+      callUuid: '${data['call_uuid'] ?? ''}',
+      callerNumber: '${data['caller_number'] ?? ''}',
+      holdIndex: '${data['index'] ?? ''}',
+      holdLabel: '${data['label'] ?? ''}',
+      registrar: '${data['registrar'] ?? ''}',
     );
   }
 
@@ -92,8 +107,34 @@ class PushCall {
 
   final PushKind kind;
 
-  /// Vobiz's CallUUID for the inbound call.
+  /// The call's reference: the bridge's CallUUID for it (its PushRef), or,
+  /// for a call Vobiz holds ([isVobiz]), the SIP Call-ID of the held INVITE.
   final String callId;
+
+  /// Vobiz's CallUUID (Vobiz pushes).
+  final String callUuid;
+
+  /// The caller's number (Vobiz pushes, whose [caller] may be a name).
+  final String callerNumber;
+
+  /// Where Vobiz's registrar holds the call (Vobiz pushes): handed back on the
+  /// REGISTER that claims it, as X-Index, X-Label and X-vobiz-Registrar-Info.
+  final String holdIndex;
+  final String holdLabel;
+  final String registrar;
+
+  /// A call Vobiz's registrar holds until this phone claims it, rather than
+  /// one the push bridge rings again.
+  bool get isVobiz => holdIndex.isNotEmpty && holdLabel.isNotEmpty && registrar.isNotEmpty;
+
+  /// Who to show on the call screen: the caller's name or number.
+  String get displayCaller => caller.isNotEmpty ? caller : callerNumber;
+
+  /// The push as the SDK reads it, for `VobizClient.handleIncomingPush` and
+  /// the call-screen reports. Null unless [isVobiz].
+  VobizIncomingPush? get sdkPush => isVobiz
+      ? VobizIncomingPush.tryParse(toExtra().map((key, value) => MapEntry(key, value as Object?)))
+      : null;
 
   /// Lets this device accept or decline this one call on the bridge.
   final String callKey;
@@ -143,6 +184,9 @@ class PushCall {
         'server': server,
         if (expiresAt != null) 'expires_at': '${expiresAt!.millisecondsSinceEpoch}',
         if (isTest) 'test': '1',
+        if (callUuid.isNotEmpty) 'call_uuid': callUuid,
+        if (callerNumber.isNotEmpty) 'caller_number': callerNumber,
+        if (isVobiz) ...<String, dynamic>{'index': holdIndex, 'label': holdLabel, 'registrar': registrar},
       };
 
   @override
@@ -176,14 +220,16 @@ String? pushRefFromHeaders(Map<String, String> headers) {
   return null;
 }
 
-/// Whether an incoming SIP call is the call [push] announced: only when the
-/// INVITE carries the bridge's call reference for exactly that call.
+/// Whether an incoming SIP call is the call [push] announced: for a call
+/// Vobiz held, only when the INVITE's SIP Call-ID ([sipCallId],
+/// `CallEvent.sipCallId`) is the push's; for the bridge, only when the INVITE
+/// carries the bridge's call reference for exactly that call.
 ///
 /// Numbers are never enough. With the bridge's default caller ID every call
 /// shows the Vobiz number, so matching by number would answer any call that
 /// arrived after an Accept without a tap.
-bool inviteMatchesPush(PushCall push, {required Map<String, String> headers}) =>
-    pushRefFromHeaders(headers) == push.callId;
+bool inviteMatchesPush(PushCall push, {required Map<String, String> headers, String? sipCallId}) =>
+    push.isVobiz ? sipCallId != null && sipCallId == push.callId : pushRefFromHeaders(headers) == push.callId;
 
 /// The real caller the bridge passed on the INVITE (`X-VH-Caller`), when its
 /// caller ID shows the Vobiz number instead.
