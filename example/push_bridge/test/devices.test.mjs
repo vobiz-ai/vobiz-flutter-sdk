@@ -31,6 +31,26 @@ test('a username that is not an endpoint on the account cannot be registered', a
   assert.deepEqual(ctx.bridge.state.devices, {});
 });
 
+test('an endpoint past the first page is found: Vobiz returns 20 a page whatever the limit', async (t) => {
+  const names = Array.from({ length: 45 }, (_, i) => `user${i}`);
+  const ctx = await startBridge({
+    apiHandler: (method, pathname) => {
+      if (!pathname.startsWith('/Endpoint/')) return { message: 'ok' };
+      const offset = Number(new URL(pathname, 'https://x').searchParams.get('offset') || 0);
+      return {
+        objects: names.slice(offset, offset + 20).map((username) => ({ username })),
+        meta: { total_count: names.length, limit: 20, offset },
+      };
+    },
+  });
+  t.after(ctx.stop);
+  const r = await postJson(ctx, '/push/register', { username: 'user30', token: fcmToken('m') }, { 'X-Bridge-Key': BRIDGE_KEY });
+  assert.equal(r.status, 200, `the 31st endpoint was refused: ${JSON.stringify(r.body ?? r)}`);
+  const offsets = ctx.api.filter((c) => c.pathname.startsWith('/Endpoint/'))
+    .map((c) => Number(new URL(c.pathname, 'https://x').searchParams.get('offset')));
+  assert.deepEqual(offsets, [0, 20, 40]);
+});
+
 test('registration without the bridge key or a device token is refused', async (t) => {
   const ctx = await startBridge();
   t.after(ctx.stop);

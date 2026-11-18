@@ -64,4 +64,32 @@ void main() {
     await settle();
     expect(controller.status, PhoneStatus.online);
   });
+
+  // Seen live 2026-10-26: the network went while an outgoing call rang. The
+  // SDK ended the call, but the app stayed on "Ringing" for good: re-registering
+  // leaves a ringing screen alone, as if a call were still up.
+  test('an outgoing call still ringing when the network drops leaves the ringing screen', () async {
+    client.connected = true;
+    client.emit(CallStateStatus.ringing, dir: CallDirection.outbound);
+    await settle();
+    expect(controller.status, PhoneStatus.ringing);
+
+    // The socket dropped: the SDK reports reconnecting, then ends a call not
+    // yet answered at once.
+    client.connected = false;
+    client.connection = ConnectionStateStatus.reconnecting;
+    client.emit(CallStateStatus.ended, dir: CallDirection.outbound, reason: 'network_lost');
+    await settle();
+    expect(controller.status, PhoneStatus.connecting);
+    expect(controller.statusText, 'Reconnecting...');
+
+    client.connected = true;
+    client.connection = null;
+    client.fakeConnections.add(ConnectionEvent(
+      connectionState: ConnectionStateStatus.connected,
+      registrationState: RegistrationState.registered,
+    ));
+    await settle();
+    expect(controller.status, PhoneStatus.online);
+  });
 }

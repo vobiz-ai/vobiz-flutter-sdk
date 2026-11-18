@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 
 import '../audio/audio_route.dart';
 import '../audio/proximity.dart';
+import '../auth/access_token.dart';
 import '../backend/webhook_server_api.dart';
 import '../calls/call_session.dart';
 import '../errors/vobiz_exception.dart';
@@ -29,6 +30,7 @@ import '../network/connection_supervisor.dart';
 import '../network/app_lifecycle_monitor.dart';
 import '../network/connectivity_monitor.dart';
 import '../network/network_event.dart';
+import '../push/vobiz_push.dart';
 import '../signaling/sip_service.dart';
 import '../state/call_state.dart';
 import '../state/connection_state.dart';
@@ -197,9 +199,13 @@ class VobizClient {
   String? _authId;
   String? _authToken;
 
-  // Credentials stored for reconnection
+  // Credentials stored for reconnection: a password, or an access token.
   String? _username;
   String? _password;
+  VobizAccessToken? _accessToken;
+
+  bool get _hasSignIn =>
+      _username != null && (_password != null || _accessToken != null);
 
   // Inbound call state
   String? _pendingInboundCaller;
@@ -227,6 +233,24 @@ class VobizClient {
   final _mediaEvents = StreamController<MediaEvent>.broadcast();
   final _errorEvents = StreamController<ErrorEvent>.broadcast();
   final _networkEvents = StreamController<NetworkEvent>.broadcast();
+  final _pushCallUpdates = StreamController<VobizPushCallUpdate>.broadcast();
+
+  /// The call a Vobiz push announced ([handleIncomingPush]), until its INVITE
+  /// arrives and the call ends, or the push expires.
+  _PushedCall? _pushed;
+
+  /// This SDK's version, for `VobizPushDevice.sdkVersion` and logs.
+  static const String sdkVersion = '0.2.0';
+
+  /// What becomes of each call push handed to [handleIncomingPush]: claimed,
+  /// ringing, answered or declined from the call screen, or expired.
+  Stream<VobizPushCallUpdate> get pushCallUpdates => _pushCallUpdates.stream;
+
+  /// The push whose call is awaited or ringing, if any.
+  VobizIncomingPush? get pushedCall => _pushed?.push;
+
+  /// Whether [callId] (a `CallEvent.callId`) is the call a push announced.
+  bool isPushedCall(String callId) => _pushed?.callId == callId;
 
   Stream<ConnectionEvent> get connectionEvents => _connectionEvents.stream;
   Stream<CallEvent> get callEvents => _callEvents.stream;
@@ -271,8 +295,21 @@ class VobizClient {
   /// How this client signed in.
   VobizAuthMode get authMode => _authMode;
 
-  /// The SIP username this client registers as, once signed in.
+  /// The SIP username this client registers as, once signed in. For an
+  /// access token it is `<sub>_<iss>`.
   String? get sipUsername => _username;
+
+  /// The access token this client signed in with: identity, expiry and
+  /// grants. Null unless [authMode] is [VobizAuthMode.accessToken].
+  VobizAccessToken? get accessToken => _accessToken;
+
+  /// How long the registrar said the access token had left, at the last
+  /// successful REGISTER (from its clock, not the device's). Null before one,
+  /// or without an access token.
+  Duration? get accessTokenTimeLeft {
+    final seconds = _accessToken == null ? null : _sip.accessTokenExpiresIn;
+    return seconds == null ? null : Duration(seconds: seconds);
+  }
 
   /// The current call's state ([CallStateStatus.idle] between calls).
   CallStateStatus get callState => _callState;
@@ -407,6 +444,232 @@ class VobizClient {
     return _connectWithCredentials(config.username, config.password);
   }
 
+  /// Signs in with an access token (JWT) that your backend minted with
+  /// `POST /api/v1/Account/{auth_id}/JWT/Token/`. The same as the web SDK's
+  /// `loginWithAccessToken`.
+  ///
+  /// The client registers as `<sub>_<iss>` ([sipUsername]) with the token in
+  /// an `X-Vobiz-Jwt` header instead of a password, and sends it on every
+  /// outbound INVITE, where its `app` claim picks the application whose
+  /// Answer URL handles the call. No endpoint has to exist in the Console,
+  /// and neither the Auth Token nor a SIP password reaches the device. To
+  /// ring this user, dial `<User>sip:<sub>_<iss>@registrar.vobiz.ai</User>`.
+  ///
+  /// The token is not renewed: once it expires the next REGISTER is refused
+  /// (`ACCESS_TOKEN_EXPIRED`). Pass a fresh one to [updateAccessToken] before
+  /// then, or sign in with `connectWithAccessTokenProvider`, which does it
+  /// for you.
+  ///
+  /// Throws [VobizAccessTokenException] (`INVALID_ACCESS_TOKEN`) before
+  /// connecting when [accessToken] is not a Vobiz token. Like
+  /// [connectWithCredentials] it completes once the REGISTER is sent; watch
+  /// [connectionEvents] for the answer. A refusal arrives as an [ErrorEvent]
+  /// with code [VobizErrorCode.registrationFailed] whose `cause` is a
+  /// [VobizAccessTokenException] carrying the registrar's reason.
+  Future<void> connectWithAccessToken(String accessToken) async {
+    final token = VobizAccessToken.parse(accessToken);
+    _closeExistingConnection();
+    _authMode = VobizAuthMode.accessToken;
+    _authId = null;
+    _authToken = null;
+    _logger.info('Signing in with an access token as ${token.sipUsername}, '
+        'valid until ${token.expiresAt.toIso8601String()}');
+    await _connectWithAccessToken(token);
+  }
+
+  /// Presents a fresh access token for the same user, without dropping the
+  /// connection or a call: the client registers again with it right away.
+  ///
+  /// Call it before the current token expires (the provider session does).
+  /// It also recovers a client whose token was refused: it registers again,
+  /// on the open socket when a call is keeping it up.
+  ///
+  /// Throws [StateError] unless signed in with an access token, and
+  /// [ArgumentError] when [accessToken] is for another user (another `sub`
+  /// or `iss`): sign in again with [connectWithAccessToken] to switch users.
+  Future<void> updateAccessToken(String accessToken) async {
+    final current = _accessToken;
+    if (_authMode != VobizAuthMode.accessToken || current == null) {
+      throw StateError('Not signed in with an access token: call connectWithAccessToken first');
+    }
+    final next = VobizAccessToken.parse(accessToken);
+    if (next.accountId != current.accountId || next.subject != current.subject) {
+      throw ArgumentError.value(next.sipUsername, 'accessToken',
+          'is for another user than ${current.sipUsername}; sign in with connectWithAccessToken to switch');
+    }
+    _accessToken = next;
+    _sip.updateAccessToken(next.token);
+    _logger.info('New access token for $_username, valid until ${next.expiresAt.toIso8601String()}');
+    // Registered: present it now on the same socket. A call is not touched.
+    if (isConnected && _sip.refreshRegistration()) return;
+    // Reconnecting after a drop: the next attempt carries the new token.
+    if (_connectionState == ConnectionStateStatus.reconnecting && _supervisor.isRunning) return;
+    // The last token was refused: register again with this one, on the
+    // socket a call is keeping open if there is one.
+    if (_sip.registerAgain()) {
+      _registrationState = RegistrationState.registering;
+      _connectionState = ConnectionStateStatus.connecting;
+      _connectionEvents.addIfOpen(ConnectionEvent(
+        connectionState: _connectionState,
+        registrationState: _registrationState,
+        message: 'Registering with a new access token',
+      ));
+      if (_config.autoReconnect && !_supervisor.isRunning) await _supervisor.start();
+      return;
+    }
+    await _connectAndRegister(reconnecting: false);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Incoming calls to a closed app: Vobiz push
+  // ---------------------------------------------------------------------------
+
+  /// Hands Vobiz's incoming-call push to the client: a call Vobiz's
+  /// registrar holds (up to 30 s) while the push wakes the app.
+  ///
+  /// The client claims the call: a REGISTER carries the push's hold
+  /// reference ([VobizIncomingPush.hold]), and the registrar then sends the
+  /// held INVITE to this registration. Signed in and registered, that
+  /// REGISTER goes at once. Otherwise sign in now ([connectWithCredentials],
+  /// [connectWithAccessToken], and so on), and the sign-in's REGISTER carries
+  /// it.
+  ///
+  /// The INVITE arrives as a normal incoming call whose `CallEvent.sipCallId`
+  /// is the push's `call_id`; [isPushedCall] tells it apart. Report the call
+  /// screen's buttons with [reportCallScreenAccepted] and
+  /// [reportCallScreenDeclined]: a call accepted, or declined, before its
+  /// INVITE arrives is answered, or declined, as soon as it does.
+  /// [pushCallUpdates] reports each step, and `expired` when no INVITE came
+  /// by the push's expiry: take the call screen down then.
+  ///
+  /// Returns false and does nothing for a push that is not a call Vobiz holds
+  /// ([VobizIncomingPush.isHeldByVobiz]), is a test, or has expired. A repeat
+  /// of the push being handled returns true and does nothing more.
+  bool handleIncomingPush(VobizIncomingPush push) {
+    final hold = push.hold;
+    if (push.kind != VobizPushKind.incomingCall || hold == null || push.isTest || push.isExpired()) {
+      return false;
+    }
+    final current = _pushed;
+    if (current != null && current.push.callId == push.callId) return true;
+    _forgetPushedCall();
+    final pushed = _PushedCall(push);
+    _pushed = pushed;
+    final expiresAt = push.expiresAt;
+    if (expiresAt != null) {
+      pushed.expiry = Timer(expiresAt.difference(DateTime.now()), () => _expirePushedCall(pushed));
+    }
+    _emitPushUpdate(pushed, VobizPushCallStatus.claiming);
+    final sentNow = _sip.claimHeldCall(hold.registerHeaders);
+    _logger.info(sentNow
+        ? 'Claiming the call ${push.callId} that Vobiz holds: REGISTER sent with its hold reference'
+        : 'Claiming the call ${push.callId} that Vobiz holds: the next REGISTER carries its hold reference');
+    // Signed in but between connections: reconnect now rather than at the
+    // next backoff step, so the claim is made while the call is still held.
+    if (!sentNow && _connectionState == ConnectionStateStatus.reconnecting) {
+      _supervisor.reconnectNow();
+    }
+    return true;
+  }
+
+  /// The user tapped Accept on the call screen for [push]. Answers its call
+  /// now if it is ringing, or as soon as its INVITE arrives. A push not
+  /// handed to [handleIncomingPush] yet (Accept after a cold start) is
+  /// handled first.
+  void reportCallScreenAccepted(VobizIncomingPush push) {
+    final pushed = _pushedFor(push);
+    if (pushed == null) return;
+    pushed.accepted = true;
+    pushed.declined = false;
+    final id = pushed.callId;
+    if (id != null && _callId == id && _callState == CallStateStatus.incoming) {
+      _emitPushUpdate(pushed, VobizPushCallStatus.answering);
+      unawaited(acceptCall(id));
+    }
+  }
+
+  /// The user tapped Decline on the call screen for [push]. Declines its call
+  /// now if it is ringing, or as soon as its INVITE arrives: the claim still
+  /// goes, so the caller hears busy at once instead of ringing out the
+  /// registrar's hold. Vobiz has no way yet to decline a held call without
+  /// claiming it.
+  void reportCallScreenDeclined(VobizIncomingPush push) {
+    final pushed = _pushedFor(push);
+    if (pushed == null) return;
+    pushed.declined = true;
+    pushed.accepted = false;
+    final id = pushed.callId;
+    if (id != null && _callId == id && _callState == CallStateStatus.incoming) {
+      _emitPushUpdate(pushed, VobizPushCallStatus.declining);
+      unawaited(rejectCall(id));
+    }
+  }
+
+  /// The pushed call [push] is about, handling the push first when the app
+  /// went straight to its call screen.
+  _PushedCall? _pushedFor(VobizIncomingPush push) {
+    final current = _pushed;
+    if (current != null && current.push.callId == push.callId) return current;
+    if (!handleIncomingPush(push)) return null;
+    return _pushed;
+  }
+
+  /// An INVITE arrived: is it the call the push announced? Only an exact
+  /// Call-ID match counts, so another call from the same caller is never
+  /// answered for them.
+  void _matchPushedCall(String callId, String callerId, Map<String, String> headers) {
+    final pushed = _pushed;
+    if (pushed == null || pushed.callId != null) return;
+    final sipCallId = _sip.activeSipCallId;
+    if (!pushed.push.matchesIncomingCall(headers: headers, sipCallId: sipCallId)) {
+      final number = pushed.push.callerNumber.isNotEmpty ? pushed.push.callerNumber : pushed.push.caller;
+      if (VobizIncomingPush.samePhoneNumber(callerId, number)) {
+        _logger.warn('A call from $callerId arrived while the pushed call ${pushed.push.callId} was '
+            'awaited, with another Call-ID ($sipCallId): not taken for the pushed call');
+      }
+      return;
+    }
+    pushed.callId = callId;
+    pushed.expiry?.cancel();
+    _logger.info('The pushed call ${pushed.push.callId} arrived');
+    _emitPushUpdate(pushed, VobizPushCallStatus.ringing);
+    if (pushed.declined) {
+      _emitPushUpdate(pushed, VobizPushCallStatus.declining);
+      unawaited(rejectCall(callId));
+    } else if (pushed.accepted) {
+      _emitPushUpdate(pushed, VobizPushCallStatus.answering);
+      unawaited(acceptCall(callId));
+    }
+  }
+
+  /// A pushed call that no REGISTER has claimed yet rides on the next one.
+  void _claimPushedCallOnRegister() {
+    final pushed = _pushed;
+    final hold = pushed?.push.hold;
+    if (pushed == null || hold == null || pushed.claimed || pushed.callId != null) return;
+    if (pushed.push.isExpired()) return;
+    _sip.claimHeldCall(hold.registerHeaders);
+  }
+
+  void _expirePushedCall(_PushedCall pushed) {
+    if (!identical(_pushed, pushed) || pushed.callId != null) return;
+    _logger.warn('The pushed call ${pushed.push.callId} did not arrive before the push expired');
+    _pushed = null;
+    _sip.cancelHeldCallClaim();
+    _emitPushUpdate(pushed, VobizPushCallStatus.expired);
+  }
+
+  void _forgetPushedCall() {
+    final pushed = _pushed;
+    if (pushed == null) return;
+    pushed.expiry?.cancel();
+    _pushed = null;
+    if (pushed.callId == null) _sip.cancelHeldCallClaim();
+  }
+
+  void _emitPushUpdate(_PushedCall pushed, VobizPushCallStatus status) => _pushCallUpdates
+      .addIfOpen(VobizPushCallUpdate(push: pushed.push, status: status, callId: pushed.callId));
+
   /// Reconnects and re-registers now, resetting the retry backoff.
   ///
   /// Call it when a push arrives, or from a "retry" button after a
@@ -418,17 +681,26 @@ class VobizClient {
   /// Signs out. A call in progress is ended first, while the socket is still
   /// open: a ringing call is declined (480) and any other gets a BYE, so the
   /// far end is not left talking to a closed socket.
-  Future<void> disconnect() async {
+  ///
+  /// [unregister] false closes the connection without a REGISTER
+  /// `Expires: 0`, as when Android kills the app: Vobiz keeps this phone's
+  /// registration until its keep-alive finds the socket gone (a few
+  /// seconds), and a call in that time takes Vobiz's push-to-wake path: the
+  /// registrar holds it and pushes the devices registered for this SIP user
+  /// ([VobizPushDevices]). For testing that path; a sign-out leaves it true.
+  Future<void> disconnect({bool unregister = true}) async {
     _supervisor.stop();
     _stopWatchingLifecycle();
     _clearCallSetupTimer();
+    _forgetPushedCall();
     final callId = _callId;
     if (callId != null) {
       await _terminate(callId,
           message: 'Signed out', reason: 'disconnected', declineCode: 480);
     }
-    // Unregisters (REGISTER Expires: 0, at most ~2 s) before the socket closes.
-    await _sip.disconnect();
+    // Unregisters (REGISTER Expires: 0, at most ~2 s) before the socket
+    // closes, unless asked not to.
+    await _sip.disconnect(unregister: unregister);
     await _peer.disposeAllCalls();
     _callId = null;
     _callState = CallStateStatus.idle;
@@ -442,6 +714,7 @@ class VobizClient {
     _authToken = null;
     _username = null;
     _password = null;
+    _accessToken = null;
     _connectionEvents.addIfOpen(ConnectionEvent(
       connectionState: _connectionState,
       registrationState: _registrationState,
@@ -451,6 +724,7 @@ class VobizClient {
 
   Future<void> dispose() async {
     await disconnect();
+    await _pushCallUpdates.close();
     await _connectionEvents.close();
     await _callEvents.close();
     await _mediaEvents.close();
@@ -492,6 +766,15 @@ class VobizClient {
     if (!isConnected) throw StateError('Not registered — call connect() first');
     if (_callState != CallStateStatus.idle) {
       throw StateError('Already in a call');
+    }
+    // As the web SDK does: a token that does not grant outgoing calls is
+    // refused here, before the registrar refuses the INVITE.
+    final token = _accessToken;
+    if (token != null && !token.canCallOut) {
+      throw const VobizAccessTokenException(
+          'This access token does not allow outgoing calls '
+          '(per.voice.outgoing_allow is not true)',
+          tokenError: VobizAccessTokenException.invalidGrants);
     }
     final target = destination.trim();
     if (target.isEmpty) throw ArgumentError('A destination is required');
@@ -937,7 +1220,13 @@ class VobizClient {
         registrationState: _registrationState,
         message: 'Registration failed: $reason',
       ));
-      _emitError('registration_failed', reason, null);
+      // A refused access token carries the registrar's reason (10001-10010).
+      _emitError(
+          'registration_failed',
+          reason,
+          _accessToken == null
+              ? null
+              : VobizAccessTokenException(reason, tokenError: _sip.accessTokenError));
     };
 
     _sip.onSocketError = _onSocketLost;
@@ -969,7 +1258,7 @@ class VobizClient {
     _onSignalingLost();
     if (!_config.autoReconnect) return;
     if (immediately) {
-      if (_username != null && _password != null) {
+      if (_hasSignIn) {
         _supervisor.reconnectNow(reason: reason);
       }
     } else {
@@ -1035,6 +1324,13 @@ class VobizClient {
       }
     };
 
+    _sip.onHeldCallClaimed = () {
+      final pushed = _pushed;
+      if (pushed == null || pushed.claimed || pushed.callId != null) return;
+      pushed.claimed = true;
+      _emitPushUpdate(pushed, VobizPushCallStatus.claimed);
+    };
+
     _sip.onIncomingCall = (callerId, sdp, headers) {
       if (_callState != CallStateStatus.idle) return;
       final callId = 'in_${DateTime.now().millisecondsSinceEpoch}';
@@ -1046,6 +1342,7 @@ class VobizClient {
       _callHeaders = Map<String, String>.unmodifiable(headers);
       _callState = CallStateStatus.incoming;
       _emitCallEvent(callId, CallStateStatus.incoming, callerId);
+      _matchPushedCall(callId, callerId, headers);
     };
 
     _sip.onCallEnded = (reason) {
@@ -1119,9 +1416,25 @@ class VobizClient {
   }
 
   Future<void> _connectWithCredentials(String username, String password,
-      {bool reconnecting = false}) async {
+      {bool reconnecting = false}) {
     _username = username;
     _password = password;
+    _accessToken = null;
+    return _connectAndRegister(reconnecting: reconnecting);
+  }
+
+  Future<void> _connectWithAccessToken(VobizAccessToken token) {
+    _username = token.sipUsername;
+    _password = null;
+    _accessToken = token;
+    return _connectAndRegister(reconnecting: false);
+  }
+
+  /// Opens the socket and sends the first REGISTER with whatever this client
+  /// signs in with: a password, or an access token.
+  Future<void> _connectAndRegister({required bool reconnecting}) async {
+    final username = _username;
+    if (username == null) return;
     _registrationState = RegistrationState.registering;
     _connectionState = reconnecting
         ? ConnectionStateStatus.reconnecting
@@ -1138,7 +1451,14 @@ class VobizClient {
         await _supervisor.start();
       }
       await _sip.connect();
-      _sip.register(username, password);
+      // A pushed call not claimed yet rides on this sign-in's REGISTER.
+      _claimPushedCallOnRegister();
+      final token = _accessToken;
+      if (token != null) {
+        _sip.registerWithAccessToken(username, token.token);
+      } else {
+        _sip.register(username, _password ?? '');
+      }
     } catch (e) {
       _registrationState = RegistrationState.failed;
       _connectionState = ConnectionStateStatus.failed;
@@ -1178,20 +1498,19 @@ class VobizClient {
   /// Hands a drop to the supervisor, which applies [SdkConfig.reconnectPolicy]
   /// backoff, gives up after its last attempt, and waits while offline.
   void _scheduleReconnect([String reason = 'Connection lost']) {
-    if (_username == null || _password == null) return;
+    if (!_hasSignIn) return;
     _supervisor.connectionLost(reason);
   }
 
-  /// One reconnect attempt for the supervisor: a fresh socket and REGISTER.
+  /// One reconnect attempt for the supervisor: a fresh socket and REGISTER,
+  /// with the password or the current access token.
   Future<void> _reconnectOnce() async {
-    final username = _username;
-    final password = _password;
-    if (username == null || password == null) return;
+    if (!_hasSignIn) return;
     // Keep a connected call's dialog: once registered again it can still
     // be hung up, and the far end's BYE still matches it.
     // Not a sign-out: no unregistration, the REGISTER below replaces it.
     unawaited(_sip.disconnect(keepCall: _callId != null, unregister: false));
-    await _connectWithCredentials(username, password, reconnecting: true);
+    await _connectAndRegister(reconnecting: true);
   }
 
   void _onNetworkEvent(NetworkEvent event) {
@@ -1253,7 +1572,7 @@ class VobizClient {
     final wasForeground = _inForeground;
     _inForeground = foreground;
     if (!foreground || wasForeground == true) return;
-    if (_username == null || _password == null) return;
+    if (!_hasSignIn) return;
     final now = DateTime.now();
     final last = _lastForegroundRegister;
     if (last != null && now.difference(last) < _foregroundDebounce) return;
@@ -1454,6 +1773,20 @@ class VobizClient {
         _logger.info('ICE restart for call $id answered; waiting for ICE');
       } catch (e) {
         if (_callId != id) return; // the call ended meanwhile
+        if (e is SipRequestFailed && e.statusCode == 481) {
+          // Vobiz no longer has this call: it ended while the phone was
+          // offline (the far end hung up, or the call was transferred
+          // away). End it now rather than waiting out the grace period, and
+          // send no BYE: it would only be refused too (RFC 3261 12.2.1.2).
+          _logger.warn('ICE restart for call $id refused with 481: the call '
+              'no longer exists; ending it');
+          final cleanup = _cleanupCall(id,
+              message: 'The call ended while the connection was down',
+              reason: 'ended_while_offline');
+          _sip.abandonCall();
+          await cleanup;
+          return;
+        }
         _logger.warn('ICE restart for call $id refused: $e');
         await _peer.abortIceRestart();
       }
@@ -1544,6 +1877,7 @@ class VobizClient {
   final Map<String, Future<void>> _releasing = <String, Future<void>>{};
 
   Future<void> _endCall(String callId, String? message, String? reason) async {
+    if (_pushed?.callId == callId) _forgetPushedCall();
     _callId = null;
     _clearCallSetupTimer();
     _clearNetworkLossTimer();
@@ -1625,6 +1959,7 @@ class VobizClient {
       headers: _callHeaders,
       sipCode: sipCode,
       reason: reason,
+      sipCallId: _sip.activeSipCallId,
     ));
   }
 
@@ -1646,4 +1981,24 @@ class _AlwaysOnlineMonitor implements ConnectivityMonitor {
 
   @override
   Stream<NetworkStatus> get changes => const Stream<NetworkStatus>.empty();
+}
+
+/// A call a Vobiz push announced, from [VobizClient.handleIncomingPush] until
+/// its call ends or the push expires.
+class _PushedCall {
+  _PushedCall(this.push);
+
+  final VobizIncomingPush push;
+
+  /// The call's `CallEvent.callId`, once its INVITE has arrived.
+  String? callId;
+
+  /// The registrar took the REGISTER that claimed it.
+  bool claimed = false;
+
+  /// Accept, or Decline, was tapped on the call screen.
+  bool accepted = false;
+  bool declined = false;
+
+  Timer? expiry;
 }

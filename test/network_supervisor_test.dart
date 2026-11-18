@@ -181,6 +181,29 @@ void main() {
       });
     });
 
+    // Seen live 2026-10-26: mobile data off with Wi-Fi already off, Wi-Fi back
+    // 7 s later. The socket never reported its death, so nothing reconnected
+    // until its ping timed out 20 s in, and the call ran out of grace.
+    test('back from offline during a call, the old socket is replaced at once', () {
+      fakeAsync((FakeAsync async) {
+        final h = _Harness(failAttempts: false, activeCall: true);
+        h.supervisor.start();
+        async.flushMicrotasks();
+        h.supervisor.connected();
+
+        h.monitor.goOffline();
+        async.flushMicrotasks();
+        expect(h.attempts, 0, reason: 'nothing to try while offline');
+        h.monitor.wifi();
+        async.flushMicrotasks();
+        expect(h.handovers, hasLength(1));
+        expect(h.attempts, 1, reason: 'a socket that lived through an outage is not trusted');
+        h.supervisor.connected();
+        expect(h.types.last, NetworkEventType.reconnected);
+        h.supervisor.stop();
+      });
+    });
+
     test('a network change during a call goes to the handover hook, not a new socket', () {
       fakeAsync((FakeAsync async) {
         final h = _Harness(failAttempts: false, activeCall: true);

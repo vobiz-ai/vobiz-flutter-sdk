@@ -58,6 +58,39 @@ class FakeClient implements VobizClient {
   String? get sipUsername => username;
   @override
   VobizAuthMode get authMode => mode;
+
+  /// The access token sign-in in effect (set by [connectWithAccessToken]).
+  @override
+  VobizAccessToken? accessToken;
+
+  /// Every token passed to [connectWithAccessToken] / [updateAccessToken].
+  final List<String> tokens = <String>[];
+
+  @override
+  Future<void> connectWithAccessToken(String token) async {
+    actions.add('connectWithAccessToken');
+    tokens.add(token);
+    final parsed = VobizAccessToken.parse(token);
+    accessToken = parsed;
+    username = parsed.sipUsername;
+    mode = VobizAuthMode.accessToken;
+    if (registerOnConnect) {
+      connected = true;
+      fakeConnections.add(ConnectionEvent(
+        connectionState: ConnectionStateStatus.connected,
+        registrationState: RegistrationState.registered,
+        message: 'Registered',
+      ));
+    }
+  }
+
+  @override
+  Future<void> updateAccessToken(String token) async {
+    actions.add('updateAccessToken');
+    tokens.add(token);
+    accessToken = VobizAccessToken.parse(token);
+  }
+
   @override
   String? get lastCallUuid => null;
   @override
@@ -91,10 +124,12 @@ class FakeClient implements VobizClient {
   }
 
   @override
-  Future<void> disconnect() async {
-    actions.add('disconnect');
+  Future<void> disconnect({bool unregister = true}) async {
+    actions.add(unregister ? 'disconnect' : 'disconnect:keep-registration');
     connected = false;
     username = null;
+    accessToken = null;
+    mode = VobizAuthMode.none;
   }
 
   @override
@@ -125,17 +160,54 @@ class FakeClient implements VobizClient {
   @override
   Future<void> dispose() async {}
 
+  // ── Vobiz push ─────────────────────────────────────────────────────────
+  final StreamController<VobizPushCallUpdate> fakePushUpdates = StreamController<VobizPushCallUpdate>.broadcast();
+
+  /// The push handed to [handleIncomingPush], as the SDK would keep it.
+  VobizIncomingPush? handledPush;
+
+  /// The `CallEvent.callId` of the call the push announced, once it rang.
+  String? pushedCallId;
+
+  @override
+  Stream<VobizPushCallUpdate> get pushCallUpdates => fakePushUpdates.stream;
+  @override
+  VobizIncomingPush? get pushedCall => handledPush;
+  @override
+  bool isPushedCall(String callId) => pushedCallId == callId;
+
+  @override
+  bool handleIncomingPush(VobizIncomingPush push) {
+    if (!push.isHeldByVobiz || push.isTest || push.isExpired()) return false;
+    actions.add('handleIncomingPush:${push.callId}');
+    handledPush = push;
+    return true;
+  }
+
+  @override
+  void reportCallScreenAccepted(VobizIncomingPush push) => actions.add('reportAccepted:${push.callId}');
+  @override
+  void reportCallScreenDeclined(VobizIncomingPush push) => actions.add('reportDeclined:${push.callId}');
+
   /// An INVITE arrives.
-  void ring({String callId = 'sip-1', String from = '+918000000000', Map<String, String> headers = const {}}) {
+  void ring({
+    String callId = 'sip-1',
+    String from = '+918000000000',
+    Map<String, String> headers = const {},
+    String? sipCallId,
+  }) {
     state = CallStateStatus.incoming;
     direction = CallDirection.inbound;
     this.headers = headers;
+    final held = handledPush;
+    if (held != null && sipCallId != null && sipCallId == held.callId) pushedCallId = callId;
     fakeCalls.add(CallEvent(
       callId: callId,
       state: CallStateStatus.incoming,
       direction: CallDirection.inbound,
       remoteIdentity: from,
       headers: headers,
+      sipCallId: sipCallId,
     ));
   }
 

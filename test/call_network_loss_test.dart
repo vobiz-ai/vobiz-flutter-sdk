@@ -5,8 +5,31 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
+import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 
 import 'call_harness.dart';
+
+/// The far end's final response to the last [method] the client sent.
+void answerLast(Harness h, String method, int code, String phrase) {
+  final request =
+      SipParser.parse(h.sent.lastWhere((m) => m.startsWith('$method ')));
+  h.sip.debugReceive('SIP/2.0 $code $phrase\r\n'
+      'Via: ${request.header('Via')}\r\n'
+      'From: ${request.header('From')}\r\n'
+      'To: ${request.header('To')}\r\n'
+      'Call-ID: ${request.header('Call-ID')}\r\n'
+      'CSeq: ${request.header('CSeq')}\r\nContent-Length: 0\r\n\r\n');
+}
+
+/// The network is back: the client registers again on a new connection.
+void registerAgain(Harness h, [String user = 'play1']) {
+  h.sent.clear();
+  h.sip.register(user, 'secret');
+  h.registered();
+}
+
+int countSent(Harness h, String method) =>
+    h.firstLines.where((l) => l.startsWith('$method ')).length;
 
 void main() {
   group('#3 zombie call: disconnect, dispose, socket drop, ICE loss', () {
@@ -146,6 +169,132 @@ void main() {
       await h.settle(200);
       expect(h.client.callState, CallStateStatus.idle);
       expect(h.lastEnded.reason, 'network_lost');
+      await h.dispose();
+    });
+
+    // Seen live 2026-10-28: the call was transferred away while the phone was
+    // offline. Vobiz answered the reconnect's re-INVITE with 481, and the app
+    // still showed "reconnecting" for 12 s before ending the call.
+    test('an ICE restart answered 481 (the call is gone) ends the call at once, without a BYE', () async {
+      final h = await answeredCall(grace: const Duration(seconds: 30));
+      final id = h.client.currentCallId!;
+      h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateDisconnected);
+      h.sip.onSocketError!('SIP socket closed unexpectedly');
+      h.sip.disconnect(keepCall: true);
+      h.sip.register('play1', 'secret');
+      h.registered();
+      await h.settle();
+      final errorsBefore = h.errors.length; // the socket drop's own socket_error
+      h.respondToReInvite(481, 'Call is being terminated');
+      await h.settle();
+      // Long before the 30 s grace period.
+      expect(h.client.callState, CallStateStatus.idle);
+      expect(h.lastEnded.reason, 'ended_while_offline');
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      expect(h.errors.length, errorsBefore,
+          reason: 'the far end ended the call: not an error');
+      // Nothing is sent again after the next registration either.
+      registerAgain(h);
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      await h.dispose();
+    });
+  });
+
+  // Seen live 2026-10-26: airplane mode for 9 s plus 7 s for Android to bring
+  // the network back. The grace ran out offline, the BYE never left, and the
+  // callee's phone stayed on a silent, billed call.
+  group('a BYE or CANCEL lost with the connection is sent again', () {
+    Future<Harness> endedOffline() async {
+      final h = await answeredCall(grace: const Duration(milliseconds: 50));
+      h.sip.onSocketError!('SIP socket closed unexpectedly');
+      await h.settle(120);
+      expect(h.lastEnded.reason, 'network_lost');
+      expect(h.sentRequest('BYE'), isTrue, reason: 'sent: ${h.firstLines}');
+      return h;
+    }
+
+    test('a call that ran out of grace offline sends its BYE again once registered', () async {
+      final h = await endedOffline();
+      registerAgain(h);
+      expect(countSent(h, 'BYE'), 1, reason: 'sent: ${h.firstLines}');
+      expect(h.sent.lastWhere((m) => m.startsWith('BYE ')), contains('Call-ID: in-1'));
+      // Answered now: never sent again.
+      answerLast(h, 'BYE', 200, 'OK');
+      registerAgain(h);
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      await h.dispose();
+    });
+
+    test('a BYE that was answered is not sent again', () async {
+      final h = await answeredCall();
+      await h.client.hangup();
+      answerLast(h, 'BYE', 200, 'OK');
+      registerAgain(h);
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      await h.dispose();
+    });
+
+    test('a BYE refused with 481 (the far end already left) is not sent again', () async {
+      final h = await endedOffline();
+      registerAgain(h);
+      answerLast(h, 'BYE', 481, 'Call/Transaction Does Not Exist');
+      registerAgain(h);
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      await h.dispose();
+    });
+
+    test('a BYE is not sent for a different sign-in', () async {
+      final h = await endedOffline();
+      registerAgain(h, 'someone-else');
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      await h.dispose();
+    });
+
+    test('a BYE older than the resend window is dropped', () async {
+      final h = await endedOffline();
+      h.sip.pendingEndWindow = Duration.zero;
+      await h.settle(5);
+      registerAgain(h);
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      await h.dispose();
+    });
+
+    test('an unanswered BYE is sent again at most three times', () async {
+      final h = await endedOffline();
+      var resent = 0;
+      for (var i = 0; i < 5; i++) {
+        registerAgain(h);
+        resent += countSent(h, 'BYE');
+      }
+      expect(resent, 3);
+      await h.dispose();
+    });
+
+    test('a ringing outgoing call cut off by the network sends its CANCEL again', () async {
+      final h = Harness();
+      await h.dial();
+      h.respond(180, 'Ringing');
+      final invite =
+          SipParser.parse(h.sent.lastWhere((m) => m.startsWith('INVITE ')));
+      h.sip.onSocketError!('SIP socket closed unexpectedly');
+      await h.settle();
+      expect(h.lastEnded.reason, 'network_lost');
+      expect(h.sentRequest('CANCEL'), isTrue, reason: 'sent: ${h.firstLines}');
+
+      registerAgain(h);
+      expect(countSent(h, 'CANCEL'), 1, reason: 'sent: ${h.firstLines}');
+      final cancel =
+          SipParser.parse(h.sent.lastWhere((m) => m.startsWith('CANCEL ')));
+      // The INVITE's transaction: the registrar matches a CANCEL by these.
+      final branch = RegExp(r'branch=([^;\s]+)');
+      expect(branch.firstMatch(cancel.header('Via')!)!.group(1),
+          branch.firstMatch(invite.header('Via')!)!.group(1));
+      expect(cancel.header('Call-ID'), invite.header('Call-ID'));
+      expect(cancel.header('CSeq')!.split(' ').first, invite.header('CSeq')!.split(' ').first);
+
+      answerLast(h, 'CANCEL', 200, 'OK');
+      registerAgain(h);
+      expect(h.sentRequest('CANCEL'), isFalse, reason: 'sent: ${h.firstLines}');
       await h.dispose();
     });
   });

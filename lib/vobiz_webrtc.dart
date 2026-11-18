@@ -33,7 +33,10 @@ export 'src/media/call_quality.dart' show CallQualityLevel, CallQualitySample;
 export 'src/media/dtmf_transport.dart';
 
 // ── Authentication ────────────────────────────────────────────────────────────
+export 'src/auth/access_token.dart';
+export 'src/auth/access_token_provider.dart';
 export 'src/auth/credentials_provider.dart';
+export 'src/backend/backend_access_token_provider.dart';
 export 'src/backend/backend_credentials_provider.dart';
 export 'src/models/auth/auth_mode.dart';
 export 'src/models/auth/credential_config.dart';
@@ -43,9 +46,11 @@ export 'src/models/auth/zero_config_session.dart';
 // ── Calls ─────────────────────────────────────────────────────────────────────
 export 'src/calls/call_actions.dart';
 export 'src/calls/call_session.dart';
+export 'src/conference/vobiz_conference.dart';
 
 // ── Push ──────────────────────────────────────────────────────────────────────
 export 'src/push/vobiz_push.dart';
+export 'src/push/vobiz_push_devices.dart';
 
 // ── Events ────────────────────────────────────────────────────────────────────
 export 'src/events/call_event.dart';

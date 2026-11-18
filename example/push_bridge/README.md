@@ -155,6 +155,10 @@ Disconnecting in the app unregisters the phone; closing the app does not.
 | `ALLOW_UNSIGNED_WEBHOOKS` | `false` | `true` accepts webhooks without a Vobiz signature. Local tests only |
 | `LOST_BEEP_SECONDS` | `3` | Connection watch: seconds without an "alive" report from the app before the other party hears the connection-lost beep. Clamped to 2–10 |
 | `LOST_HANGUP_SECONDS` | `15` | Connection watch: seconds without a report before the bridge ends the call (the SDK gives up at 12 s, but an offline phone's hangup cannot reach Vobiz). Clamped to 5–300; `0` never ends it |
+| `CONF_HOST_LOST_SECONDS` | `2` | Connection watch, conferences: seconds without a report from the host app before the bridge ends the whole room, as a phone call ends when one side drops. A Wi-Fi ↔ mobile data switch can take about 2 s, and may end the room. Clamped to 1–300 |
+| `JWT_SUB` | `flutter-app` | Access tokens: the user id (`sub`) `POST /token` mints for when the app sends none. The app registers as `<sub>_<VOBIZ_AUTH_ID>` |
+| `JWT_TTL_SECONDS` | `3600` | Access tokens: lifetime, clamped to 180–86400 (the platform's limits). The SDK renews 60 s before expiry |
+| `JWT_APP_ID` | — | Access tokens: the application whose Answer URL handles the app's outbound calls (the `app` claim). Without it, the account's default application. The bridge's own application only rings phones, so point this at the one your outbound calls use (the Playground application, for example) |
 
 Whatever the caller ID mode, the push shows the real caller, and the bridge passes
 the real caller to the app in a SIP header as well.
@@ -168,6 +172,7 @@ the real caller to the app in a SIP header as well.
 | `POST /dial-events/<call>.<tag>` | Vobiz | Live events for the leg ringing the app. Only an answer event here counts as answered: Vobiz can report `DialStatus=completed` for a ring nobody picked up |
 | `POST /dial-now/<call>.<tag>` | Vobiz | The one Dial: reached by the hold's `<Redirect>` when the wait ends, or by a transfer when the pushed phones report they are registered |
 | `POST /declined/<call>.<tag>` | Vobiz | The caller's leg, transferred here on Decline: busy tone, then busy |
+| `POST /token` | the app | An access token (JWT) for signing in: minted with `POST /Account/{auth id}/JWT/Token/`, the Auth Token staying here. Bridge key or device token; `sub` from the body or `?sub=`, else `JWT_SUB`. Replies `{token, sub, exp, sip_username}`, as the Vobiz WebRTC demo's `/token` does |
 | `POST /hangup` | Vobiz | The caller's leg ended: stop the phones ringing |
 | `GET /wait.wav`, `/busy.wav` | Vobiz | `PUSH_WAIT_SECONDS` of ringback / three seconds of busy tone |
 | `GET /lost.wav` | Vobiz | The connection-lost beep: 0.25 s of 1 kHz in 2.5 s, played looped |
@@ -184,6 +189,30 @@ the real caller to the app in a SIP header as well.
 Every Vobiz route needs a valid signature. `<call>.<tag>` is the Vobiz CallUUID and
 an HMAC the bridge made, so the signed URL (Vobiz signs the URL, not the body or
 query string) names the call.
+
+## Access tokens
+
+The example's **Access token** tab signs in with a short-lived JWT instead of an
+endpoint password. With its token server left empty it asks this bridge:
+
+1. `POST /token` (bridge key, or the phone's device token once paired) mints
+   `{"iss": VOBIZ_AUTH_ID, "sub": <user id or JWT_SUB>, "nbf", "exp", "per": {"voice":
+   {"incoming_allow": true, "outgoing_allow": true}}, "app": JWT_APP_ID}` through the Vobiz
+   API. The Auth Token never leaves the bridge. `nbf` is a minute in the past, because
+   the registrar refuses a token whose `nbf` its clock has not reached (10005); `sub` is
+   letters, digits, `_` or `-`, at most 50. Set `JWT_APP_ID`: a token without `app` can
+   be refused with 10001 (the bridge warns once).
+2. The SDK registers as `<sub>_<VOBIZ_AUTH_ID>` with the token in `X-Vobiz-Jwt`, and asks
+   for the next token a minute before this one expires.
+3. "Receive calls" registers that identity here like an endpoint: the bridge accepts
+   `<sub>_<VOBIZ_AUTH_ID>` (an identity the token creates; it is not in the Console), and
+   rings it as `<User>sip:<sub>_<VOBIZ_AUTH_ID>@registrar.vobiz.ai</User>`. List it in
+   `ROUTES` like an endpoint when several users have phones.
+
+Outbound calls go to the token's `app`: set `JWT_APP_ID` to the application whose Answer
+URL dials out for you. Like the demo's, this route trusts whoever holds the bridge key;
+in production, issue tokens only after your own user has signed in, with that user's id
+as `sub`.
 
 ## Connection watch
 
@@ -217,6 +246,49 @@ curl -X POST "https://api.vobiz.ai/api/v1/Account/$VOBIZ_AUTH_ID/Call/" \
 ```
 
 The bridge logs `Vobiz received "1234"` and reads the digits back to the caller.
+
+## Conference
+
+The app's **Add** button (the SDK's `VobizConference`) asks the bridge to make the call
+a conference. Vobiz mixes conferences in rooms (`<Conference>`); the bridge does the
+REST calls, since they need the Auth Token:
+
+1. **The first add** moves both sides of the app's call into a new room
+   `vc-<call>-<random>` with the Transfer API (`legs=both`): the app's leg as the host
+   (`endConferenceOnExit="true"`), the other side as a guest. The phone's own SIP call
+   is not touched, so its audio carries on through the room.
+2. **Each add** dials the person (`POST /Call/`, `from` = the app's caller ID or
+   `VOBIZ_NUMBER`); when they answer, Vobiz asks `/conf-room/…` for their XML, which is
+   the same room.
+3. **Who is in the room** comes from the room's enter and exit callbacks
+   (`/conf-events/…`) and the dialled calls' `hangup_url` (`/conf-dial/…`): Vobiz's read
+   API does not list a live room's members.
+4. **Mute and unmute** use the member API. **Hold** transfers the person's leg out of
+   the room onto `/hold.wav` (looped `<Play loop="0">`); **resume** transfers it back,
+   as a new member (muted again if they were). **Remove** hangs up their leg.
+5. **The room ends** when the app's leg leaves (Vobiz kicks everyone), when the app asks
+   (`/conference/end`), when nobody but the app is left (in the room, ringing or on
+   hold), or `CONF_HOST_LOST_SECONDS` (2 s) after the app's phone stops reporting
+   (the connection watch): like a phone call, the call ends for everyone when its
+   host drops. People on hold and calls still ringing are hung up too.
+
+Every leg joins with `stayAlone="true"`: Vobiz otherwise drops a member who is alone in
+the room, even for the moment both sides of the call are moving in. A conference holds
+at most 20 people (the account's `max_conf_members`). The connection-lost beep is not
+played in a conference: the call's legs are no longer bridged to each other.
+
+| Request | Auth | Body | Response |
+|---|---|---|---|
+| `/conference/add` | `Authorization: Bearer <device_token>`, or `X-Bridge-Key` | `{call_uuid, number \| user, caller_id?}` (with the bridge key also `host_leg`: `aleg` or `bleg`) | the state; 400 bad input, 403 not this phone's live call, 409 room full, 502 Vobiz refused |
+| `/conference/state` | same | `{call_uuid}` | the state; 404 not a conference |
+| `/conference/participant` | same | `{call_uuid, participant_id, action}`, `action` = `mute`, `unmute`, `hold`, `resume`, `remove` | the state; 409 not possible now (e.g. not in the room) |
+| `/conference/end` | same | `{call_uuid}` | the state, `active: false` |
+
+The state: `{room, active, ended_reason?, participants: [{id, label, you, role, status,
+muted, reason?}]}` with `role` `host` (the app), `guest`, `added` or `other`, and
+`status` `connecting`, `dialing`, `joined`, `on_hold`, `left` or `failed`. `call_uuid` is
+the id the app reports to `/call/alive`: its own CallUUID for a call it placed, the
+`PushRef` for a call this bridge rang. A phone may act only on calls its endpoint is on.
 
 ## App ↔ bridge protocol
 
