@@ -566,7 +566,11 @@ class SipDigestAuth {
 /// A second plain 401/407 means the credentials are wrong, and sending them
 /// again would only loop.
 class _AuthRetries {
-  _AuthRetries({this.refresh = false, this.timeout});
+  _AuthRetries({
+    this.refresh = false,
+    this.timeout,
+    this.extraHeaders = const <String, String>{},
+  });
 
   /// A REGISTER refreshing a live registration rather than a sign-in's
   /// first: no answer then means the transport is dead.
@@ -575,6 +579,14 @@ class _AuthRetries {
   /// How long each REGISTER of this attempt waits for a final response;
   /// null for [SIPService.transactionTimeout].
   final Duration? timeout;
+
+  /// Headers every REGISTER of this attempt carries, its digest answer too:
+  /// the reference of a call the registrar holds ([SIPService.claimHeldCall]),
+  /// which it reads only once the REGISTER is authenticated.
+  final Map<String, String> extraHeaders;
+
+  /// Whether this attempt claims a held call.
+  bool get claims => extraHeaders.isNotEmpty;
 
   int _attempts = 0;
   bool _usedStale = false;
@@ -718,7 +730,7 @@ class SIPService {
   SIPService({
     required this.wsUrl,
     required this.sipServer,
-    this.registerExpires = 600,
+    this.registerExpires = 3600,
     this.keepAlive = const KeepAliveConfig(),
     Logger? logger,
   })  : _logger = logger ?? Logger(),
@@ -732,6 +744,12 @@ class SIPService {
   /// The registration lifetime this client asks for, in seconds. The
   /// registrar may grant less (or, after a 423, require more); the refresh
   /// follows what it granted.
+  ///
+  /// An hour by default: Vobiz's registrar keeps this SDK's registration
+  /// after its socket closes (the app killed or put to sleep) until it
+  /// expires, and while it lasts a call reaches the app by push. Every
+  /// REGISTER (sign-in, the refresh, the return to the foreground, the claim
+  /// of a pushed call) starts that hour again.
   final int registerExpires;
 
   /// The WebSocket ping and the optional RFC 5626 CRLF keep-alive.
@@ -794,6 +812,10 @@ class SIPService {
   int? _accessTokenExpiresAt;
   int _cseq = 1;
   bool _manualDisconnect = false;
+
+  // The reference of a call the registrar holds for this user (from a push),
+  // waiting for the next REGISTER to hand it back: see [claimHeldCall].
+  Map<String, String>? _pendingClaim;
 
   String? _activeCallId;
   String? _activeRemoteTag;
@@ -878,6 +900,14 @@ class SIPService {
 
   /// Vobiz's CallUUID (`X-Calluuid`) for the current or most recent call.
   String? get callUuid => _callUuid;
+
+  /// The SIP Call-ID of the current call: for an incoming call, its INVITE's.
+  /// Null with no call.
+  String? get activeSipCallId => _activeCallId;
+
+  /// The registrar took a REGISTER that claimed a held call
+  /// ([claimHeldCall]): the held INVITE should follow on this connection.
+  void Function()? onHeldCallClaimed;
 
   /// Whether an established call (dialog) exists that in-dialog requests,
   /// such as DTMF, can be sent on.
@@ -984,8 +1014,46 @@ class SIPService {
     _accessTokenError = null;
     _closeWhenCallEnds = false;
     _registrationState.value = SipRegistrationState.registering;
-    _sendRegister(expires: registerExpires, auth: _AuthRetries());
+    final claim = _pendingClaim;
+    _pendingClaim = null;
+    _sendRegister(
+        expires: registerExpires,
+        auth: _AuthRetries(extraHeaders: claim ?? const <String, String>{}));
   }
+
+  /// Claims a call Vobiz's registrar is holding for this user while a push
+  /// wakes the app: the REGISTER that follows carries [headers]
+  /// (`VobizPushHold.registerHeaders`: `X-Index`, `X-Label`,
+  /// `X-vobiz-Registrar-Info`), its digest answer too, and the registrar then
+  /// sends the held INVITE to this registration.
+  ///
+  /// Registered on an open socket, that REGISTER goes now and this returns
+  /// true. Otherwise it returns false and the headers ride on the next
+  /// REGISTER: the sign-in's ([register], [registerWithAccessToken]), a
+  /// reconnect's, or another right after the one in flight is answered. Only
+  /// that one REGISTER carries them; refreshes after it do not.
+  bool claimHeldCall(Map<String, String> headers) {
+    if (headers.isEmpty) return false;
+    final registered = _connectionState.value == SipConnectionState.connected &&
+        _registrationState.value == SipRegistrationState.registered;
+    final inFlight = _transactions.values.any((tx) => tx.method == 'REGISTER');
+    if (!_hasCredentials || !registered || inFlight) {
+      _pendingClaim = Map<String, String>.unmodifiable(headers);
+      return false;
+    }
+    _registrationRefreshTimer?.cancel();
+    _sendRegister(
+        expires: registerExpires,
+        auth: _AuthRetries(refresh: true, timeout: refreshTimeout, extraHeaders: headers));
+    return true;
+  }
+
+  /// Drops a claim no REGISTER has carried yet: the pushed call expired or
+  /// was taken some other way.
+  void cancelHeldCallClaim() => _pendingClaim = null;
+
+  /// Whether a held call's reference is waiting for the next REGISTER.
+  bool get hasPendingClaim => _pendingClaim != null;
 
   /// Refreshes the registration now, on the open socket: the same REGISTER
   /// (and digest retry) as the periodic refresh, whose timer is re-armed from
@@ -1127,6 +1195,16 @@ class SIPService {
     _endCall();
   }
 
+  /// Forgets the established call without signalling it. For a call the far
+  /// end no longer has: it answered a request within the dialog with 481
+  /// (Call/Transaction Does Not Exist), so a BYE would only be refused too.
+  /// RFC 3261 12.2.1.2: the UAC SHOULD then terminate the dialog.
+  void abandonCall() {
+    if (_activeCallId == null) return;
+    _endCall();
+    onCallEnded?.call('The call no longer exists');
+  }
+
   void hangup() {
     _releaseReservation();
 
@@ -1169,6 +1247,8 @@ class SIPService {
   /// established call's dialog, so it can still be hung up (or be hung up)
   /// once registered again. [keepCall] implies no unregistration.
   Future<void> disconnect({bool keepCall = false, bool unregister = true}) async {
+    // A held call can only be claimed by a sign-in that is still wanted.
+    _pendingClaim = null;
     _releaseReservation();
     _registrationRefreshTimer?.cancel();
     _crlfKeepAlive?.stop();
@@ -1287,7 +1367,7 @@ class SIPService {
         branch: branch,
         authHeaderName: authHeaderName,
         authHeader: authHeader,
-        extraHeaders: _accessTokenHeaders,
+        extraHeaders: <String, String>{..._accessTokenHeaders, ...auth.extraHeaders},
       ),
       branch: branch,
       method: 'REGISTER',
@@ -2134,7 +2214,8 @@ class SIPService {
       if (minimum != null && minimum > expires) {
         _sendRegister(
             expires: minimum,
-            auth: _AuthRetries(refresh: auth.refresh, timeout: auth.timeout),
+            auth: _AuthRetries(
+                refresh: auth.refresh, timeout: auth.timeout, extraHeaders: auth.extraHeaders),
             socket: tx.socket);
         return;
       }
@@ -2155,6 +2236,20 @@ class SIPService {
       _startKeepAlive();
       _resendPendingEnds();
       onRegistered?.call();
+      if (auth.claims) {
+        _logger.info('The registrar took the REGISTER that claims a held call '
+            '(X-Index ${auth.extraHeaders['X-Index']}, X-Label ${auth.extraHeaders['X-Label']})');
+        onHeldCallClaimed?.call();
+      }
+      // A claim that came while this REGISTER was in flight goes now.
+      final pending = _pendingClaim;
+      if (pending != null && _registrationState.value == SipRegistrationState.registered) {
+        _pendingClaim = null;
+        _registrationRefreshTimer?.cancel();
+        _sendRegister(
+            expires: registerExpires,
+            auth: _AuthRetries(refresh: true, timeout: refreshTimeout, extraHeaders: pending));
+      }
       return;
     }
 

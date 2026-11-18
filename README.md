@@ -132,6 +132,36 @@ await client.transferCall(number: '+919876543211', leg: TransferLeg.bLeg);
 `TransferLeg.bLeg` moves the other party and drops you. Transfers go through the Vobiz
 Redirect API, never SIP REFER.
 
+### Conference
+
+`VobizConference` turns the current call into a conference and manages the people in it.
+Vobiz mixes the voices in a conference room (VobizXML `<Conference>`); moving the call
+into a room, dialling people and muting them need the Auth Token, so the SDK asks **your
+server**, which makes the Vobiz calls. The first person added moves both sides of the call
+into a new room, then dials them in; the phone's own call carries on unchanged.
+
+```dart
+final conference = VobizConference(
+  client: client,
+  serverUrl: Uri.parse('https://api.example.com'),
+  headers: () async => {'Authorization': 'Bearer ${await session.token()}'},
+);
+await conference.add(number: '+919876543211', callerId: '+918000000000');
+await conference.add(sipUser: 'play123');
+conference.state.addListener(() {
+  for (final p in conference.state.value?.present ?? const []) print('${p.label}: ${p.status}');
+});
+await conference.mute(id);   // unmute, hold (out of the room onto music), resume, remove
+await conference.end();      // everyone, this call included
+```
+
+Your server implements four routes (`/conference/add`, `/state`, `/participant`, `/end`);
+the example's push bridge is a working implementation, and its README has the protocol
+and the Vobiz behaviour it relies on. The people added see `callerId`, one of your Vobiz
+numbers. When the conference ends, the SDK hangs up the call itself
+(`endCallWithConference`), so a hang-up lost on its way to the phone cannot leave it on a
+dead call.
+
 ### Recordings
 
 ```dart
@@ -182,6 +212,26 @@ the INVITE that follows (`CallEvent.headers` carries the server's `PushRef` head
 the call screen and the push server are still example code. **iOS rings only while the
 app is in the foreground** for now (no PushKit/CallKit yet). See
 [doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md).
+
+**Vobiz's own push (Android, with Vobiz's server side, being deployed).** Vobiz's
+registrar can hold a call for a SIP user with no live registration, push that user's
+phones through Vobiz's push service, and send the call to the REGISTER that hands back
+the push's hold reference. No push server of your own is needed:
+
+1. After sign-in, and whenever Firebase replaces the token, register the phone with
+   `VobizPushDevices.register` (`sipUsername`: the SIP user it signed in as). At
+   sign-out, `VobizPushDevices.logout`.
+2. When a push arrives, show your call screen and pass the push to
+   `client.handleIncomingPush(VobizIncomingPush.tryParse(message.data)!)`, then sign
+   in if the app was closed. The REGISTER carries `X-Index`, `X-Label` and
+   `X-vobiz-Registrar-Info`, and the held INVITE follows with the push's `call_id` as
+   its Call-ID (`CallEvent.sipCallId`).
+3. Report the call screen's buttons with `reportCallScreenAccepted` and
+   `reportCallScreenDeclined`; `pushCallUpdates` says when the call arrives or never
+   came (`expired`: take the screen down).
+
+The example app does all three in *Identity → Incoming calls → Vobiz push*. Device
+registration takes the account's Auth ID and Auth Token for now: test only.
 
 The older call-control methods (`transfer(String)`, `addCall`, `swapCalls`,
 `mergeCalls`, `warmTransferStart`…) call routes such as `/add-call` that only the Node

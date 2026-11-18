@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Incoming calls to a closed app through Vobiz's own push** (Android), for Vobiz's
+  server side that holds a call and pushes the called SIP user's phones:
+  `VobizPushDevices` (register and log out a phone for its SIP user),
+  `VobizIncomingPush.hold` (`index`, `label`, `registrar`), `client.handleIncomingPush`
+  (the next REGISTER claims the held call with `X-Index`, `X-Label` and
+  `X-vobiz-Registrar-Info`), `reportCallScreenAccepted`/`reportCallScreenDeclined`,
+  `pushCallUpdates`, `CallEvent.sipCallId`, `VobizClient.sdkVersion`. The example app
+  has it under *Incoming calls → Vobiz push*. See doc/PUSH_DESIGN.md.
+- `VobizClient.disconnect(unregister: false)`: closes the connection without a REGISTER
+  `Expires: 0`, as when Android kills the app, so Vobiz keeps the registration (until it
+  expires) and a call takes its push-to-wake path. For testing that path.
+- Example: *Call this phone through Vobiz* replaces *Send a test push through Vobiz*
+  (push-service's notify now takes only the registrar's internal token, so a pretend
+  push gets 401). It drops the connection without signing off, then has Vobiz's Call API
+  call this phone's SIP user (caller ID and answer URL fields, test only).
+
+### Changed
+
+- **REGISTER asks for an hour (`Expires: 3600`, was 600).** Vobiz's registrar now keeps this
+  SDK's registration after its socket closes (the app killed or asleep) until it expires, and
+  while it lasts a call reaches the app by push. Every REGISTER (sign-in, the refresh at 80 %,
+  the return to the foreground, the claim of a pushed call) starts the hour again. Asked for by
+  Vobiz's platform team with that registrar change.
+
+### Fixed
+
+- A push's `expires_at` in Unix seconds (as Vobiz sends it) is no longer read as
+  milliseconds, which made every such push stale on arrival.
+
 Fixes from the end-to-end review of 0.2.0 (tracking issue #56). Verified with unit
 tests (SDK, example app and push bridge) only: no device, emulator or live Vobiz
 call was used. #58 lists what still needs a device.
@@ -30,6 +61,16 @@ call was used. #58 lists what still needs a device.
 
 ### Added
 
+- Conference: `VobizConference` turns the current call into a Vobiz conference room and
+  manages it through your server (which holds the Auth Token): `add` (a number or SIP
+  user; the first one moves both sides of the call into a new room), `mute`, `unmute`,
+  `hold` (out of the room onto music), `resume`, `remove`, `end`, and a polled `state`
+  with `VobizConferenceParticipant`s. Errors are `VobizException`
+  (`VobizErrorCode.conferenceFailed`). The four server routes are in API_REFERENCE.md.
+  When the conference ends, the call is hung up from the phone too
+  (`endCallWithConference`): in a live test a WebRTC gateway dropped the media server's
+  BYE, which came minutes after the call's last SIP message, and left the app on a dead
+  call.
 - Access-token (JWT) sign-in, as the web SDK's `loginWithAccessToken` /
   `loginWithAccessTokenGenerator` and the Vobiz WebRTC demo: `connectWithAccessToken`,
   `connectWithAccessTokenProvider` (renews the token 60 s before it expires and asks
@@ -74,6 +115,10 @@ call was used. #58 lists what still needs a device.
 
 ### Fixed
 
+- A call that ended on Vobiz while the phone was offline (the far end hung up, or the call
+  was transferred away) now ends as soon as the phone is back: when Vobiz answers the
+  reconnect's re-INVITE with 481, the call ends at once with reason `ended_while_offline`,
+  with no BYE and no `ErrorEvent`. It used to show "reconnecting" for up to 12 s more.
 - SIP: CANCEL when hanging up a ringing outbound call, with a crossing 200 ACKed and
   ended (#4); in-dialog re-INVITE and UPDATE answered, unsupported requests get 405/501,
   no `Supported: timer` (#6); one digest retry (two with `stale=true`), `opaque` echoed
@@ -108,6 +153,9 @@ call was used. #58 lists what still needs a device.
 
 ### Changed
 
+- Push bridge: a conference ends for everyone `CONF_HOST_LOST_SECONDS` (2 s) after the host
+  app stops reporting, as a phone call ends when one side drops. It used to wait for the
+  one-to-one call's `LOST_HANGUP_SECONDS` (15 s), which one-to-one calls still use.
 - `TokenConfig` is deprecated: it is a SIP password, not an access token. For access
   tokens use `connectWithAccessToken` (#29).
 - `hold()`/`resume()` throw when there is no call or Vobiz refuses; legacy
@@ -119,6 +167,13 @@ call was used. #58 lists what still needs a device.
 
 ### Example app and push bridge
 
+- Conference: an **Add** button on the call screen opens a conference sheet (add a
+  number or SIP user, see who is in the room, mute, hold, resume or remove each person,
+  end it for everyone). The push bridge implements the routes: it moves the call into a
+  room with the Transfer API (`legs=both`), dials people with the Call API, keeps the
+  members from Vobiz's enter and exit callbacks, holds a person on looping music outside
+  the room, and ends the room when the app leaves or nobody else is left. Every leg
+  joins with `stayAlone="true"`.
 - An **Access token** sign-in tab: a token from your token server (the Vobiz WebRTC
   demo's `/token` works) or the push bridge's `POST /token`, which mints it through the
   Vobiz API with `JWT_SUB`, `JWT_TTL_SECONDS` and `JWT_APP_ID`. The bridge registers a

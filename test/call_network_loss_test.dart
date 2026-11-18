@@ -171,6 +171,33 @@ void main() {
       expect(h.lastEnded.reason, 'network_lost');
       await h.dispose();
     });
+
+    // Seen live 2026-10-28: the call was transferred away while the phone was
+    // offline. Vobiz answered the reconnect's re-INVITE with 481, and the app
+    // still showed "reconnecting" for 12 s before ending the call.
+    test('an ICE restart answered 481 (the call is gone) ends the call at once, without a BYE', () async {
+      final h = await answeredCall(grace: const Duration(seconds: 30));
+      final id = h.client.currentCallId!;
+      h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateDisconnected);
+      h.sip.onSocketError!('SIP socket closed unexpectedly');
+      h.sip.disconnect(keepCall: true);
+      h.sip.register('play1', 'secret');
+      h.registered();
+      await h.settle();
+      final errorsBefore = h.errors.length; // the socket drop's own socket_error
+      h.respondToReInvite(481, 'Call is being terminated');
+      await h.settle();
+      // Long before the 30 s grace period.
+      expect(h.client.callState, CallStateStatus.idle);
+      expect(h.lastEnded.reason, 'ended_while_offline');
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      expect(h.errors.length, errorsBefore,
+          reason: 'the far end ended the call: not an error');
+      // Nothing is sent again after the next registration either.
+      registerAgain(h);
+      expect(h.sentRequest('BYE'), isFalse, reason: 'sent: ${h.firstLines}');
+      await h.dispose();
+    });
   });
 
   // Seen live 2026-10-26: airplane mode for 9 s plus 7 s for Android to bring
