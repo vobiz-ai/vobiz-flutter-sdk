@@ -149,12 +149,76 @@ store was lost): look it up with
 
 ### Access tokens (JWT)
 
-Not available yet. Vobiz SIP registration authenticates with an endpoint's username
-and password only; the endpoint docs state that "SIP endpoints do not require a separate
-token or JWT". `TokenConfig` is not token authentication (its token is sent as a SIP
-password) and is deprecated. When the platform accepts short-lived access tokens on
-REGISTER, the SDK will add them next to the credentials provider, which is already the
-refreshable place to fetch them.
+Instead of an endpoint password, the app can sign in with a short-lived access token
+that your backend mints. Nothing long-lived reaches the device, no endpoint has to exist
+in the Console, and each of your users gets their own SIP identity, `<sub>_<auth_id>`.
+This is what the web SDK's `loginWithAccessTokenGenerator` does (see the Vobiz WebRTC
+demo, vobiz-ai/Vobiz-RTC-demo).
+
+**1. Your backend mints the token** after authenticating your app's user with its own
+session. The Vobiz API signs it with the account Auth Token:
+
+```js
+// POST /voice/token  (your route; your own auth middleware first)
+app.post('/voice/token', requireUser, async (req, res) => {
+  const nbf = Math.floor(Date.now() / 1000) - 60; // a minute back: see below
+  const claims = {
+    iss: process.env.VOBIZ_AUTH_ID,
+    sub: req.user.id,                       // A-Z a-z 0-9 _ -, at most 50; registers as <sub>_<auth_id>
+    nbf,
+    exp: nbf + 3600,                        // exp - nbf: 180 s to 24 h
+    app: process.env.VOBIZ_APP_ID,          // whose Answer URL handles outbound calls
+    per: { voice: { incoming_allow: true, outgoing_allow: true } },
+  };
+  const r = await fetch(`https://api.vobiz.ai/api/v1/Account/${process.env.VOBIZ_AUTH_ID}/JWT/Token/`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Auth-ID': process.env.VOBIZ_AUTH_ID,
+      'X-Auth-Token': process.env.VOBIZ_AUTH_TOKEN,
+    },
+    body: JSON.stringify(claims),
+  });
+  if (!r.ok) return res.status(502).json({ error: 'token not minted' });
+  res.json({ token: (await r.json()).token });
+});
+```
+
+Two things we saw on the live platform (2026-10-25):
+
+- **Put `app` in the token.** A token without it is handled by the account's default
+  application, and where that cannot be used the registrar refuses the token with
+  10001 `INVALID_ACCESS_TOKEN`.
+- **Set `nbf` a minute in the past.** The registrar refuses a token whose `nbf` it has
+  not reached yet (10005 `ACCESS_TOKEN_NOT_VALID_YET`), and its clock can be a second
+  behind your server's. (The provider session copes with that by presenting the same
+  token again 3 s later, but backdating avoids it.)
+
+**2. The app signs in with it** and the SDK keeps it fresh:
+
+```dart
+final provider = VobizBackendAccessTokenProvider(
+  url: Uri.parse('https://api.example.com/voice/token'),
+  headers: () async => {'Authorization': 'Bearer ${await mySession.token()}'},
+);
+final session = await client.connectWithAccessTokenProvider(provider.call);
+// client.sipUsername == '<sub>_<auth_id>'; 60 s before exp the provider is asked
+// again (reason "expiring") and the client re-registers without touching a call.
+```
+
+**3. Calls.** Outbound INVITEs carry the token; the registrar tells the media server
+the account and the token's `app`, whose Answer URL gets the call (without `app`, the
+account's default application). To ring the user, answer an inbound call with
+`<Dial><User>sip:<sub>_<auth_id>@registrar.vobiz.ai</User></Dial>`.
+
+- `per.voice.outgoing_allow` must be true for `makeCall`: otherwise it throws before
+  dialling. The SDK does not check `incoming_allow`; the platform does.
+- A refused token (expired, wrong signature…) fails the registration with the
+  registrar's reason, 10001 to 10010 (`VobizAccessTokenException.tokenErrorName`, for
+  example `ACCESS_TOKEN_EXPIRED`), and the provider is asked again with `rejected`.
+- Revoking: stop issuing tokens to that user; the current one dies at `exp`.
+- `TokenConfig` is not token authentication (its token is sent as a SIP password) and
+  is deprecated.
 
 ### Transfers and recordings in production
 

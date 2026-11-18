@@ -8,6 +8,7 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../core/sip_headers.dart';
+import '../errors/vobiz_exception.dart';
 import '../network/keep_alive.dart';
 import '../utils/logger.dart';
 
@@ -157,6 +158,11 @@ class SipBuilder {
   /// INVITE's.
   static String newBranch() => 'z9hG4bK${_branch()}';
 
+  /// The header an access-token (JWT) sign-in sends on REGISTER and INVITE
+  /// instead of answering a digest challenge, spelled as Vobiz's web clients
+  /// send it.
+  static const String accessTokenHeader = 'X-Vobiz-Jwt';
+
   static String register({
     required String sipServer,
     required String username,
@@ -168,6 +174,7 @@ class SipBuilder {
     String? branch,
     String? authHeaderName,
     String? authHeader,
+    Map<String, String> extraHeaders = const <String, String>{},
   }) {
     final from = 'sip:$username@$sipServer';
     // CRLF line ends throughout (RFC 3261 7), as every other message here.
@@ -182,6 +189,7 @@ class SipBuilder {
       'Max-Forwards: 70',
       'User-Agent: vobiz_flutter_sdk',
       'Expires: $expires',
+      for (final header in extraHeaders.entries) '${header.key}: ${header.value}',
       'Content-Length: 0',
       if (authHeader != null) '${authHeaderName ?? 'Authorization'}: $authHeader',
       '',
@@ -558,6 +566,28 @@ class SipDigestAuth {
 /// A second plain 401/407 means the credentials are wrong, and sending them
 /// again would only loop.
 class _AuthRetries {
+  _AuthRetries({
+    this.refresh = false,
+    this.timeout,
+    this.extraHeaders = const <String, String>{},
+  });
+
+  /// A REGISTER refreshing a live registration rather than a sign-in's
+  /// first: no answer then means the transport is dead.
+  final bool refresh;
+
+  /// How long each REGISTER of this attempt waits for a final response;
+  /// null for [SIPService.transactionTimeout].
+  final Duration? timeout;
+
+  /// Headers every REGISTER of this attempt carries, its digest answer too:
+  /// the reference of a call the registrar holds ([SIPService.claimHeldCall]),
+  /// which it reads only once the REGISTER is authenticated.
+  final Map<String, String> extraHeaders;
+
+  /// Whether this attempt claims a held call.
+  bool get claims => extraHeaders.isNotEmpty;
+
   int _attempts = 0;
   bool _usedStale = false;
 
@@ -595,6 +625,7 @@ class _ClientTransaction {
     required this.socket,
     required this.onResponse,
     this.onTimeout,
+    this.timeout,
   });
 
   final String branch;
@@ -607,6 +638,9 @@ class _ClientTransaction {
   final WebSocketChannel? socket;
   final void Function(_ClientTransaction tx, SipMessage response) onResponse;
   final void Function()? onTimeout;
+
+  /// Overrides [SIPService.transactionTimeout] for this request.
+  final Duration? timeout;
   Timer? timer;
 
   String get key => '$branch $method';
@@ -668,6 +702,25 @@ class _Dialog {
   final List<String> routes;
 }
 
+/// A BYE or CANCEL that has had no final response yet. One sent while the
+/// connection is down (a call that ran out of network grace) never arrives,
+/// and Vobiz then keeps the far end up, silent and billed, until its media
+/// proxy times the leg out (about 300 s), or keeps a callee ringing. Once the
+/// client has registered on a new connection it is sent again.
+class _PendingEnd {
+  _PendingEnd(this.method, this.callId, this.username, this.resend);
+
+  final String method;
+  final String callId;
+  final String username;
+  final void Function() resend;
+  final DateTime since = DateTime.now();
+
+  /// The socket it last went out on (null: there was none).
+  WebSocketChannel? sentOn;
+  int resends = 0;
+}
+
 // ---------------------------------------------------------------------------
 // SIPService
 // ---------------------------------------------------------------------------
@@ -677,7 +730,7 @@ class SIPService {
   SIPService({
     required this.wsUrl,
     required this.sipServer,
-    this.registerExpires = 600,
+    this.registerExpires = 3600,
     this.keepAlive = const KeepAliveConfig(),
     Logger? logger,
   })  : _logger = logger ?? Logger(),
@@ -691,6 +744,12 @@ class SIPService {
   /// The registration lifetime this client asks for, in seconds. The
   /// registrar may grant less (or, after a 423, require more); the refresh
   /// follows what it granted.
+  ///
+  /// An hour by default: Vobiz's registrar keeps this SDK's registration
+  /// after its socket closes (the app killed or put to sleep) until it
+  /// expires, and while it lasts a call reaches the app by push. Every
+  /// REGISTER (sign-in, the refresh, the return to the foreground, the claim
+  /// of a pushed call) starts that hour again.
   final int registerExpires;
 
   /// The WebSocket ping and the optional RFC 5626 CRLF keep-alive.
@@ -723,14 +782,40 @@ class SIPService {
   @visibleForTesting
   Duration unregisterTimeout = const Duration(seconds: 2);
 
+  /// How long a BYE or CANCEL that may not have arrived is sent again after a
+  /// reconnect (at most [_pendingEndMaxResends] times). Vobiz's media proxy
+  /// ends an abandoned leg after about 300 s, so later there is nothing left
+  /// to end.
+  @visibleForTesting
+  Duration pendingEndWindow = const Duration(minutes: 5);
+  static const int _pendingEndMaxResends = 3;
+
+  /// How long [refreshRegistration] waits for the registrar before treating
+  /// the socket as dead. After a phone is locked the socket is often dead
+  /// without having been closed, and waiting the full [transactionTimeout]
+  /// would leave the app unreachable that long.
+  @visibleForTesting
+  Duration refreshTimeout = const Duration(seconds: 5);
+
   /// How long [reserveForOutgoingCall] holds the line if [call] never comes.
   @visibleForTesting
   Duration outgoingReservation = const Duration(seconds: 60);
 
   String? _username;
   String? _password;
+
+  // An access-token (JWT) sign-in sends this on REGISTER and INVITE instead
+  // of a password; it never answers a digest challenge.
+  String? _accessToken;
+  int? _accessTokenError;
+  int? _accessTokenExpiresIn;
+  int? _accessTokenExpiresAt;
   int _cseq = 1;
   bool _manualDisconnect = false;
+
+  // The reference of a call the registrar holds for this user (from a push),
+  // waiting for the next REGISTER to hand it back: see [claimHeldCall].
+  Map<String, String>? _pendingClaim;
 
   String? _activeCallId;
   String? _activeRemoteTag;
@@ -784,6 +869,9 @@ class SIPService {
 
   final Map<String, _ClientTransaction> _transactions = <String, _ClientTransaction>{};
 
+  // BYEs and CANCELs with no final response yet, by "<Call-ID> <method>".
+  final Map<String, _PendingEnd> _pendingEnds = <String, _PendingEnd>{};
+
   // Set while an outbound call is being prepared: an inbound INVITE then gets
   // 486 instead of ringing a client that will never show it.
   bool _outgoingReserved = false;
@@ -813,6 +901,14 @@ class SIPService {
   /// Vobiz's CallUUID (`X-Calluuid`) for the current or most recent call.
   String? get callUuid => _callUuid;
 
+  /// The SIP Call-ID of the current call: for an incoming call, its INVITE's.
+  /// Null with no call.
+  String? get activeSipCallId => _activeCallId;
+
+  /// The registrar took a REGISTER that claimed a held call
+  /// ([claimHeldCall]): the held INVITE should follow on this connection.
+  void Function()? onHeldCallClaimed;
+
   /// Whether an established call (dialog) exists that in-dialog requests,
   /// such as DTMF, can be sent on.
   bool get hasActiveDialog => _activeCallId != null && _dialogConfirmed;
@@ -835,6 +931,10 @@ class SIPService {
   void Function(String? reason)? onCallEnded;
   void Function(String reason, int? sipCode)? onCallFailed;
   void Function(String reason)? onSocketError;
+
+  /// The socket stopped answering (a REGISTER refresh timed out) and has been
+  /// closed. Falls back to [onSocketError] when unset.
+  void Function(String reason)? onTransportDead;
 
   /// Answers a re-INVITE or UPDATE that changes the session (new media, a
   /// hold): given the far end's offer, returns the answer SDP, or null to
@@ -872,9 +972,129 @@ class SIPService {
   void register(String username, String password) {
     _username = username;
     _password = password;
+    _accessToken = null;
+    _startRegistration();
+  }
+
+  /// Registers as [username] with an access token (JWT) instead of a
+  /// password: every REGISTER and INVITE carries it as `X-Vobiz-Jwt`, and the
+  /// registrar validates it in place of a digest challenge.
+  void registerWithAccessToken(String username, String accessToken) {
+    _username = username;
+    _password = null;
+    _accessToken = accessToken;
+    _startRegistration();
+  }
+
+  /// Swaps the access token the next REGISTER and INVITE carry. Sends
+  /// nothing: call [refreshRegistration] to present it now.
+  void updateAccessToken(String accessToken) {
+    if (_password != null) return;
+    _accessToken = accessToken;
+  }
+
+  /// Whether this client signs in with an access token rather than a
+  /// password.
+  bool get usesAccessToken => _accessToken != null;
+
+  /// The registrar's reason for its last refusal of the access token (10001
+  /// to 10010, from `X-vobiz-Jwt-Error-Code`), until the next REGISTER is
+  /// accepted.
+  int? get accessTokenError => _accessTokenError;
+
+  /// From the registrar's last 200 OK (`X-vobiz-Jwt: expires=<s>;epoch-exp=<t>`):
+  /// seconds the token had left by the server's clock, and its expiry.
+  int? get accessTokenExpiresIn => _accessTokenExpiresIn;
+  int? get accessTokenExpiresAt => _accessTokenExpiresAt;
+
+  bool get _hasCredentials =>
+      _username != null && (_password != null || _accessToken != null);
+
+  void _startRegistration() {
+    _accessTokenError = null;
     _closeWhenCallEnds = false;
     _registrationState.value = SipRegistrationState.registering;
-    _sendRegister(expires: registerExpires, auth: _AuthRetries());
+    final claim = _pendingClaim;
+    _pendingClaim = null;
+    _sendRegister(
+        expires: registerExpires,
+        auth: _AuthRetries(extraHeaders: claim ?? const <String, String>{}));
+  }
+
+  /// Claims a call Vobiz's registrar is holding for this user while a push
+  /// wakes the app: the REGISTER that follows carries [headers]
+  /// (`VobizPushHold.registerHeaders`: `X-Index`, `X-Label`,
+  /// `X-vobiz-Registrar-Info`), its digest answer too, and the registrar then
+  /// sends the held INVITE to this registration.
+  ///
+  /// Registered on an open socket, that REGISTER goes now and this returns
+  /// true. Otherwise it returns false and the headers ride on the next
+  /// REGISTER: the sign-in's ([register], [registerWithAccessToken]), a
+  /// reconnect's, or another right after the one in flight is answered. Only
+  /// that one REGISTER carries them; refreshes after it do not.
+  bool claimHeldCall(Map<String, String> headers) {
+    if (headers.isEmpty) return false;
+    final registered = _connectionState.value == SipConnectionState.connected &&
+        _registrationState.value == SipRegistrationState.registered;
+    final inFlight = _transactions.values.any((tx) => tx.method == 'REGISTER');
+    if (!_hasCredentials || !registered || inFlight) {
+      _pendingClaim = Map<String, String>.unmodifiable(headers);
+      return false;
+    }
+    _registrationRefreshTimer?.cancel();
+    _sendRegister(
+        expires: registerExpires,
+        auth: _AuthRetries(refresh: true, timeout: refreshTimeout, extraHeaders: headers));
+    return true;
+  }
+
+  /// Drops a claim no REGISTER has carried yet: the pushed call expired or
+  /// was taken some other way.
+  void cancelHeldCallClaim() => _pendingClaim = null;
+
+  /// Whether a held call's reference is waiting for the next REGISTER.
+  bool get hasPendingClaim => _pendingClaim != null;
+
+  /// Refreshes the registration now, on the open socket: the same REGISTER
+  /// (and digest retry) as the periodic refresh, whose timer is re-armed from
+  /// the new grant. A call in progress is not affected.
+  ///
+  /// No answer within [refreshTimeout] means the socket is dead: it is closed
+  /// and [onTransportDead] reports it, so the client reconnects. A final
+  /// refusal (403, say) fails the registration as usual.
+  ///
+  /// Returns false, sending nothing, unless the socket is connected and the
+  /// registration is up; reconnecting is then the caller's job. Returns true
+  /// without sending when a REGISTER is already in flight.
+  bool refreshRegistration() {
+    if (!_hasCredentials) return false;
+    if (_connectionState.value != SipConnectionState.connected ||
+        _registrationState.value != SipRegistrationState.registered) {
+      return false;
+    }
+    if (_transactions.values.any((tx) => tx.method == 'REGISTER')) return true;
+    _registrationRefreshTimer?.cancel();
+    _sendRegister(
+        expires: registerExpires,
+        auth: _AuthRetries(refresh: true, timeout: refreshTimeout));
+    return true;
+  }
+
+  /// Registers again on the socket that is still open, after the registrar
+  /// refused the last REGISTER: with a fresh access token, say. A call on
+  /// the socket keeps it (a refused registration only closes it once the
+  /// call ends), and this keeps it open afterwards too.
+  ///
+  /// Returns false, sending nothing, when the socket is closed: connect
+  /// again instead. Returns true without sending when a REGISTER is already
+  /// in flight.
+  bool registerAgain() {
+    if (!_hasCredentials) return false;
+    if (_connectionState.value != SipConnectionState.connected) return false;
+    if (_transactions.values.any((tx) => tx.method == 'REGISTER')) return true;
+    _registrationRefreshTimer?.cancel();
+    _startRegistration();
+    return true;
   }
 
   /// Marks the line busy while an outbound call is being prepared (microphone,
@@ -975,6 +1195,16 @@ class SIPService {
     _endCall();
   }
 
+  /// Forgets the established call without signalling it. For a call the far
+  /// end no longer has: it answered a request within the dialog with 481
+  /// (Call/Transaction Does Not Exist), so a BYE would only be refused too.
+  /// RFC 3261 12.2.1.2: the UAC SHOULD then terminate the dialog.
+  void abandonCall() {
+    if (_activeCallId == null) return;
+    _endCall();
+    onCallEnded?.call('The call no longer exists');
+  }
+
   void hangup() {
     _releaseReservation();
 
@@ -1017,6 +1247,8 @@ class SIPService {
   /// established call's dialog, so it can still be hung up (or be hung up)
   /// once registered again. [keepCall] implies no unregistration.
   Future<void> disconnect({bool keepCall = false, bool unregister = true}) async {
+    // A held call can only be claimed by a sign-in that is still wanted.
+    _pendingClaim = null;
     _releaseReservation();
     _registrationRefreshTimer?.cancel();
     _crlfKeepAlive?.stop();
@@ -1074,6 +1306,7 @@ class SIPService {
     required void Function(_ClientTransaction tx, SipMessage response) onResponse,
     void Function()? onTimeout,
     WebSocketChannel? socket,
+    Duration? timeout,
   }) {
     final tx = _ClientTransaction(
       branch: branch,
@@ -1083,6 +1316,7 @@ class SIPService {
       socket: socket ?? _socket,
       onResponse: onResponse,
       onTimeout: onTimeout,
+      timeout: timeout,
     );
     _transactions[tx.key] = tx;
     _armTimer(tx);
@@ -1091,7 +1325,7 @@ class SIPService {
 
   void _armTimer(_ClientTransaction tx) {
     tx.timer?.cancel();
-    tx.timer = Timer(transactionTimeout, () {
+    tx.timer = Timer(tx.timeout ?? transactionTimeout, () {
       if (!identical(_transactions[tx.key], tx)) return;
       _transactions.remove(tx.key);
       _logger.warn('No final response to ${tx.method} (CSeq ${tx.cseq})');
@@ -1120,6 +1354,7 @@ class SIPService {
     final branch = SipBuilder.newBranch();
     final cseq = _cseq++;
     final unregistering = onUnregistered != null;
+    final sentOn = socket ?? _socket;
     _sendRequest(
       message: SipBuilder.register(
         sipServer: sipServer,
@@ -1132,12 +1367,14 @@ class SIPService {
         branch: branch,
         authHeaderName: authHeaderName,
         authHeader: authHeader,
+        extraHeaders: <String, String>{..._accessTokenHeaders, ...auth.extraHeaders},
       ),
       branch: branch,
       method: 'REGISTER',
       cseq: cseq,
       callId: _registerCallId,
       socket: socket,
+      timeout: unregistering ? null : auth.timeout,
       onResponse: (tx, msg) => _handleRegisterResponse(
         tx,
         msg,
@@ -1147,8 +1384,18 @@ class SIPService {
       ),
       onTimeout: unregistering
           ? onUnregistered
-          : () => _failRegistration('Registration timed out: no answer from the registrar'),
+          : auth.refresh
+              ? () => _transportDead(sentOn, 'No answer to the REGISTER refresh')
+              : () => _failRegistration('Registration timed out: no answer from the registrar'),
     );
+  }
+
+  /// The access token, as the header a REGISTER or INVITE carries it in.
+  Map<String, String> get _accessTokenHeaders {
+    final token = _accessToken;
+    return token == null
+        ? const <String, String>{}
+        : <String, String>{SipBuilder.accessTokenHeader: token};
   }
 
   void _sendInvite(_OutgoingInvite invite, {String? authHeaderName, String? authHeader}) {
@@ -1172,8 +1419,9 @@ class SIPService {
         authHeaderName: authHeaderName,
         authHeader: authHeader,
         // The re-sent INVITE after a 407 must carry the same headers, or the
-        // webhook never sees them.
-        extraHeaders: invite.extraHeaders,
+        // webhook never sees them. A token sign-in adds its token, read now
+        // so a refreshed one is used.
+        extraHeaders: <String, String>{...invite.extraHeaders, ..._accessTokenHeaders},
       ),
       branch: invite.branch,
       method: 'INVITE',
@@ -1187,6 +1435,16 @@ class SIPService {
   void _sendCancel(_OutgoingInvite invite) {
     if (invite.cancelSent || _username == null) return;
     invite.cancelSent = true;
+    final pendingKey = '${invite.callId} CANCEL';
+    final pending =
+        _pendingEnds[pendingKey] ??= _PendingEnd('CANCEL', invite.callId, _username!, () {
+      // The INVITE's branch and CSeq again, on the connection the client has
+      // now: the registrar matches a CANCEL to its INVITE by those.
+      invite.cancelSent = false;
+      invite.socket = _socket;
+      _sendCancel(invite);
+    });
+    pending.sentOn = invite.socket;
     _sendRequest(
       message: SipBuilder.cancel(
         requestUri: invite.requestUri,
@@ -1206,6 +1464,7 @@ class SIPService {
       // A 200 to the CANCEL only means it arrived; the INVITE's own 487 (or
       // a 2xx that crossed it) is what ends the call.
       onResponse: (_, msg) {
+        if (msg.statusCode >= 200) _pendingEnds.remove(pendingKey);
         if (msg.statusCode >= 300) {
           _logger.warn('CANCEL refused: ${msg.statusCode} ${_reasonPhrase(msg)}');
         }
@@ -1229,6 +1488,10 @@ class SIPService {
     final retries = auth ?? _AuthRetries();
     final branch = SipBuilder.newBranch();
     final cseq = _cseq++;
+    final pendingKey = '${dialog.callId} BYE';
+    final pending = _pendingEnds[pendingKey] ??=
+        _PendingEnd('BYE', dialog.callId, username, () => _sendBye(dialog));
+    pending.sentOn = socket ?? _socket;
     _sendRequest(
       message: SipBuilder.bye(
         requestUri: dialog.remoteTarget,
@@ -1275,9 +1538,36 @@ class SIPService {
             }
           }
         }
+        // Answered, even refused (481: the far end already ended the call):
+        // nothing to send again.
+        _pendingEnds.remove(pendingKey);
         if (code >= 300) _logger.warn('BYE refused: $code ${_reasonPhrase(msg)}');
       },
     );
+  }
+
+  /// Registered on a (possibly new) connection: sends again each BYE and
+  /// CANCEL that went out with no connection, or on one that has since been
+  /// replaced, and has had no answer. Ones that are too old, or belong to
+  /// another sign-in, are dropped.
+  void _resendPendingEnds() {
+    if (_pendingEnds.isEmpty) return;
+    final now = DateTime.now();
+    for (final entry in _pendingEnds.entries.toList()) {
+      final pending = entry.value;
+      if (now.difference(pending.since) > pendingEndWindow ||
+          pending.username != _username ||
+          pending.resends >= _pendingEndMaxResends) {
+        _pendingEnds.remove(entry.key);
+        continue;
+      }
+      // In flight on this very connection: its answer may still come.
+      if (pending.sentOn != null && identical(pending.sentOn, _socket)) continue;
+      pending.resends++;
+      _logger.info('Sending ${pending.method} again for call ${pending.callId}: the '
+          'connection was down when it went out');
+      pending.resend();
+    }
   }
 
   void _sendNextDtmf() {
@@ -1870,6 +2160,20 @@ class SIPService {
     if (code < 200) return;
     final unregistering = onUnregistered != null;
 
+    // An access token is validated by the registrar itself. A refusal comes
+    // back as 401 with a digest challenge (and, when the token was the
+    // problem, X-vobiz-Jwt-Error-Code); there is no password to answer it.
+    if (_accessToken != null && code >= 300 && code != 423) {
+      if (unregistering) {
+        onUnregistered();
+        return;
+      }
+      final tokenError = _accessTokenErrorIn(msg);
+      _accessTokenError = tokenError;
+      _failRegistration(_accessTokenRefusal(code, msg, tokenError));
+      return;
+    }
+
     if (code == 401 || code == 407) {
       final challenge = _challenge(msg);
       _logger.info('Auth challenge: $challenge');
@@ -1908,7 +2212,11 @@ class SIPService {
       // Interval Too Brief: ask again for at least what the registrar wants.
       final minimum = int.tryParse((msg.header('Min-Expires') ?? '').trim());
       if (minimum != null && minimum > expires) {
-        _sendRegister(expires: minimum, auth: _AuthRetries(), socket: tx.socket);
+        _sendRegister(
+            expires: minimum,
+            auth: _AuthRetries(
+                refresh: auth.refresh, timeout: auth.timeout, extraHeaders: auth.extraHeaders),
+            socket: tx.socket);
         return;
       }
     }
@@ -1921,11 +2229,27 @@ class SIPService {
 
     if (code >= 200 && code < 300) {
       final granted = _grantedExpires(msg) ?? expires;
+      if (_accessToken != null) _readAccessTokenExpiry(msg);
       _logger.info('SIP registered as $_username for ${granted}s');
       _registrationState.value = SipRegistrationState.registered;
       _scheduleRegistrationRefresh(granted);
       _startKeepAlive();
+      _resendPendingEnds();
       onRegistered?.call();
+      if (auth.claims) {
+        _logger.info('The registrar took the REGISTER that claims a held call '
+            '(X-Index ${auth.extraHeaders['X-Index']}, X-Label ${auth.extraHeaders['X-Label']})');
+        onHeldCallClaimed?.call();
+      }
+      // A claim that came while this REGISTER was in flight goes now.
+      final pending = _pendingClaim;
+      if (pending != null && _registrationState.value == SipRegistrationState.registered) {
+        _pendingClaim = null;
+        _registrationRefreshTimer?.cancel();
+        _sendRegister(
+            expires: registerExpires,
+            auth: _AuthRetries(refresh: true, timeout: refreshTimeout, extraHeaders: pending));
+      }
       return;
     }
 
@@ -1935,6 +2259,38 @@ class SIPService {
       return;
     }
     _failRegistration('Registration failed ($code ${_reasonPhrase(msg)})');
+  }
+
+  /// The token error code on a refusal (`X-vobiz-Jwt-Error-Code: 10006`).
+  static int? _accessTokenErrorIn(SipMessage msg) =>
+      int.tryParse((msg.header('X-vobiz-Jwt-Error-Code') ?? '').trim());
+
+  /// Why the registrar refused this token sign-in, in words.
+  String _accessTokenRefusal(int code, SipMessage msg, int? tokenError) {
+    if (tokenError != null) {
+      return 'Access token refused: ${VobizAccessTokenException.errorName(tokenError)} '
+          '($tokenError)';
+    }
+    if (code == 401 || code == 407) {
+      return 'Access token refused ($code ${_reasonPhrase(msg)})';
+    }
+    if (code == 403) return 'Access token refused (403 ${_reasonPhrase(msg)})';
+    return 'Registration failed ($code ${_reasonPhrase(msg)})';
+  }
+
+  /// Why an outbound call was refused for its access token, in words.
+  static String _accessTokenCallRefusal(int tokenError) => 'Call refused: access token '
+      '${VobizAccessTokenException.errorName(tokenError)} ($tokenError)';
+
+  /// The registrar's view of the token on a 200 OK:
+  /// `X-vobiz-Jwt: expires=<seconds left>;epoch-exp=<exp>`.
+  void _readAccessTokenExpiry(SipMessage msg) {
+    final value = msg.header('X-vobiz-Jwt');
+    if (value == null) return;
+    int? param(String name) => int.tryParse(
+        RegExp('(?:^|;)\\s*$name\\s*=\\s*(-?\\d+)').firstMatch(value)?.group(1) ?? '');
+    _accessTokenExpiresIn = param('expires') ?? _accessTokenExpiresIn;
+    _accessTokenExpiresAt = param('epoch-exp') ?? _accessTokenExpiresAt;
   }
 
   /// The lifetime the registrar granted: our Contact's `expires` parameter
@@ -1972,6 +2328,23 @@ class SIPService {
     } else {
       _closeAfterRegistrationFailure();
     }
+  }
+
+  /// A refresh went unanswered: the socket is dead even though it was never
+  /// closed. Drop it and report it, so the client reconnects (keeping a
+  /// call's dialog) instead of giving up on the registration.
+  void _transportDead(WebSocketChannel? socket, String reason) {
+    if (socket == null || !identical(socket, _socket)) return;
+    _logger.warn('$reason: the WebSocket is dead, closing it');
+    // Its close, whenever it comes, is no longer the current socket's.
+    _socket = null;
+    _registrationRefreshTimer?.cancel();
+    _crlfKeepAlive?.stop();
+    _registrationRefreshDelay = null;
+    _connectionState.value = SipConnectionState.disconnected;
+    _registrationState.value = SipRegistrationState.failed;
+    _closeQuietly(socket);
+    (onTransportDead ?? onSocketError)?.call(reason);
   }
 
   void _closeAfterRegistrationFailure() {
@@ -2053,8 +2426,12 @@ class SIPService {
         _failOutgoing(_withDetail('Remote party declined the call', msg), code);
         break;
       default:
+        final tokenError = _accessToken != null ? _accessTokenErrorIn(msg) : null;
         _failOutgoing(
-            _withDetail('Call failed ($code ${_reasonPhrase(msg)})', msg), code);
+            tokenError != null
+                ? _accessTokenCallRefusal(tokenError)
+                : _withDetail('Call failed ($code ${_reasonPhrase(msg)})', msg),
+            code);
     }
   }
 
@@ -2138,6 +2515,18 @@ class SIPService {
   }
 
   void _handleInviteAuthChallenge(_OutgoingInvite invite, SipMessage msg) {
+    // A token sign-in has no password: a challenge means the token was not
+    // accepted for this call.
+    if (_accessToken != null) {
+      final tokenError = _accessTokenErrorIn(msg);
+      _failOutgoing(
+          tokenError != null
+              ? _accessTokenCallRefusal(tokenError)
+              : 'Call refused: the access token was not accepted '
+                  '(${msg.statusCode} ${_reasonPhrase(msg)})',
+          msg.statusCode);
+      return;
+    }
     final challenge = _challenge(msg);
     if (challenge.isEmpty || _username == null || _password == null) {
       _failOutgoing('Call authentication failed', msg.statusCode);
@@ -2203,8 +2592,8 @@ class SIPService {
     final delay = Duration(milliseconds: max(1000, grantedSeconds * 800));
     _registrationRefreshDelay = delay;
     _registrationRefreshTimer = Timer(delay, () {
-      if (_username == null || _password == null) return;
-      _sendRegister(expires: registerExpires, auth: _AuthRetries());
+      if (!_hasCredentials) return;
+      _sendRegister(expires: registerExpires, auth: _AuthRetries(refresh: true));
     });
   }
 

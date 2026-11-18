@@ -20,7 +20,7 @@ export function fcmToken(name) {
  * Starts a bridge. `env` is merged over a signed, fully configured default.
  * Returns { bridge, base, pushes, api, logs, stateFile, stop }.
  */
-export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, endpoints = ['alice', 'bob', 'carol'] } = {}) {
+export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, endpoints = ['alice', 'bob', 'carol'], deps = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-bridge-test-'));
   const file = stateFile || path.join(dir, 'bridge-state.json');
   const pushes = [];
@@ -51,6 +51,7 @@ export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, 
         }
         return { message: 'ok' };
       },
+      ...deps,
     },
   });
   const port = await bridge.start({ port: 0, checks: false });
@@ -109,8 +110,12 @@ export function xmlAttr(xml, element, attr) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Waits until fn() is truthy, up to `ms`. */
-export async function until(fn, ms = 2000) {
+/**
+ * Waits until fn() is truthy, up to `ms`. 5 s, not 2: with every test file
+ * starting bridges in parallel, a push can take over 2 s on a loaded machine;
+ * a passing check returns at once.
+ */
+export async function until(fn, ms = 5000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
     const v = await fn();
@@ -128,4 +133,30 @@ export async function registerDevice(ctx, username, { name = username } = {}) {
   const r = await postJson(ctx, '/push/register', { username, token: fcmToken(name), platform: 'android' }, { 'X-Bridge-Key': BRIDGE_KEY });
   if (r.status !== 200) throw new Error(`register ${username}: ${r.status} ${r.text}`);
   return { ...r.json, fcm: fcmToken(name), auth: { Authorization: `Bearer ${r.json.device_token}` } };
+}
+
+/**
+ * An inbound call up to its Dial. /answer holds the caller on ringback while
+ * a pushed phone wakes (PreAnswer + Redirect to /dial-now); this follows the
+ * Redirect as Vobiz does when the wait ends. Returns { text: the Dial XML,
+ * hold: the hold XML or null, action, events }.
+ */
+export async function answerCall(ctx, params) {
+  const answer = await webhook(ctx, '/answer', params);
+  let text = answer.text;
+  let hold = null;
+  const redirect = text.match(/<Redirect[^>]*>([^<]+)<\/Redirect>/);
+  if (redirect) {
+    hold = text;
+    text = (await webhook(ctx, new URL(redirect[1].replace(/&amp;/g, '&')).pathname, { CallUUID: params.CallUUID, Event: 'Redirect' })).text;
+  }
+  const action = xmlAttr(text, 'Dial', 'action');
+  const events = xmlAttr(text, 'Dial', 'callbackUrl');
+  return {
+    text,
+    hold,
+    headers: answer.headers,
+    action: action && new URL(action).pathname,
+    events: events && new URL(events).pathname,
+  };
 }

@@ -578,6 +578,78 @@ class PeerService {
   }
 
   // -------------------------------------------------------------------------
+  // ICE restart (re-INVITE)
+  // -------------------------------------------------------------------------
+
+  /// Starts an ICE restart on the active call, for when the phone's network
+  /// changed: when Android drops a network, WebRTC deletes the ports it
+  /// gathered on it and gathers no new ones by itself, so the audio cannot
+  /// come back without fresh ICE credentials and candidates. Keeps the hold
+  /// direction. Waits for gathering as for the first offer and returns the
+  /// new offer's SDP for a re-INVITE. Finish with [completeIceRestart] when
+  /// the 200 OK arrives, or [abortIceRestart].
+  Future<String> beginIceRestart({bool Function()? cancelled}) async {
+    final String callId = _requireActiveCallId();
+    final _PeerCallState state = _requireState(callId);
+    final RTCPeerConnection peer = _requirePeerForState(state, callId);
+    final String direction = state.held ? 'sendonly' : 'sendrecv';
+    final String? oldUfrag = _iceUfrag((await peer.getLocalDescription())?.sdp);
+
+    // The gathering wait below must see this restart's candidates, not the
+    // ones gathered on the network that is gone.
+    state.gatheringComplete = false;
+    state.candidateTypes.clear();
+    try {
+      await peer.restartIce();
+    } catch (e) {
+      // createOffer's iceRestart option below asks for the same thing.
+      _logger.warn('restartIce failed for $callId: $e');
+    }
+    RTCSessionDescription offer =
+        await peer.createOffer(<String, dynamic>{'iceRestart': true});
+    if (SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
+      offer = RTCSessionDescription(
+          SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
+    }
+    offer = _withPreferredCodecs(offer);
+    _requireLive(callId, state);
+    await peer.setLocalDescription(offer);
+    await waitForIceGathering(callId, cancelled: cancelled);
+    final RTCSessionDescription? local = await peer.getLocalDescription();
+    final String sdp = local?.sdp ?? offer.sdp ?? '';
+    if (oldUfrag != null && _iceUfrag(sdp) == oldUfrag) {
+      _logger.warn('ICE restart offer for $callId kept the old ICE credentials');
+    }
+    _emitMediaMessage(callId, state, 'ICE restart offer created');
+    return sdp;
+  }
+
+  /// Applies the far end's answer to a [beginIceRestart] offer. ICE then
+  /// checks the new candidate pairs; [onIceConnectionState] reports whether
+  /// the audio is back.
+  Future<void> completeIceRestart(String answerSdp) async {
+    final String callId = _requireActiveCallId();
+    final _PeerCallState state = _requireState(callId);
+    await setRemoteDescription(RTCSessionDescription(answerSdp, 'answer'));
+    _emitMediaMessage(callId, state, 'ICE restart answered');
+  }
+
+  /// Rolls back a [beginIceRestart] offer the far end refused.
+  Future<void> abortIceRestart() async {
+    final String? callId = _activeCallId;
+    final RTCPeerConnection? peer = _activeState?.peerConnection;
+    if (callId == null || peer == null) return;
+    try {
+      await peer.setLocalDescription(RTCSessionDescription('', 'rollback'));
+    } catch (e) {
+      _logger.warn('Could not roll back the ICE restart offer for $callId: $e');
+    }
+  }
+
+  static String? _iceUfrag(String? sdp) =>
+      RegExp(r'a=ice-ufrag:(\S+)').firstMatch(sdp ?? '')?.group(1);
+
+  // -------------------------------------------------------------------------
   // Audio control
   // -------------------------------------------------------------------------
 

@@ -44,6 +44,15 @@ abstract final class VobizErrorCode {
   /// The server refused the call's credentials (401/407 after the SDK
   /// answered its digest challenge).
   static const String authFailed = 'auth_failed';
+
+  /// An access token (JWT) could not be used: it is not a Vobiz token, the
+  /// app's token provider failed, or the token does not allow what was
+  /// asked. See [VobizAccessTokenException].
+  static const String accessTokenFailed = 'access_token_failed';
+
+  /// A conference request failed: your conference server could not be
+  /// reached, or it refused (see [VobizException.statusCode]).
+  static const String conferenceFailed = 'conference_failed';
 }
 
 /// An SDK operation failed.
@@ -107,4 +116,76 @@ class VobizCredentialsException extends VobizException {
 class VobizRegistrationException extends VobizException {
   const VobizRegistrationException(String message, {super.cause})
       : super(VobizErrorCode.registrationFailed, message);
+}
+
+/// An access token (JWT) could not be used.
+///
+/// [tokenError] is the registrar's reason when it gave one: the
+/// `X-vobiz-Jwt-Error-Code` header on its refusal, 10001 to 10010, the same
+/// numbers the web SDK reports in `onLoginFailed`. [tokenErrorName] names it.
+/// The SDK also uses [invalidToken] when a token cannot be decoded and
+/// [invalidGrants] when it does not allow outgoing calls.
+///
+/// On an `ErrorEvent` with code [VobizErrorCode.registrationFailed], this is
+/// the `cause` when the registrar refused an access token.
+class VobizAccessTokenException extends VobizException {
+  const VobizAccessTokenException(String message,
+      {this.tokenError, super.statusCode, super.cause})
+      : super(VobizErrorCode.accessTokenFailed, message);
+
+  /// The registrar's reason code (10001 to 10010), when there is one.
+  final int? tokenError;
+
+  /// [tokenError] by name, such as `ACCESS_TOKEN_EXPIRED`; null without one.
+  String? get tokenErrorName => tokenError == null ? null : errorName(tokenError!);
+
+  /// Not a JWT, or a claim is missing or has the wrong type.
+  static const int invalidToken = 10001;
+
+  /// The JWT header is not one Vobiz signs (`typ`, `alg` or `cty`).
+  static const int invalidHeader = 10002;
+
+  /// `iss` is not an Auth ID the platform knows.
+  static const int invalidIssuer = 10003;
+
+  /// `sub` names no identity on that account.
+  static const int invalidSubject = 10004;
+
+  /// `nbf` is still in the future.
+  static const int notValidYet = 10005;
+
+  /// `exp` has passed.
+  static const int expired = 10006;
+
+  /// The signature does not match the account's Auth Token.
+  static const int invalidSignature = 10007;
+
+  /// `per.voice` does not allow this: an outgoing call without
+  /// `outgoing_allow`, for example.
+  static const int invalidGrants = 10008;
+
+  /// `exp - nbf` is outside 180 seconds to 24 hours.
+  static const int lifetimeTooLong = 10009;
+
+  /// Too many sign-ins for this identity.
+  static const int maxLoginsReached = 10010;
+
+  /// The name the web SDK's `getErrorStringByErrorCodes` gives [code].
+  static String errorName(int code) => switch (code) {
+        invalidToken => 'INVALID_ACCESS_TOKEN',
+        invalidHeader => 'INVALID_ACCESS_TOKEN_HEADER',
+        invalidIssuer => 'INVALID_ACCESS_TOKEN_ISSUER',
+        invalidSubject => 'INVALID_ACCESS_TOKEN_SUBJECT',
+        notValidYet => 'ACCESS_TOKEN_NOT_VALID_YET',
+        expired => 'ACCESS_TOKEN_EXPIRED',
+        invalidSignature => 'INVALID_ACCESS_TOKEN_SIGNATURE',
+        invalidGrants => 'INVALID_ACCESS_TOKEN_GRANTS',
+        lifetimeTooLong => 'EXPIRATION_EXCEEDS_MAX_ALLOWED_TIME',
+        maxLoginsReached => 'MAX_ALLOWED_LOGIN_REACHED',
+        _ => 'UNAUTHORISED',
+      };
+
+  @override
+  String toString() => 'VobizAccessTokenException('
+      '${tokenError != null ? '$tokenError ${tokenErrorName!}' : code}): $message';
 }

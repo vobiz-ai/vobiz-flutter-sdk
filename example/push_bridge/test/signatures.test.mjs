@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createBridge } from '../push-bridge.mjs';
-import { AUTH_TOKEN, PUBLIC_URL, registerDevice, signV3, startBridge, webhook, xmlAttr } from './helpers.mjs';
+import { AUTH_TOKEN, PUBLIC_URL, answerCall, registerDevice, signV3, startBridge, webhook } from './helpers.mjs';
 
 test('refuses to start without PUBLIC_URL', () => {
   assert.throws(
@@ -62,7 +62,7 @@ test('a signed /answer is accepted; replaying the same nonce with another body i
   await registerDevice(ctx, 'alice');
   const first = await webhook(ctx, '/answer', { CallUUID: 'c1', From: '+919800000001', To: '+918000000000' });
   assert.equal(first.status, 200);
-  assert.match(first.text, /<Dial/);
+  assert.match(first.text, /<Redirect[^>]*>[^<]*\/dial-now\/c1\.[\w-]{22}<\/Redirect>/);
   const replay = await webhook(ctx, '/answer', { CallUUID: 'c2', From: '+910000000000' }, { sign: false, headers: first.headers });
   assert.equal(replay.status, 403);
   assert.equal(ctx.bridge.calls.has('c2'), false);
@@ -86,11 +86,11 @@ test('Dial callbacks carry the call id in the signed path; a captured signature 
   const ctx = await startBridge();
   t.after(ctx.stop);
   await registerDevice(ctx, 'alice');
-  const a = await webhook(ctx, '/answer', { CallUUID: 'call-A', From: '+919800000001', To: '+918000000000' });
-  const b = await webhook(ctx, '/answer', { CallUUID: 'call-B', From: '+919800000002', To: '+918000000000' });
-  const actionA = new URL(xmlAttr(a.text, 'Dial', 'action'));
-  const actionB = new URL(xmlAttr(b.text, 'Dial', 'action'));
-  assert.equal(actionA.search, '', 'no unsigned query string');
+  const a = await answerCall(ctx, { CallUUID: 'call-A', From: '+919800000001', To: '+918000000000' });
+  const b = await answerCall(ctx, { CallUUID: 'call-B', From: '+919800000002', To: '+918000000000' });
+  const actionA = new URL(`${PUBLIC_URL}${a.action}`);
+  const actionB = new URL(`${PUBLIC_URL}${b.action}`);
+  assert.doesNotMatch(a.text, /dial-result\/[^"]*\?/, 'no unsigned query string');
   assert.match(actionA.pathname, /^\/dial-result\/call-A\.[\w-]{22}$/);
 
   // Vobiz's genuine signature for call A's action URL, sent to call B's.
@@ -104,4 +104,8 @@ test('Dial callbacks carry the call id in the signed path; a captured signature 
   assert.equal(forged.status, 200);
   assert.match(forged.text, /<Hangup\/>/);
   assert.equal(ctx.bridge.calls.get('call-B').finished, null);
+
+  // The same for the hold's /dial-now path.
+  const forgedNow = await webhook(ctx, '/dial-now/call-B.AAAAAAAAAAAAAAAAAAAAAA', {});
+  assert.match(forgedNow.text, /<Hangup\/>/);
 });
