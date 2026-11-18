@@ -68,6 +68,24 @@ class FakePeer extends PeerService {
     if (error != null) throw error;
   }
 
+  /// The ICE restart steps the client took: 'begin', 'complete', 'abort'.
+  final List<String> iceRestarts = <String>[];
+
+  @override
+  Future<String> beginIceRestart({bool Function()? cancelled}) async {
+    iceRestarts.add('begin');
+    return 'v=0\r\na=ice-ufrag:new\r\n';
+  }
+
+  @override
+  Future<void> completeIceRestart(String answerSdp) async {
+    iceRestarts.add('complete');
+    remoteDescriptions.add(RTCSessionDescription(answerSdp, 'answer'));
+  }
+
+  @override
+  Future<void> abortIceRestart() async => iceRestarts.add('abort');
+
   @override
   Future<void> disposeCall(String callId) async => _pc = null;
 
@@ -180,6 +198,22 @@ class Harness {
         'Call-ID: ${invite.header('Call-ID')}\r\n'
         'CSeq: ${invite.header('CSeq')}\r\n'
         'Contact: <sip:far@10.0.2.9:5060>\r\n'
+        '${body.isEmpty ? '' : 'Content-Type: application/sdp\r\n'}'
+        'Content-Length: ${body.length}\r\n\r\n$body');
+  }
+
+  /// The far end's final response to the last in-dialog re-INVITE, its
+  /// headers echoed (the To tag is already there).
+  void respondToReInvite(int code, String phrase, {String body = ''}) {
+    final reInvite =
+        SipParser.parse(sent.lastWhere((m) => m.startsWith('INVITE ')));
+    sip.debugReceive('SIP/2.0 $code $phrase\r\n'
+        'Via: ${reInvite.header('Via')}\r\n'
+        'From: ${reInvite.header('From')}\r\n'
+        'To: ${reInvite.header('To')}\r\n'
+        'Call-ID: ${reInvite.header('Call-ID')}\r\n'
+        'CSeq: ${reInvite.header('CSeq')}\r\n'
+        'Contact: <sip:Vobiz@10.0.2.9:5060>\r\n'
         '${body.isEmpty ? '' : 'Content-Type: application/sdp\r\n'}'
         'Content-Length: ${body.length}\r\n\r\n$body');
   }

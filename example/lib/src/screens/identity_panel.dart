@@ -8,8 +8,9 @@ import '../widgets/common.dart';
 import '../widgets/push_panel.dart';
 import '../widgets/vobiz_logo.dart';
 
-/// Sign in: Zero-Config Setup (Auth ID + Auth Token) or SIP Direct (an
-/// endpoint's username and password). Nothing is pre-filled from code.
+/// Sign in: Zero-Config Setup (Auth ID + Auth Token), SIP Direct (an
+/// endpoint's username and password) or an access token (JWT) from a token
+/// server. Nothing is pre-filled from code.
 class IdentityPanel extends StatefulWidget {
   const IdentityPanel({super.key, required this.controller});
 
@@ -24,6 +25,8 @@ class _IdentityPanelState extends State<IdentityPanel> {
   late final TextEditingController _authToken = TextEditingController(text: widget.controller.authToken);
   late final TextEditingController _sipUser = TextEditingController(text: widget.controller.sipUsername);
   late final TextEditingController _sipPass = TextEditingController(text: widget.controller.sipPassword);
+  late final TextEditingController _tokenServer = TextEditingController(text: widget.controller.tokenServerUrl);
+  late final TextEditingController _tokenUser = TextEditingController(text: widget.controller.tokenUser);
   bool _showToken = false;
   bool _showPassword = false;
 
@@ -33,6 +36,8 @@ class _IdentityPanelState extends State<IdentityPanel> {
     _authToken.dispose();
     _sipUser.dispose();
     _sipPass.dispose();
+    _tokenServer.dispose();
+    _tokenUser.dispose();
     super.dispose();
   }
 
@@ -43,6 +48,8 @@ class _IdentityPanelState extends State<IdentityPanel> {
     _sync(_authToken, widget.controller.authToken);
     _sync(_sipUser, widget.controller.sipUsername);
     _sync(_sipPass, widget.controller.sipPassword);
+    _sync(_tokenServer, widget.controller.tokenServerUrl);
+    _sync(_tokenUser, widget.controller.tokenUser);
   }
 
   void _sync(TextEditingController field, String value) {
@@ -132,6 +139,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
 
   List<Widget> _signInForm(PlaygroundController c, PlaygroundColors pg, bool connecting) {
     final zero = c.authTab == AuthTab.zeroConfig;
+    final token = c.authTab == AuthTab.accessToken;
     return <Widget>[
       Container(
         padding: const EdgeInsets.all(4),
@@ -143,12 +151,56 @@ class _IdentityPanelState extends State<IdentityPanel> {
         child: Row(
           children: <Widget>[
             _tab('Zero-Config Setup', Icons.code, zero, () => c.setAuthTab(AuthTab.zeroConfig), pg),
-            _tab('SIP Direct', Icons.call_outlined, !zero, () => c.setAuthTab(AuthTab.sipDirect), pg),
+            _tab('SIP Direct', Icons.call_outlined, c.authTab == AuthTab.sipDirect,
+                () => c.setAuthTab(AuthTab.sipDirect), pg),
+            _tab('Access token', Icons.key_outlined, token, () => c.setAuthTab(AuthTab.accessToken), pg),
           ],
         ),
       ),
       const SizedBox(height: 18),
-      if (zero) ...<Widget>[
+      if (token) ...<Widget>[
+        const SectionLabel('Token server',
+            trailing: InfoTip(
+                title: 'Token server',
+                message: 'Your backend\'s route that returns {"token": "<JWT>"}. It mints the token '
+                    'with POST /api/v1/Account/{auth_id}/JWT/Token/, so the Auth Token stays on the '
+                    'server. The Vobiz WebRTC demo\'s /token works. Leave it empty to use the push '
+                    'server\'s /token.')),
+        TextField(
+          key: const Key('tokenServer'),
+          controller: _tokenServer,
+          autocorrect: false,
+          keyboardType: TextInputType.url,
+          decoration: InputDecoration(
+            hintText: c.bridgeConfig != null
+                ? 'Empty: the push server\'s /token'
+                : 'https://<your server>/token',
+            errorText: _missing(c, 'tokenServer'),
+          ),
+          onChanged: (v) => _edited(c, 'tokenServer', () => c.tokenServerUrl = v),
+        ),
+        const SizedBox(height: 14),
+        const SectionLabel('User ID',
+            trailing: InfoTip(
+                title: 'User ID (sub)',
+                message: 'Who the push server\'s /token signs you in as: you register as '
+                    '<User ID>_<Auth ID>. Empty: the bridge\'s JWT_SUB. Your own token server '
+                    'decides this itself.')),
+        TextField(
+          key: const Key('tokenUser'),
+          controller: _tokenUser,
+          autocorrect: false,
+          decoration: const InputDecoration(hintText: 'e.g. agent42 (push server only)'),
+          onChanged: (v) => c.tokenUser = v,
+          onSubmitted: (_) => c.connect(),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'A short-lived JWT instead of a password: no endpoint and no long-lived secret on the '
+          'device. The SDK fetches a new token a minute before each one expires.',
+          style: TextStyle(fontSize: 11, height: 1.4, color: pg.faint),
+        ),
+      ] else if (zero) ...<Widget>[
         Text(
           'Demo only: Zero-Config sends your Auth Token to the shared demo webhook server. '
           'A production app signs in with SIP credentials or a token from its own backend.',
@@ -346,6 +398,11 @@ class _IdentityPanelState extends State<IdentityPanel> {
   Widget _connected(PlaygroundController c, PlaygroundColors pg) {
     final user = c.connectedAs ?? c.client.sipUsername ?? '';
     final zero = c.authMode == VobizAuthMode.zeroConfig;
+    final token = c.client.accessToken;
+    String hhmm(DateTime t) {
+      final l = t.toLocal();
+      return '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+    }
     return Container(
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
@@ -360,7 +417,13 @@ class _IdentityPanelState extends State<IdentityPanel> {
             Text('CONNECTION ACTIVE',
                 style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.muted)),
             const Spacer(),
-            Chip2(zero ? 'ZERO-CONFIG' : 'SIP DIRECT', color: pg.accent),
+            Chip2(
+                zero
+                    ? 'ZERO-CONFIG'
+                    : token != null
+                        ? 'ACCESS TOKEN'
+                        : 'SIP DIRECT',
+                color: pg.accent),
           ]),
           const SizedBox(height: 12),
           Row(children: <Widget>[
@@ -379,6 +442,12 @@ class _IdentityPanelState extends State<IdentityPanel> {
           ]),
           if (zero)
             Text('Webhook: ${c.client.backendUrl}',
+                style: TextStyle(fontFamily: 'monospace', fontSize: 10.5, color: pg.faint)),
+          if (token != null)
+            Text(
+                key: const Key('tokenInfo'),
+                'Token valid until ${hhmm(token.expiresAt)} (renewed automatically) · '
+                'incoming ${token.canReceiveCalls ? 'yes' : 'no'} · outgoing ${token.canCallOut ? 'yes' : 'no'}',
                 style: TextStyle(fontFamily: 'monospace', fontSize: 10.5, color: pg.faint)),
           const SizedBox(height: 12),
           Container(
@@ -431,6 +500,11 @@ class _IdentityPanelState extends State<IdentityPanel> {
         qa('What does Zero-Config Setup create?',
             'An application named "Vobiz WebRTC Playground" and an endpoint aliased "Vobiz WebRTC Playground Endpoint" on your account — '
             'the same ones the web Playground uses, so signing in here gives that endpoint a new password.'),
+        qa('What is access-token sign-in?',
+            'Your server mints a short-lived JWT with POST /api/v1/Account/{auth_id}/JWT/Token/ and the '
+            'app signs in with it as <sub>_<Auth ID>. The token\'s "app" picks the application whose '
+            'Answer URL handles your outbound calls; to ring you, dial '
+            '<User>sip:<sub>_<Auth ID>@registrar.vobiz.ai</User>.'),
         qa('How do calls to my Vobiz number reach this phone?',
             'The push bridge in example/push_bridge answers the number. It rings this app over SIP and sends a '
             'Firebase push that wakes it when it is in the background or closed. Accept on the call screen opens '

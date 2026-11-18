@@ -289,7 +289,8 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.ensureVisible(find.text('INCOMING CALLS'));
-      expect(find.text('OFF'), findsOneWidget);
+      // Both ways of ringing a closed app start off: the push server, and Vobiz push.
+      expect(find.text('OFF'), findsNWidgets(2));
       final toggle = tester.widget<Switch>(find.byKey(const Key('receiveCalls')));
       expect(toggle.onChanged, isNull);
       expect(tester.widget<ButtonStyleButton>(find.byKey(const Key('testCall'))).onPressed, isNull);

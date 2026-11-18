@@ -20,7 +20,7 @@ export function fcmToken(name) {
  * Starts a bridge. `env` is merged over a signed, fully configured default.
  * Returns { bridge, base, pushes, api, logs, stateFile, stop }.
  */
-export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, endpoints = ['alice', 'bob', 'carol'] } = {}) {
+export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, endpoints = ['alice', 'bob', 'carol'], deps = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-bridge-test-'));
   const file = stateFile || path.join(dir, 'bridge-state.json');
   const pushes = [];
@@ -51,6 +51,7 @@ export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, 
         }
         return { message: 'ok' };
       },
+      ...deps,
     },
   });
   const port = await bridge.start({ port: 0, checks: false });
@@ -109,8 +110,12 @@ export function xmlAttr(xml, element, attr) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Waits until fn() is truthy, up to `ms`. */
-export async function until(fn, ms = 2000) {
+/**
+ * Waits until fn() is truthy, up to `ms`. 5 s, not 2: with every test file
+ * starting bridges in parallel, a push can take over 2 s on a loaded machine;
+ * a passing check returns at once.
+ */
+export async function until(fn, ms = 5000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
     const v = await fn();
