@@ -115,6 +115,10 @@ call was used. #58 lists what still needs a device.
 
 ### Fixed
 
+- A call that ended on Vobiz while the phone was offline (the far end hung up, or the call
+  was transferred away) now ends as soon as the phone is back: when Vobiz answers the
+  reconnect's re-INVITE with 481, the call ends at once with reason `ended_while_offline`,
+  with no BYE and no `ErrorEvent`. It used to show "reconnecting" for up to 12 s more.
 - SIP: CANCEL when hanging up a ringing outbound call, with a crossing 200 ACKed and
   ended (#4); in-dialog re-INVITE and UPDATE answered, unsupported requests get 405/501,
   no `Supported: timer` (#6); one digest retry (two with `stale=true`), `opaque` echoed

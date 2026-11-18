@@ -283,6 +283,10 @@ A connected (or held) call survives a short loss of network, audio included:
   12 s.
 - When ICE connects the call gets `reason: 'reconnected'`. If it is not back in time
   the call ends with reason `network_lost` and an `ErrorEvent` `network_lost`.
+- If Vobiz answers the restart's re-INVITE with 481, the call ended on Vobiz while the
+  phone was offline: the far end hung up, or the call was transferred away. The call
+  ends at once with reason `ended_while_offline`, without a BYE (Vobiz has no such call
+  to end) and without an `ErrorEvent`.
 - Measured on Android against Vobiz: the audio is back about 1.4 s after the network
   returns (about 1 s after a complete outage), and a switch between Wi-Fi and mobile
   data leaves a gap of about 2 s.
