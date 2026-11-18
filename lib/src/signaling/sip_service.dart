@@ -730,7 +730,7 @@ class SIPService {
   SIPService({
     required this.wsUrl,
     required this.sipServer,
-    this.registerExpires = 600,
+    this.registerExpires = 3600,
     this.keepAlive = const KeepAliveConfig(),
     Logger? logger,
   })  : _logger = logger ?? Logger(),
@@ -744,6 +744,12 @@ class SIPService {
   /// The registration lifetime this client asks for, in seconds. The
   /// registrar may grant less (or, after a 423, require more); the refresh
   /// follows what it granted.
+  ///
+  /// An hour by default: Vobiz's registrar keeps this SDK's registration
+  /// after its socket closes (the app killed or put to sleep) until it
+  /// expires, and while it lasts a call reaches the app by push. Every
+  /// REGISTER (sign-in, the refresh, the return to the foreground, the claim
+  /// of a pushed call) starts that hour again.
   final int registerExpires;
 
   /// The WebSocket ping and the optional RFC 5626 CRLF keep-alive.

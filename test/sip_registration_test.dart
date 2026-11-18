@@ -27,7 +27,7 @@ void main() {
   group('lifetime (#22)', () {
     test('asks for registerExpires, not a hard-coded hour', () {
       s.register('play1', 'secret');
-      expect(headerOf(sent.single, 'Expires'), '600');
+      expect(headerOf(sent.single, 'Expires'), '3600', reason: 'an hour: how long a closed app stays reachable by push');
       final custom = SIPService(wsUrl: 'wss://t', sipServer: 'r', registerExpires: 120)
         ..debugOnSend = sent.add;
       custom.register('play1', 'secret');
@@ -51,7 +51,7 @@ void main() {
       expect(s.registrationRefreshDelay, const Duration(seconds: 72));
       s.register('play1', 'secret');
       s.debugReceive(respond(sent.last, 200, 'OK'));
-      expect(s.registrationRefreshDelay, const Duration(seconds: 480));
+      expect(s.registrationRefreshDelay, const Duration(seconds: 2880));
     });
 
     test('the refresh REGISTER goes out when it is due and keeps the state registered', () async {
@@ -65,12 +65,13 @@ void main() {
 
     test('423 Interval Too Brief: asks again with Min-Expires', () {
       s.register('play1', 'secret');
-      s.debugReceive(respond(sent.last, 423, 'Interval Too Brief', headers: <String>['Min-Expires: 1800']));
-      expect(headerOf(sent.last, 'Expires'), '1800');
+      // A minimum above what was asked (an hour), as a 423 carries.
+      s.debugReceive(respond(sent.last, 423, 'Interval Too Brief', headers: <String>['Min-Expires: 7200']));
+      expect(headerOf(sent.last, 'Expires'), '7200');
       expect(failures, isEmpty);
       s.debugReceive(respond(sent.last, 200, 'OK'));
       expect(registered, 1);
-      expect(s.registrationRefreshDelay, const Duration(seconds: 1440));
+      expect(s.registrationRefreshDelay, const Duration(seconds: 5760));
     });
   });
 

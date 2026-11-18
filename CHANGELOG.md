@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X-vobiz-Registrar-Info`), `reportCallScreenAccepted`/`reportCallScreenDeclined`,
   `pushCallUpdates`, `CallEvent.sipCallId`, `VobizClient.sdkVersion`. The example app
   has it under *Incoming calls → Vobiz push*. See doc/PUSH_DESIGN.md.
+- `VobizClient.disconnect(unregister: false)`: closes the connection without a REGISTER
+  `Expires: 0`, as when Android kills the app, so Vobiz keeps the registration (until it
+  expires) and a call takes its push-to-wake path. For testing that path.
+- Example: *Call this phone through Vobiz* replaces *Send a test push through Vobiz*
+  (push-service's notify now takes only the registrar's internal token, so a pretend
+  push gets 401). It drops the connection without signing off, then has Vobiz's Call API
+  call this phone's SIP user (caller ID and answer URL fields, test only).
+
+### Changed
+
+- **REGISTER asks for an hour (`Expires: 3600`, was 600).** Vobiz's registrar now keeps this
+  SDK's registration after its socket closes (the app killed or asleep) until it expires, and
+  while it lasts a call reaches the app by push. Every REGISTER (sign-in, the refresh at 80 %,
+  the return to the foreground, the claim of a pushed call) starts the hour again. Asked for by
+  Vobiz's platform team with that registrar change.
 
 ### Fixed
 

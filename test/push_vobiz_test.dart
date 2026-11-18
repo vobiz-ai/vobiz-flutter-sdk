@@ -160,8 +160,8 @@ void main() {
     test('a 423 asks again with the reference', () {
       s.claimHeldCall(hold);
       s.register('play1', 'secret');
-      s.debugReceive(respond(sent.single, 423, 'Interval Too Brief', headers: <String>['Min-Expires: 900']));
-      expect(headerOf(sent.last, 'Expires'), '900');
+      s.debugReceive(respond(sent.single, 423, 'Interval Too Brief', headers: <String>['Min-Expires: 7200']));
+      expect(headerOf(sent.last, 'Expires'), '7200');
       expectClaims(sent.last);
     });
 
@@ -289,6 +289,29 @@ void main() {
       }
       expect(h.sent, isEmpty);
       expect(updates, isEmpty);
+    });
+  });
+
+  group('VobizClient.disconnect', () {
+    test('signs off with REGISTER Expires: 0 by default', () async {
+      final h = harness.Harness();
+      h.sip.connectionState.value = SipConnectionState.connected;
+      await h.client.disconnect();
+      final registers = h.sent.where((m) => m.startsWith('REGISTER ')).toList();
+      expect(registers, hasLength(1));
+      expect(headerOf(registers.single, 'Expires'), '0');
+      await h.dispose();
+    });
+
+    test('unregister false: the connection goes with no sign-off, as a killed app goes, so Vobiz keeps the '
+        'registration and can push', () async {
+      final h = harness.Harness();
+      h.sip.connectionState.value = SipConnectionState.connected;
+      await h.client.disconnect(unregister: false);
+      expect(h.sent.where((m) => m.startsWith('REGISTER ')), isEmpty);
+      expect(h.client.isConnected, isFalse);
+      expect(h.client.sipUsername, isNull, reason: 'signed out locally all the same');
+      await h.dispose();
     });
   });
 
