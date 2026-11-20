@@ -391,12 +391,15 @@ export function createBridge(options = {}) {
    * Metadata on the SIP INVITE of every <User>. PushRef is this call's
    * CallUUID (the caller's leg), which the app sends back as call_uuid to
    * /conference/* and /call/alive; Caller is the real caller's number (with
-   * CALLER_ID_MODE=number every call shows the same number). Vobiz's docs
+   * CALLER_ID_MODE=number every call shows the same number). Caller is left
+   * out when the caller is not a phone number (a plus and 7 to 15 digits): a
+   * call from a SIP user (a PBX extension, another app) has no number to
+   * show, and the digits of its name would read as a made-up one. Vobiz's docs
    * disagree on the key format ("RefX-VH=" on the SIP headers page, "Ref=" in
    * the Dial examples), so it is configurable.
    */
   function sipHeaders(call) {
-    const caller = call.from.replace(/\D/g, '');
+    const caller = /^\+\d{7,15}$/.test(call.from) ? call.from.slice(1) : '';
     const pairs = config.headerStyle === 'plain'
       ? [`PushRef=${call.id}`, caller && `Caller=${caller}`]
       : [`PushRefX-VH=${call.id}`, caller && `CallerX-VH=${caller}`];

@@ -360,7 +360,8 @@ Every app request is JSON and carries:
 
 The `<Dial>` puts two SIP headers on every `<User>`: `PushRef`, this call's CallUUID
 (the caller's leg), which the app sends back as `call_uuid` to `/conference/*` and
-`/call/alive`; and `Caller`, the real caller's number. They are written `PushRefX-VH=`
+`/call/alive`; and `Caller`, the real caller's number, left out when the caller is not
+a phone number (a SIP user such as a PBX extension). They are written `PushRefX-VH=`
 and `CallerX-VH=`, or `PushRef=` and `Caller=` with `SIP_HEADER_STYLE=plain`.
 
 ## Security
