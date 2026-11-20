@@ -160,7 +160,11 @@ void main() {
   test('numbers follow the transfer rule: a plus and 7 to 15 digits', () async {
     final conference = make(poll: const Duration(minutes: 1));
     expect(() => conference.add(number: '+123456'), throwsArgumentError);
+    expect(() => conference.add(number: '+1234567890123456'), throwsArgumentError);
+    expect(() => conference.add(number: '1234567'), throwsArgumentError);
     expect(() => conference.add(number: '+1234567', callerId: '+123456'), throwsArgumentError);
+    expect(() => conference.add(sipUser: 'bob smith'), throwsArgumentError);
+    expect(() => conference.add(sipUser: 'bob<1>'), throwsArgumentError);
     await conference.add(number: '+1234567', callerId: '+1234567');
     expect(server.body(0)['number'], '+1234567');
     conference.dispose();

@@ -8,6 +8,7 @@ import '../core/vobiz_client.dart';
 import '../errors/vobiz_exception.dart';
 import '../events/call_event.dart';
 import '../state/call_state.dart';
+import '../utils/sip_text.dart';
 
 /// Where a conference participant is.
 enum VobizParticipantStatus {
@@ -260,10 +261,6 @@ class VobizConference {
   /// The [_generation] whose call this class has already hung up.
   int _hungUpGeneration = -1;
 
-  /// The same rule as `VobizClient.transferCall`: a plus and 7 to 15 digits.
-  static final RegExp _e164 = RegExp(r'^\+\d{7,15}$');
-  static final RegExp _sipUser = RegExp(r'^[A-Za-z0-9_.\-+]{1,120}$');
-
   /// The current call's conference, or null when it is not one.
   ValueListenable<VobizConferenceState?> get state => _state;
 
@@ -281,14 +278,14 @@ class VobizConference {
     if ((number == null) == (sipUser == null)) {
       throw ArgumentError('Pass either number or sipUser');
     }
-    if (number != null && !_e164.hasMatch(number)) {
+    if (number != null && !e164Number.hasMatch(number)) {
       throw ArgumentError.value(number, 'number', 'must be E.164, e.g. +919876543210');
     }
     final user = sipUser == null ? null : VobizClient.endpointUsername(sipUser);
-    if (user != null && !_sipUser.hasMatch(user)) {
+    if (user != null && !sipUserName.hasMatch(user)) {
       throw ArgumentError.value(sipUser, 'sipUser', 'must be a SIP endpoint username');
     }
-    if (callerId != null && callerId.isNotEmpty && !_e164.hasMatch(callerId)) {
+    if (callerId != null && callerId.isNotEmpty && !e164Number.hasMatch(callerId)) {
       throw ArgumentError.value(callerId, 'callerId', 'must be E.164, e.g. +918000000000');
     }
     if (client.callState != CallStateStatus.active) {
