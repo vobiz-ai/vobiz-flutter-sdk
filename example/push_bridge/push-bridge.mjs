@@ -1,27 +1,21 @@
 #!/usr/bin/env node
 /**
- * Vobiz push bridge: rings the Flutter example app for inbound calls, also
- * when the app is in the background or has been swiped away.
+ * Sample server for the Flutter example app. It:
  *
- * Why it is needed: the app speaks SIP over a WebSocket. When Android closes
- * the app the socket closes, and the Vobiz registrar forgets the
- * registration, so an inbound call would have nothing to ring. This server
- * answers your Vobiz number instead. For every inbound call it:
- *
- *   1. sends the phone a high-priority Firebase message. That wakes the app,
- *      which shows a full-screen incoming-call screen and signs in;
- *   2. holds the caller on ringback (early media) for up to
- *      PUSH_WAIT_SECONDS, until the pushed phones report their SIP
- *      registration (POST /push/registered). It dials the moment they do,
- *      and at the end of the wait without them if they do not;
- *   3. rings every target at once in ONE <Dial>: the app endpoints, the
- *      ALWAYS_RING endpoints (e.g. a browser) and the route's PSTN numbers.
- *      The first to answer wins; Vobiz cancels the rest. The Dial is never
- *      restarted, so a ringing browser or phone is not cut off.
+ *   1. answers your Vobiz number and rings, at once and in ONE <Dial>, the
+ *      SIP users and phone numbers ROUTES gives for the dialled number plus
+ *      the ALWAYS_RING users. The first to answer wins; Vobiz cancels the
+ *      rest. A closed app is woken by Vobiz push (Vobiz's registrar holds
+ *      the call and pushes the phone), not by this server;
+ *   2. mints access tokens (JWT) for the app with the account's Auth Token,
+ *      which stays here;
+ *   3. turns the app's call into a conference and manages it;
+ *   4. watches the app's connection during a call, when the app reports.
  *
  * Webhooks must carry a valid Vobiz signature (PUBLIC_URL and
- * VOBIZ_AUTH_TOKEN are required); phones pair once with the bridge key and
- * then use their own device token. README.md has the app ↔ bridge protocol.
+ * VOBIZ_AUTH_TOKEN are required). The app sends the server's key
+ * (X-Bridge-Key) and the SIP user it is signed in as (X-Bridge-User).
+ * README.md has the app ↔ server protocol.
  *
  * Node 18 or newer, no npm packages. Settings come from a .env file next to
  * this script (see .env.example) or from environment variables.
@@ -43,8 +37,8 @@ const CALL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 /**
  * Builds a bridge without starting it. `options.env` replaces process.env,
  * `options.stateFile` the state file, and `options.deps` lets tests swap the
- * outside world: `sendPush(token, data)` for Firebase, `vobizApi(method,
- * path, body)` for the Vobiz REST API, `log(tag, message)`.
+ * outside world: `vobizApi(method, path, body)` for the Vobiz REST API,
+ * `log(tag, message)`.
  */
 export function createBridge(options = {}) {
   const env = options.env || process.env;
@@ -53,7 +47,6 @@ export function createBridge(options = {}) {
   const config = {
     port: clampInt(env.PORT, 8787, 1, 65535),
     publicUrl: (env.PUBLIC_URL || '').trim().replace(/\/+$/, ''),
-    serviceAccountFile: (env.FIREBASE_SERVICE_ACCOUNT || '').trim(),
     vobizApi: (env.VOBIZ_API_URL || 'https://api.vobiz.ai').trim().replace(/\/+$/, ''),
     authId: (env.VOBIZ_AUTH_ID || '').trim(),
     authToken: (env.VOBIZ_AUTH_TOKEN || '').trim(),
@@ -61,10 +54,6 @@ export function createBridge(options = {}) {
     appName: (env.VOBIZ_APP_NAME || 'Vobiz_Flutter_Push_Bridge').trim(),
     forceAttach: env.FORCE_ATTACH === 'true',
     ringSeconds: clampInt(env.RING_SECONDS, 45, 15, 120),
-    // How long the caller waits on ringback for the woken app to sign in
-    // before the Dial starts without it. 3 to 9 seconds: longer delays every
-    // other target (browser, PSTN) by as much.
-    pushWaitSeconds: clampInt(env.PUSH_WAIT_SECONDS, 5, 3, 9),
     // Connection watch (see onCallAlive): after this long without word from
     // the app during a call, the other party hears the connection-lost beep.
     lostBeepSeconds: clampInt(env.LOST_BEEP_SECONDS, 3, 2, 10),
@@ -100,12 +89,6 @@ export function createBridge(options = {}) {
   }
 
   /**
-   * A transfer to /dial-now this close to the end of the wait could race the
-   * hold XML's own <Redirect> to /dial-now and restart a Dial that has just
-   * started, so the bridge lets the Redirect dial instead.
-   */
-  const TRANSFER_MARGIN_MS = 1000;
-  /**
    * How long a webhook nonce is remembered. Vobiz nonces are random, not
    * time-based, and nothing in the request is timestamped, so replay
    * protection is "never accept the same nonce twice" within this window;
@@ -114,7 +97,7 @@ export function createBridge(options = {}) {
   const NONCE_TTL_MS = 30 * 60 * 1000;
   const INSTANCE = crypto.randomBytes(6).toString('hex');
 
-  // ── State: the app's key and the registered devices, kept across restarts ────
+  // ── State: the app's key, the webhook secret and seen nonces, kept across restarts ──
 
   const state = loadState();
   if (env.BRIDGE_KEY) state.bridgeKey = env.BRIDGE_KEY.trim();
@@ -127,8 +110,6 @@ export function createBridge(options = {}) {
 
   /** Inbound calls in progress, by Vobiz CallUUID. Kept in memory only. */
   const calls = new Map();
-  // Ringback for exactly the push wait: 0.4 s on, 0.2 s off, 0.4 s on, 2 s off.
-  const waitRingback = makeToneWav(config.pushWaitSeconds, ringbackBursts(config.pushWaitSeconds));
   // Indian busy tone: 400 Hz, 0.75 s on, 0.75 s off.
   const busyTone = makeToneWav(3, [[0, 0.75], [1.5, 2.25]]);
   // Connection-lost beep, looped: a short 1 kHz beep every 2.5 s.
@@ -141,7 +122,6 @@ export function createBridge(options = {}) {
   const routes = {
     'GET /': (req, res) => sendText(res, 200, 'Vobiz push bridge is running.\n'),
     'GET /health': (req, res) => sendJson(res, 200, { ok: true, service: 'vobiz-push-bridge', instance: INSTANCE }),
-    'GET /wait.wav': (req, res) => sendWav(res, waitRingback),
     'GET /busy.wav': (req, res) => sendWav(res, busyTone),
     'GET /lost.wav': (req, res) => sendWav(res, lostBeep),
     'GET /hold.wav': (req, res) => sendWav(res, holdMusic),
@@ -155,17 +135,6 @@ export function createBridge(options = {}) {
     'GET /hangup': vobiz(onHangup),
     // The app
     'POST /token': onToken,
-    'POST /push/register': onRegister,
-    'POST /push/unregister': onUnregister,
-    'POST /push/test': onTestCall,
-    'POST /push/accept': onAccept,
-    'POST /push/registered': onRegistered,
-    // The one Dial: the hold XML redirects here when the wait ends, or the
-    // caller's leg is transferred here when the app reports it is registered
-    'POST /dial-now/*': vobiz(onDialNow),
-    // Where a call is transferred to when the user taps Decline
-    'POST /declined/*': vobiz(onDeclinedXml),
-    'POST /push/decline': onDecline,
     // During a call: the app reports it still has its network
     'POST /call/alive': onCallAlive,
     'POST /call/ended': onCallEnded,
@@ -198,7 +167,7 @@ export function createBridge(options = {}) {
     } catch (error) {
       log('!!', `${req.method} ${url.pathname} failed: ${error.stack || error}`);
       if (!res.headersSent) {
-        if (url.pathname === '/answer' || /^\/(dial-result|dial-now|declined|conf-room|conf-hold)\//.test(url.pathname)) {
+        if (url.pathname === '/answer' || /^\/(dial-result|conf-room|conf-hold)\//.test(url.pathname)) {
           sendXml(res, '<Speak>Sorry, something went wrong. Please try again.</Speak><Hangup/>');
         } else {
           sendJson(res, 500, { error: 'Internal error' });
@@ -210,18 +179,28 @@ export function createBridge(options = {}) {
   let sweeper = null;
   let watchdog = null;
 
+  /**
+   * Forgets old calls and rooms (every minute). A call is kept while it is
+   * answered and not over (the conference and the connection watch need it),
+   * otherwise 10 minutes. A room is kept 10 minutes after it ends (the app
+   * reads its last state). Both are dropped after 5 hours however they
+   * ended: the Dial's timeLimit is 4 hours.
+   */
+  function sweep(now = Date.now()) {
+    const cutoff = now - 10 * 60 * 1000;
+    const limit = now - 5 * 60 * 60 * 1000;
+    for (const [id, call] of calls) {
+      const live = call.bridged && !call.over;
+      if (call.createdAt < limit || (call.createdAt < cutoff && !live)) calls.delete(id);
+    }
+    for (const room of rooms.values()) {
+      if ((room.over && room.endedAt < cutoff) || room.createdAt < limit) forgetRoom(room);
+    }
+  }
+
   /** Starts listening. `port` 0 picks a free port (tests). Resolves with the port. */
   function start({ port = config.port, checks = true } = {}) {
-    sweeper = setInterval(() => {
-      const cutoff = Date.now() - 10 * 60 * 1000;
-      for (const [id, call] of calls) if (call.createdAt < cutoff) calls.delete(id);
-      // A room is kept 10 minutes after it ends (the app reads its last
-      // state), and dropped after 5 hours however it ended (timeLimit is 4).
-      for (const room of rooms.values()) {
-        const age = Date.now() - room.createdAt;
-        if ((room.over && room.endedAt < cutoff) || age > 5 * 60 * 60 * 1000) forgetRoom(room);
-      }
-    }, 60 * 1000);
+    sweeper = setInterval(() => sweep(), 60 * 1000);
     sweeper.unref();
     watchdog = setInterval(checkWatched, deps.watchTickMs ?? 500);
     watchdog.unref();
@@ -246,7 +225,7 @@ export function createBridge(options = {}) {
 
   // ── Vobiz webhooks ───────────────────────────────────────────────────────────
 
-  /** Inbound call: wake the app, hold the caller briefly, then ring everyone at once. */
+  /** Inbound call: ring everyone at once in one <Dial>. */
   async function onAnswer(req, res, url, params) {
     if (isHangupEvent(params)) return onHangup(req, res, url, params);
 
@@ -254,68 +233,32 @@ export function createBridge(options = {}) {
     let call = calls.get(id);
     if (call) {
       log('..', `Vobiz asked again for call ${short(id)}`);
-      return sendXml(res, call.dialStarted ? dialXml(call) : holdXml(call));
+      return sendXml(res, dialXml(call));
     }
 
     const { users: targets, numbers } = ringTargets(params.To);
     if (!targets.length && !numbers.length) {
-      log('..', `Inbound call from ${params.From || 'unknown'}: no app has signed in, so the caller is told`);
-      return sendXml(res, '<Speak>Sorry, nobody is signed in to take this call. Please try again later.</Speak><Hangup/>');
+      log('..', `Inbound call from ${params.From || 'unknown'} to ${params.To || 'unknown'}: no ROUTES entry for that number and no ALWAYS_RING, so the caller is told`);
+      return sendXml(res, '<Speak>Sorry, nobody is available to take this call. Please try again later.</Speak><Hangup/>');
     }
 
-    // Every endpoint rung is already on a call through this bridge.
-    const lineBusy = targets.length > 0 && targets.every((user) => onCall(user));
-    // Phones the push goes to. Waiting only makes sense if one of them can
-    // be woken; an endpoint already on a call is registered already.
-    const pushed = canPush() ? devicesOf(targets).filter((d) => d.token).length : 0;
-    const waitSeconds = pushed && !lineBusy ? config.pushWaitSeconds : 0;
-    const now = Date.now();
     call = {
       id,
-      key: crypto.randomBytes(16).toString('hex'),
       from: displayNumber(params.From),
       to: displayNumber(params.To),
       targets,
       numbers,
-      createdAt: now,
-      // Until the Dial starts: the wait plus the ring. Then: the ring.
-      deadline: now + (waitSeconds + config.ringSeconds) * 1000,
-      waitUntil: now + waitSeconds * 1000,
-      pushedDevices: pushed,
-      // Phones that reported "registered" for this call (device ids, or one
-      // anonymous entry per call-key report).
-      registered: new Set(),
-      transferred: false,
-      dialStarted: false,
-      lateRegistered: false,
-      accepted: false,
-      declined: false,
+      createdAt: Date.now(),
       bridged: false,
       finished: null,
-      endedPushSent: false,
-      lineBusy,
+      // Every endpoint rung is already on a call this server connected.
+      lineBusy: targets.length > 0 && targets.every((user) => onCall(user)),
       over: false,
     };
     calls.set(id, call);
     const everyone = [...targets, ...numbers].join(', ');
     log('->', `Inbound call ${short(id)} from ${call.from} to ${call.to}; will ring ${everyone}`);
-
-    // The push goes out in parallel; FCM never holds up the reply to Vobiz.
-    background(pushToTargets(call, incomingPayload(call)), 'push');
-    if (!waitSeconds) return sendXml(res, dialXml(call));
-    log('..', `Call ${short(id)}: ringback for up to ${waitSeconds} s while ${pushed} phone(s) wake and sign in`);
-    return sendXml(res, holdXml(call));
-  }
-
-  /**
-   * The caller hears ringback as early media while the app wakes. When it
-   * ends, Vobiz requests /dial-now (the Dial without the app). If the app
-   * reports "registered" first, the caller's leg is transferred to /dial-now
-   * at once and this document is abandoned (see onRegistered).
-   */
-  function holdXml(call) {
-    const base = publicBase();
-    return `  <PreAnswer><Play>${esc(base)}/wait.wav</Play></PreAnswer>\n  <Redirect method="POST">${esc(base)}/dial-now/${callRef(call.id)}</Redirect>`;
+    return sendXml(res, dialXml(call));
   }
 
   /** The single Dial attempt has ended: the call is answered, or it is over. */
@@ -325,7 +268,6 @@ export function createBridge(options = {}) {
     const status = String(params.DialStatus || '').toLowerCase();
     const cause = params.DialHangupCause || params.DialBLegHangupCause || '';
     if (!call) return sendXml(res, '<Hangup/>');
-    if (call.finished === 'declined') return sendXml(res, declinedXml());
     log('..', `Call ${short(id)} Dial ended: ${status || 'no status'}${cause ? ` (${cause})` : ''}`);
 
     // "completed" is documented as "bridged, then ended", but Vobiz also sends it
@@ -337,27 +279,21 @@ export function createBridge(options = {}) {
       call.over = true;
       return sendXml(res, '<Hangup/>');
     }
-    // Call waiting: the endpoint is on another call through this bridge, so
-    // "busy" is the app's SIP stack refusing a second call.
-    if (status === 'busy' && call.lineBusy && !call.accepted) {
+    // Every endpoint rung is on another call this server connected, so
+    // "busy" is the app's SIP stack refusing a second call. Any other busy
+    // is not proof that someone declined: Vobiz also reports busy for a SIP
+    // user it could not reach.
+    if (status === 'busy' && call.lineBusy) {
       finish(call, 'busy');
-      endRinging(call, 'busy');
-      return sendXml(res, declinedXml());
+      return sendXml(res, busyXml());
     }
     if (status === 'cancel') {
       finish(call, 'caller hung up');
-      endRinging(call, 'caller_hung_up');
       return sendXml(res, '<Hangup/>');
-    }
-    if (call.declined) {
-      finish(call, 'declined');
-      endRinging(call, 'declined');
-      return sendXml(res, declinedXml());
     }
     // One Dial only: nobody answered (or every leg failed). No second attempt,
     // so a target that rang is never rung again from the start.
     finish(call, 'missed');
-    endRinging(call, 'missed');
     return sendXml(res, '<Speak>Sorry, there was no answer. Please try again later.</Speak><Hangup/>');
   }
 
@@ -377,18 +313,6 @@ export function createBridge(options = {}) {
           log('ok', `Call ${short(call.id)}: answered${by ? ` by ${by}` : ''}`);
           call.bridged = true;
           finish(call, 'answered');
-          // Every phone that was pushed and has not got the call stops
-          // ringing now, without a "missed call". The phone that answered
-          // ignores this: it has the call (PushRef = call_id).
-          if (!call.endedPushSent) {
-            call.endedPushSent = true;
-            background(pushToTargets(call, {
-              type: 'call_ended',
-              call_id: call.id,
-              reason: 'answered_elsewhere',
-              ...(by ? { answered_by: by } : {}),
-            }), 'push');
-          }
         }
       } else if (action === 'hangup' || event === 'DialHangup') {
         const cause = params.DialBLegHangupCauseName || params.DialBLegHangupCause || '';
@@ -398,26 +322,23 @@ export function createBridge(options = {}) {
     sendText(res, 200, 'OK');
   }
 
-  /** The caller's leg has ended. Stop the phone ringing if it still is. */
+  /** The caller's leg has ended. */
   async function onHangup(req, res, url, params) {
     const call = calls.get(params.CallUUID);
     if (call) {
       call.over = true;
       if (!call.finished) finish(call, `ended (${params.HangupCause || params.CallStatus || 'hangup'})`);
-      endRinging(call, call.finished === 'answered' ? 'completed' : 'caller_hung_up');
     }
     sendText(res, 200, 'OK');
   }
 
   /**
-   * The one Dial: every app endpoint (all routed users, whether or not their
-   * app reported in time: an open app that did not report still rings, an
-   * offline one just fails its leg), every ALWAYS_RING endpoint and the
-   * route's PSTN numbers, all at once. The first to answer wins.
+   * The one Dial: every routed SIP user, every ALWAYS_RING user and the
+   * route's PSTN numbers, all at once. The first to answer wins. A user whose
+   * app is closed rings when Vobiz push wakes it (Vobiz holds that leg while
+   * it does); a user with no registration fails its leg at once.
    */
   function dialXml(call) {
-    call.dialStarted = true;
-    call.deadline = Date.now() + config.ringSeconds * 1000;
     const base = publicBase();
     const action = `${base}/dial-result/${callRef(call.id)}`;
     const events = `${base}/dial-events/${callRef(call.id)}`;
@@ -430,12 +351,24 @@ export function createBridge(options = {}) {
   }
 
   /**
-   * Metadata on the SIP INVITE, so the app can match the call to the push it
-   * already showed. PushRef is the push's call_id, on every <User>: the app
-   * auto-answers an accepted call only when PushRef equals that call_id, never
-   * by caller or callee number (with CALLER_ID_MODE=number every call shows
-   * the same number). Vobiz's docs disagree on the key format ("RefX-VH=" on
-   * the SIP headers page, "Ref=" in the Dial examples), so it is configurable.
+   * Busy, for a Dial that ended busy because everyone rung is on a call.
+   * <Hangup reason="busy"> rejects the call unbilled only while it is
+   * unanswered; once a <Dial> has answered the caller's leg, Vobiz ends it as
+   * a normal hangup (docs: /xml/hangup). So the caller first hears a busy
+   * tone: as early media (not billed) if the call is still unanswered, as
+   * ordinary audio if it was answered.
+   */
+  function busyXml() {
+    return `  <PreAnswer><Play>${esc(publicBase())}/busy.wav</Play></PreAnswer>\n  <Hangup reason="busy"/>`;
+  }
+
+  /**
+   * Metadata on the SIP INVITE of every <User>. PushRef is this call's
+   * CallUUID (the caller's leg), which the app sends back as call_uuid to
+   * /conference/* and /call/alive; Caller is the real caller's number (with
+   * CALLER_ID_MODE=number every call shows the same number). Vobiz's docs
+   * disagree on the key format ("RefX-VH=" on the SIP headers page, "Ref=" in
+   * the Dial examples), so it is configurable.
    */
   function sipHeaders(call) {
     const caller = call.from.replace(/\D/g, '');
@@ -451,14 +384,6 @@ export function createBridge(options = {}) {
     return event === 'hangup' || ['completed', 'busy', 'failed', 'no-answer', 'canceled', 'cancel'].includes(status);
   }
 
-  /** The `reason` the app is given for a call that is over. */
-  function endReason(call) {
-    const outcome = String(call.finished || '');
-    if (outcome === 'answered') return 'answered_elsewhere';
-    if (['declined', 'missed', 'busy'].includes(outcome)) return outcome;
-    return 'caller_hung_up';
-  }
-
   function finish(call, outcome) {
     if (!call.finished) {
       call.finished = outcome;
@@ -467,49 +392,55 @@ export function createBridge(options = {}) {
   }
 
   /**
-   * Who rings for an inbound call to `to`: `users`, the endpoints ROUTES
+   * Who rings for an inbound call to `to`: `users`, the SIP users ROUTES
    * maps that number to plus ALWAYS_RING, and `numbers`, the route's PSTN
-   * numbers. Without ROUTES, the one user that has registered a phone; with
-   * several users and no ROUTES nobody is pushed, because the bridge cannot
-   * know whose number was dialled.
+   * numbers. The server does not know which phones are signed in, so with
+   * neither setting nobody is rung.
    */
   function ringTargets(to) {
     const names = new Set();
-    let numbers = [];
-    if (config.routes.size) {
-      const route = config.routes.get(displayNumber(to));
-      for (const user of route?.users || []) names.add(user);
-      numbers = route?.numbers || [];
-    } else {
-      const users = new Set(Object.values(state.devices).map((d) => d.username));
-      if (users.size === 1) names.add([...users][0]);
-      else if (users.size > 1) {
-        log('!!', `Phones are registered for ${users.size} different endpoints (${[...users].join(', ')}) and ROUTES is not set, so none of them is rung for ${to || 'this call'}. Set ROUTES=<number>=<endpoint>,… in .env.`);
-      }
-    }
+    const route = config.routes.get(displayNumber(to));
+    for (const user of route?.users || []) names.add(user);
     for (const user of config.alwaysRing) names.add(user);
-    return { users: [...names], numbers };
+    return { users: [...names], numbers: route?.numbers || [] };
   }
 
-  /** Whether a push can be sent at all (Firebase set up, or a test double). */
-  function canPush() {
-    return Boolean(deps.sendPush) || firebase.ready;
-  }
-
-  /** Whether `user` is on a call this bridge connected and that has not ended. */
+  /** Whether `user` is on a call this server connected and that has not ended. */
   function onCall(user) {
     for (const c of calls.values()) if (c.bridged && !c.over && c.targets.includes(user)) return true;
     return false;
   }
 
-  /** The registered phones of these endpoints. */
-  function devicesOf(users) {
-    return Object.entries(state.devices)
-      .filter(([, d]) => users.includes(d.username))
-      .map(([id, d]) => ({ id, ...d }));
-  }
-
   // ── The app's requests ───────────────────────────────────────────────────────
+
+  /**
+   * Who an app request is from, or null after answering it with the refusal.
+   * The request must carry the bridge key (X-Bridge-Key). X-Bridge-User names
+   * the SIP user the app is signed in as: `{ username }`. Without that header
+   * the request is the key holder's own (`{ username: null, operator: true }`),
+   * unless `needUser`. A header that is present but empty or not a user name
+   * is refused (400), never read as the key holder. The user name is what the
+   * app says it is: it picks the app's leg of a call, it does not prove who
+   * is asking.
+   */
+  function appCaller(req, res, { needUser = false } = {}) {
+    if (!keyMatches(req)) {
+      sendJson(res, 401, { error: needUser ? 'Send the bridge key and X-Bridge-User' : 'Send the bridge key' });
+      return null;
+    }
+    const header = req.headers['x-bridge-user'];
+    if (header === undefined) {
+      if (!needUser) return { username: null, operator: true };
+      sendJson(res, 401, { error: 'Send X-Bridge-User: the SIP user the app is signed in as' });
+      return null;
+    }
+    const username = String(header).trim();
+    if (!USERNAME_RE.test(username)) {
+      sendJson(res, 400, { error: 'X-Bridge-User must be the SIP user name the app is signed in as' });
+      return null;
+    }
+    return { username, operator: false };
+  }
 
   let jwtAppWarned = false;
 
@@ -518,13 +449,12 @@ export function createBridge(options = {}) {
    * mints it with the account's Auth Token, which stays here. The app signs
    * in with it (the SDK's connectWithAccessTokenProvider) as
    * "<sub>_<auth id>", and the token renews itself through this route before
-   * it expires. Only a paired phone (device token) or the bridge key may
-   * ask; `sub` comes from the body or ?sub=, else JWT_SUB. Same reply shape
-   * as the Vobiz WebRTC demo's /token.
+   * it expires. Anyone with the bridge key may ask; `sub` comes from the body
+   * or ?sub=, else JWT_SUB. Same reply shape as the Vobiz WebRTC demo's
+   * /token.
    */
   async function onToken(req, res, url) {
-    const device = deviceFromRequest(req);
-    if (!device && !keyMatches(req)) return sendJson(res, 401, { error: 'Send the bridge key, or this phone\'s device token' });
+    if (!appCaller(req, res)) return;
     if (!config.authId || !config.authToken) return sendJson(res, 503, { error: 'VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN are not set' });
     const body = await readJson(req);
     const sub = String(body.sub || url.searchParams.get('sub') || config.jwtSub).trim();
@@ -557,416 +487,6 @@ export function createBridge(options = {}) {
     const reason = typeof body.reason === 'string' ? ` (${body.reason.slice(0, 20)})` : '';
     log('ok', `Access token for ${sipUsername}, valid until ${new Date(claims.exp * 1000).toISOString()}${reason}`);
     sendJson(res, 200, { token: minted.token, sub, exp: claims.exp, sip_username: sipUsername });
-  }
-
-  /**
-   * The app signed in. A new phone pairs with the bridge key (X-Bridge-Key)
-   * and gets its own device token back, which it sends from then on
-   * (Authorization: Bearer <device_token>). Calls to an endpoint are pushed
-   * only to the phones registered for it.
-   */
-  async function onRegister(req, res) {
-    const device = deviceFromRequest(req);
-    if (!device && !keyMatches(req)) return sendJson(res, 401, { error: 'Pair with the bridge key, or send this phone\'s device token' });
-    const body = await readJson(req);
-    const username = endpointUsername(body.username);
-    if (!USERNAME_RE.test(username)) return sendJson(res, 400, { error: 'username must be the SIP endpoint username' });
-    const token = typeof body.token === 'string' && body.token.length > 20 && body.token.length < 4096 ? body.token : null;
-
-    const known = await endpointKnown(username);
-    if (known === false) {
-      log('!!', `Refused to register ${username}: not an endpoint on ${config.authId}`);
-      return sendJson(res, 403, { error: `${username} is not an endpoint on this Vobiz account` });
-    }
-    if (known === null) return sendJson(res, 503, { error: 'Could not check the endpoint with Vobiz; try again' });
-
-    let id = device?.id;
-    let secret = null;
-    if (!id) {
-      id = crypto.randomBytes(9).toString('base64url');
-      secret = crypto.randomBytes(24).toString('base64url');
-    }
-    // A Firebase token belongs to one phone: drop older records that carry it.
-    if (token) {
-      for (const [other, d] of Object.entries(state.devices)) if (other !== id && d.token === token) delete state.devices[other];
-    }
-    state.devices[id] = {
-      username,
-      token,
-      secretHash: secret ? sha256(secret) : state.devices[id].secretHash,
-      platform: String(body.platform || 'android').slice(0, 20),
-      app: String(body.app || '').slice(0, 120),
-      registeredAt: new Date().toISOString(),
-    };
-    saveState();
-
-    log('ok', `Registered ${username} on device ${id}${token ? ` for push (token ${mask(token)})` : ' without push (no Firebase token)'}`);
-    sendJson(res, 200, {
-      ok: true,
-      username,
-      push: Boolean(token),
-      device_id: id,
-      // Only on pairing; the bridge keeps a hash and cannot show it again.
-      ...(secret ? { device_token: `${id}.${secret}` } : {}),
-      ...(known === undefined ? { warning: 'The bridge cannot check endpoints (VOBIZ_AUTH_ID is not set)' } : {}),
-    });
-  }
-
-  /** Forget this phone (device token required). */
-  async function onUnregister(req, res) {
-    const device = deviceFromRequest(req);
-    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
-    delete state.devices[device.id];
-    saveState();
-    log('ok', `Unregistered device ${device.id} (${device.username})`);
-    sendJson(res, 200, { ok: true });
-  }
-
-  /** A pretend incoming call to the asking phone only, to try the push path. */
-  async function onTestCall(req, res) {
-    const device = deviceFromRequest(req);
-    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
-    const body = await readJson(req);
-    if (!device.token) return sendJson(res, 409, { error: 'This phone has no push token registered' });
-    const delay = clampInt(body.delay_seconds, 10, 0, 60);
-
-    const call = {
-      id: crypto.randomUUID(),
-      key: crypto.randomBytes(16).toString('hex'),
-      from: 'Test call',
-      to: '',
-      targets: [device.username],
-      onlyDevice: device.id,
-      createdAt: Date.now() + delay * 1000,
-      deadline: Date.now() + (delay + 30) * 1000,
-      accepted: false,
-      declined: false,
-      finished: null,
-      endedPushSent: false,
-      test: true,
-    };
-    calls.set(call.id, call);
-    log('->', `Test call ${short(call.id)} for device ${device.id} in ${delay} s`);
-    setTimeout(() => pushToTargets(call, incomingPayload(call)).catch(() => {}), delay * 1000);
-    sendJson(res, 200, { ok: true, call_id: call.id, sending_in_seconds: delay });
-  }
-
-  /**
-   * The user tapped Accept. With one Dial there is no later attempt to hold
-   * the call open for, so this only records it (and says if it is over).
-   */
-  async function onAccept(req, res) {
-    const body = await readJson(req);
-    const call = callFor(body);
-    if (!call) return sendJson(res, 404, { error: 'Unknown call' });
-    if (call.finished) return sendJson(res, 200, { ok: true, finished: true, reason: endReason(call) });
-    call.accepted = true;
-    log('ok', `Call ${short(call.id)} accepted on the phone`);
-    sendJson(res, 200, { ok: true, test: Boolean(call.test) });
-  }
-
-  /**
-   * The app's SIP registration succeeded while a pushed call rings.
-   * Body: { call_id, call_key } for one call, or no call with the phone's
-   * device token for every call ringing its endpoint. Replies per call:
-   *   transferred  every pushed phone has reported: the caller's leg is
-   *                transferred (Vobiz Transfer API) to /dial-now, which
-   *                starts the Dial now instead of at the end of the wait;
-   *   waiting      the Dial starts at the end of the wait (other pushed
-   *                phones have not reported yet, the wait is about to end,
-   *                or the transfer failed); this phone is in it;
-   *   too_late     the Dial had already started without this phone. It is
-   *                not restarted (that would cut off a ringing browser or
-   *                PSTN leg); the app gets call_ended when the call ends;
-   *   finished     the call is over;  test  a test call.
-   */
-  async function onRegistered(req, res) {
-    const body = await readJson(req);
-    let list;
-    let device = null;
-    if (body.call_id) {
-      const call = callFor(body);
-      if (!call) return sendJson(res, 404, { error: 'Unknown call' });
-      list = [call];
-    } else {
-      device = deviceFromRequest(req);
-      if (!device) return sendJson(res, 401, { error: 'Send call_id and call_key, or this phone\'s device token' });
-      list = [...calls.values()].filter((c) => c.targets.includes(device.username));
-    }
-    const results = {};
-    for (const call of list) {
-      if (call.finished || call.test) {
-        results[call.id] = call.finished ? 'finished' : 'test';
-        continue;
-      }
-      results[call.id] = await registeredFor(call, device ? device.id : `report-${call.registered.size}`);
-    }
-    const single = body.call_id ? results[body.call_id] : undefined;
-    sendJson(res, 200, {
-      ok: true,
-      ...(single ? { redial: single, finished: single === 'finished' } : { calls: results }),
-    });
-  }
-
-  /** One phone reported "registered" for `call`. Returns the reply value. */
-  async function registeredFor(call, reporter) {
-    if (call.dialStarted) {
-      call.lateRegistered = true;
-      log('..', `Call ${short(call.id)}: an app signed in after the Dial started; the others keep ringing (not restarted)`);
-      return 'too_late';
-    }
-    call.registered.add(reporter);
-    if (call.transferred) return 'transferred';
-    if (call.registered.size < call.pushedDevices) {
-      log('..', `Call ${short(call.id)}: ${call.registered.size} of ${call.pushedDevices} phones signed in; waiting for the rest`);
-      return 'waiting';
-    }
-    return dialNow(call);
-  }
-
-  /** Ends the wait early: transfers the caller's leg to /dial-now. */
-  async function dialNow(call) {
-    if (call.waitUntil - Date.now() < TRANSFER_MARGIN_MS) {
-      log('..', `Call ${short(call.id)}: the app is signed in; the wait ends in under a second and dials then`);
-      return 'waiting';
-    }
-    if (!config.authId) {
-      log('..', `Call ${short(call.id)}: the app is signed in, but without VOBIZ_AUTH_ID the bridge cannot cut the wait short`);
-      return 'waiting';
-    }
-    call.transferred = true;
-    try {
-      await vobizApi('POST', `/Call/${encodeURIComponent(call.id)}/`, {
-        legs: 'aleg',
-        aleg_url: `${publicBase()}/dial-now/${callRef(call.id)}`,
-        aleg_method: 'POST',
-      });
-      log('ok', `Call ${short(call.id)}: the app is signed in; dialling everyone now`);
-      return 'transferred';
-    } catch (error) {
-      call.transferred = false;
-      log('!!', `Call ${short(call.id)}: could not transfer to dial now (${error.message}); dialling when the wait ends`);
-      return 'waiting';
-    }
-  }
-
-  /**
-   * Starts the one Dial: requested by the hold XML's <Redirect> when the
-   * wait ends, or after the transfer in dialNow().
-   */
-  async function onDialNow(req, res, url) {
-    const id = callIdFromPath(url);
-    const call = id ? calls.get(id) : null;
-    if (call?.finished === 'declined') return sendXml(res, declinedXml());
-    if (!call || call.finished) return sendXml(res, '<Hangup/>');
-    if (call.dialStarted) {
-      // Vobiz only asks again if the document running the Dial was replaced
-      // (a transfer that crossed the Redirect): the Dial has to be resent.
-      log('!!', `Call ${short(call.id)}: /dial-now requested again after the Dial started; dialling again`);
-    }
-    return sendXml(res, dialXml(call));
-  }
-
-  /** The user tapped Decline. Needs the call's own key from the push. */
-  async function onDecline(req, res) {
-    const body = await readJson(req);
-    const call = callFor(body);
-    if (!call) return sendJson(res, 404, { error: 'Unknown call' });
-    // Closing the call screen of a call that has already ended reports a
-    // Decline too: nothing to do.
-    if (call.finished) return sendJson(res, 200, { ok: true, finished: true });
-    call.declined = true;
-    log('ok', `Call ${short(call.id)} declined on the phone`);
-    let busy = 'next_attempt';
-    if (!call.test) {
-      finish(call, 'declined');
-      endRinging(call, 'declined');
-      // Act now rather than at the Dial result (the end of the wait, or
-      // never while the other targets are still ringing).
-      if (config.authId) {
-        try {
-          await vobizApi('POST', `/Call/${encodeURIComponent(call.id)}/`, {
-            legs: 'aleg',
-            aleg_url: `${publicBase()}/declined/${callRef(call.id)}`,
-            aleg_method: 'POST',
-          });
-          busy = 'transferred';
-        } catch (error) {
-          log('!!', `Call ${short(call.id)}: could not transfer to busy (${error.message}); the next dial result hangs up`);
-        }
-      }
-    }
-    sendJson(res, 200, { ok: true, busy });
-  }
-
-  /** The caller's leg after Decline: hear busy, then a busy rejection. */
-  async function onDeclinedXml(req, res) {
-    return sendXml(res, declinedXml());
-  }
-
-  /**
-   * Busy for a declined call. <Hangup reason="busy"> rejects the call
-   * unbilled only while it is unanswered; once a <Dial> has answered the
-   * caller's leg, Vobiz ends it as a normal hangup (docs: /xml/hangup). So the
-   * caller first hears a busy tone: as early media (not billed) if the call is
-   * still unanswered, as ordinary audio if it was answered.
-   */
-  function declinedXml() {
-    return `  <PreAnswer><Play>${esc(publicBase())}/busy.wav</Play></PreAnswer>\n  <Hangup reason="busy"/>`;
-  }
-
-  function callFor(body) {
-    const call = calls.get(String(body.call_id || ''));
-    if (!call || !safeEqual(String(body.call_key || ''), call.key)) return null;
-    return call;
-  }
-
-  // ── Push messages (Firebase Cloud Messaging HTTP v1) ─────────────────────────
-
-  /**
-   * The incoming-call push. The phone's clock may be off, so the time left is
-   * sent as a duration (ttl_ms, from when the bridge sends it): the app
-   * stops ringing ttl_ms after the push arrives, or after FCM's sent time
-   * when it has one. expires_at is the bridge's clock and is kept only for
-   * older app builds; do not compare it with the phone's clock.
-   */
-  function incomingPayload(call) {
-    return {
-      type: 'incoming_call',
-      call_id: call.id,
-      call_key: call.key,
-      caller: call.from,
-      callee: call.to,
-      server: publicBase(),
-      sent_at: String(Date.now()),
-      ttl_ms: String(Math.max(0, call.deadline - Date.now())),
-      // The user is already on a call: show call waiting, not the full-screen
-      // ringing screen, and leave the active call's service alone.
-      ...(call.lineBusy ? { line_busy: '1' } : {}),
-      expires_at: String(call.deadline),
-      ...(call.test ? { test: '1' } : {}),
-    };
-  }
-
-  /** Tells the pushed phones to stop ringing. Does not hold up the reply to Vobiz. */
-  function endRinging(call, reason) {
-    if (call.endedPushSent) return;
-    call.endedPushSent = true;
-    background(pushToTargets(call, { type: 'call_ended', call_id: call.id, reason }), 'push');
-  }
-
-  function background(promise, label) {
-    promise.catch((error) => log('!!', `${label} failed: ${error.message}`));
-  }
-
-  async function pushToTargets(call, data) {
-    // FCM drops an incoming-call push that cannot arrive before the caller
-    // gives up; "call ended" pushes only matter for a minute.
-    const ttlSeconds = data.type === 'incoming_call'
-      ? Math.max(1, Math.ceil((call.deadline - Date.now()) / 1000))
-      : 60;
-    const devices = devicesOf(call.targets).filter((d) => d.token && (!call.onlyDevice || d.id === call.onlyDevice));
-    if (!devices.length) return;
-    if (!firebase.ready && !deps.sendPush) {
-      log('!!', 'Not sending a push: FIREBASE_SERVICE_ACCOUNT is not set up');
-      return;
-    }
-    await Promise.all(devices.map(async (device) => {
-      const result = await sendPush(device.token, data, { ttlSeconds });
-      if (result.ok) {
-        log('ok', `Push ${data.type} sent for call ${short(call.id)} to ${mask(device.token)}`);
-      } else {
-        log('!!', `Push to ${mask(device.token)} failed: ${result.status} ${result.code || ''} ${result.message || ''}`);
-        if (result.code === 'UNREGISTERED' || result.status === 404) forgetToken(device.token);
-      }
-    }));
-  }
-
-  const firebase = { ready: false, projectId: '', clientEmail: '', privateKey: '', accessToken: '', expiresAt: 0 };
-
-  function loadServiceAccount() {
-    if (!config.serviceAccountFile) return 'FIREBASE_SERVICE_ACCOUNT is not set';
-    let json;
-    try {
-      json = JSON.parse(fs.readFileSync(path.resolve(HERE, config.serviceAccountFile), 'utf8'));
-    } catch (error) {
-      return `cannot read ${config.serviceAccountFile}: ${error.message}`;
-    }
-    if (json.type !== 'service_account' || !json.private_key || !json.client_email || !json.project_id) {
-      return `${config.serviceAccountFile} is not a service account key`;
-    }
-    Object.assign(firebase, { ready: true, projectId: json.project_id, clientEmail: json.client_email, privateKey: json.private_key });
-    return null;
-  }
-
-  async function googleAccessToken() {
-    if (firebase.accessToken && Date.now() < firebase.expiresAt - 5 * 60 * 1000) return firebase.accessToken;
-    const now = Math.floor(Date.now() / 1000);
-    const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-    const claims = b64url(JSON.stringify({
-      iss: firebase.clientEmail,
-      scope: 'https://www.googleapis.com/auth/firebase.messaging',
-      aud: 'https://oauth2.googleapis.com/token',
-      iat: now,
-      exp: now + 3600,
-    }));
-    const signature = crypto.createSign('RSA-SHA256').update(`${header}.${claims}`).sign(firebase.privateKey);
-    const response = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        assertion: `${header}.${claims}.${b64url(signature)}`,
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body.access_token) {
-      throw new Error(`Google rejected the service account (${response.status} ${body.error || ''} ${body.error_description || ''})`.trim());
-    }
-    firebase.accessToken = body.access_token;
-    firebase.expiresAt = Date.now() + (body.expires_in || 3600) * 1000;
-    return firebase.accessToken;
-  }
-
-  async function sendPush(token, data, opts = {}) {
-    if (deps.sendPush) return deps.sendPush(token, data, opts);
-    const { validateOnly = false, ttlSeconds = config.ringSeconds } = opts;
-    try {
-      const accessToken = await googleAccessToken();
-      const response = await fetch(`https://fcm.googleapis.com/v1/projects/${firebase.projectId}/messages:send`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          validate_only: validateOnly,
-          message: {
-            token,
-            data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
-            // Data-only and high priority: Android wakes the app even when it
-            // is closed, and the app draws the call screen itself.
-            android: { priority: 'HIGH', ttl: `${ttlSeconds}s` },
-          },
-        }),
-        signal: AbortSignal.timeout(8000),
-      });
-      if (response.ok) return { ok: true };
-      const body = await response.json().catch(() => ({}));
-      const detail = (body.error?.details || []).find((d) => d.errorCode);
-      return { ok: false, status: response.status, code: detail?.errorCode || body.error?.status, message: body.error?.message };
-    } catch (error) {
-      return { ok: false, status: 0, code: error.name === 'TimeoutError' ? 'TIMEOUT' : 'ERROR', message: error.message };
-    }
-  }
-
-  function forgetToken(token) {
-    for (const device of Object.values(state.devices)) {
-      if (device.token === token) {
-        log('..', `Removed an expired push token from ${device.username}; the app registers a new one when it next signs in`);
-        // Keep the endpoint ringing even without a token.
-        device.token = null;
-      }
-    }
-    saveState();
   }
 
   // ── Vobiz: signatures, account set-up ────────────────────────────────────────
@@ -1132,58 +652,9 @@ export function createBridge(options = {}) {
     log('ok', `Vobiz: ${e164} now rings this bridge`);
   }
 
-  const endpointCache = { at: 0, names: null };
-
-  /** An access-token identity on this account: "<sub>_<auth id>" (see /token). */
-  function isTokenIdentity(username) {
-    const suffix = `_${config.authId}`.toLowerCase();
-    const name = String(username || '').toLowerCase();
-    return Boolean(config.authId) && name.length > suffix.length && name.endsWith(suffix)
-      && SUB_RE.test(name.slice(0, -suffix.length));
-  }
-
-  /**
-   * Whether `username` is an endpoint on VOBIZ_AUTH_ID's account: true,
-   * false, null when Vobiz could not be asked, undefined when there is no
-   * account to ask.
-   */
-  async function endpointKnown(username) {
-    if (!config.authId || !config.authToken) return undefined;
-    // An app signed in with an access token registers as "<sub>_<auth id>":
-    // an identity the token creates, not a Console endpoint. Ringing
-    // <User>sip:<sub>_<auth id>@registrar.vobiz.ai</User> reaches it.
-    if (isTokenIdentity(username)) return true;
-    try {
-      if (!endpointCache.names || Date.now() - endpointCache.at > 60 * 1000) {
-        const endpoints = await listAll('/Endpoint/');
-        endpointCache.names = new Set(endpoints.filter((e) => e.username).map((e) => String(e.username).toLowerCase()));
-        endpointCache.at = Date.now();
-      }
-      return endpointCache.names.has(username.toLowerCase());
-    } catch (error) {
-      log('!!', `Vobiz: could not list endpoints: ${error.message}`);
-      return null;
-    }
-  }
-
   // ── Start-up checks ──────────────────────────────────────────────────────────
 
   async function startupChecks() {
-    const saProblem = loadServiceAccount();
-    if (saProblem) {
-      log('!!', `Firebase: ${saProblem}. Calls still ring the app while it is open, but closed apps will not wake.`);
-    } else {
-      // A dry run with a made-up token: Google answers "invalid token" only
-      // after accepting the credentials, which is what this checks.
-      const result = await sendPush('bridge-startup-check', { type: 'check' }, { validateOnly: true });
-      if (result.ok || result.status === 400 || result.status === 404) {
-        log('ok', `Firebase: service account for project ${firebase.projectId} works`);
-      } else {
-        firebase.ready = false;
-        log('!!', `Firebase: ${result.status} ${result.code || ''} ${result.message || ''}`);
-      }
-    }
-
     if (!config.publicUrl) {
       log('!!', 'PUBLIC_URL is not set. Start a tunnel to this port and put its https address in .env, then restart.');
     } else {
@@ -1214,21 +685,22 @@ export function createBridge(options = {}) {
       ? 'Webhooks: Vobiz signatures (V3/V2) and nonces are checked'
       : 'Webhooks: signatures are NOT checked (ALLOW_UNSIGNED_WEBHOOKS=true). Anyone who finds this address can ring your phones. Local testing only.');
 
-    const registered = Object.entries(state.devices)
-      .map(([id, d]) => `${d.username} on ${id} (${d.token ? 'push' : 'no push'})`);
-    log('..', `Phones registered: ${registered.length ? registered.join(', ') : 'none yet'}`);
     for (const [number, route] of config.routes) log('..', `Calls to ${number} ring ${[...route.users, ...route.numbers].join(', ')}`);
-    log('..', `Inbound calls wait up to ${config.pushWaitSeconds} s for a pushed app to sign in, then ring for ${config.ringSeconds} s`);
+    if (config.alwaysRing.length) log('..', `Every inbound call also rings ${config.alwaysRing.join(', ')}`);
+    if (!config.routes.size && !config.alwaysRing.length) {
+      log('!!', 'ROUTES and ALWAYS_RING are empty: inbound calls ring nobody. Set ROUTES=<your number>=<SIP user> in .env.');
+    }
+    log('..', `Inbound calls ring for ${config.ringSeconds} s`);
 
     console.log('');
     if (keyIsNew) {
       // Shown once, when it is created. Afterwards it is in the state file
-      // (readable by this user only) or in BRIDGE_KEY.
-      console.log('  Pair a phone: Identity tab → Incoming calls → Push server, paste this line:');
+      // (readable by this user only, on Linux and macOS) or in BRIDGE_KEY.
+      console.log('  Connect the app: Identity tab → Sample server, paste this line:');
       console.log('');
       console.log(`    ${config.publicUrl || 'https://<your-tunnel>'}#key=${state.bridgeKey}`);
     } else {
-      console.log(`  Pair a phone with ${config.publicUrl || 'https://<your-tunnel>'}#key=<bridge key>; the key is bridgeKey in ${config.stateFile} (or BRIDGE_KEY).`);
+      console.log(`  Connect the app with ${config.publicUrl || 'https://<your-tunnel>'}#key=<bridge key>; the key is bridgeKey in ${config.stateFile} (or BRIDGE_KEY).`);
     }
     console.log('');
   }
@@ -1241,7 +713,8 @@ export function createBridge(options = {}) {
   // every 2.5 s, and stops it when the app is back. The SDK gives a dropped call
   // 12 s to come back; after LOST_HANGUP_SECONDS without a report it has given
   // up, but its BYE could not leave the offline phone, and Vobiz would keep the
-  // call up (and billed) for about five minutes. So the bridge ends it.
+  // call up (and billed) for about five minutes. So the bridge ends it. The
+  // app reports with the bridge key and its SIP user (X-Bridge-User).
 
   /** Calls being watched, by the CallUUID the app reports. Memory only. */
   const watched = new Map();
@@ -1252,27 +725,27 @@ export function createBridge(options = {}) {
   const confHostLostMs = deps.confHostLostMs ?? config.confHostLostSeconds * 1000;
 
   async function onCallAlive(req, res) {
-    const device = deviceFromRequest(req);
-    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
+    const who = appCaller(req, res, { needUser: true });
+    if (!who) return;
     const body = await readJson(req);
     const uuid = String(body.call_uuid || '').toLowerCase();
     if (!CALL_UUID_RE.test(uuid)) return sendJson(res, 400, { error: 'call_uuid must be a Vobiz CallUUID' });
     let watch = watched.get(uuid);
     if (!watch) {
-      const key = `${uuid} ${device.username}`;
+      const key = `${uuid} ${who.username}`;
       if (!watchLookups.has(key)) {
-        watchLookups.set(key, otherPartyLeg(uuid, device.username).finally(() => watchLookups.delete(key)));
+        watchLookups.set(key, otherPartyLeg(uuid, who.username).finally(() => watchLookups.delete(key)));
       }
       const legs = await watchLookups.get(key);
-      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this phone\'s endpoint' });
+      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this SIP user' });
       watch = watched.get(uuid);
       if (!watch) {
-        watch = { uuid, username: device.username, legs, lastSeen: Date.now(), beeping: false, beepFailed: false, busy: false };
+        watch = { uuid, username: who.username, legs, lastSeen: Date.now(), beeping: false, beepFailed: false, busy: false };
         watched.set(uuid, watch);
-        log('..', `Call ${short(uuid)}: watching ${device.username}'s connection (beeps go to the ${legs === 'aleg' ? 'caller' : 'callee'})`);
+        log('..', `Call ${short(uuid)}: watching ${who.username}'s connection (beeps go to the ${legs === 'aleg' ? 'caller' : 'callee'})`);
       }
     }
-    if (watch.username !== device.username) return sendJson(res, 403, { error: 'Not a call of this phone\'s endpoint' });
+    if (watch.username !== who.username) return sendJson(res, 403, { error: 'Not a call of this SIP user' });
     watch.lastSeen = Date.now();
     watch.beepFailed = false;
     if (watch.beeping && !watch.busy) await stopBeep(watch, 'the app is back');
@@ -1281,18 +754,18 @@ export function createBridge(options = {}) {
 
   /** The call ended in the app: stop watching it. */
   async function onCallEnded(req, res) {
-    const device = deviceFromRequest(req);
-    if (!device) return sendJson(res, 401, { error: 'Send this phone\'s device token' });
+    const who = appCaller(req, res, { needUser: true });
+    if (!who) return;
     const body = await readJson(req);
     const watch = watched.get(String(body.call_uuid || '').toLowerCase());
-    if (watch && watch.username === device.username) forget(watch, 'ended in the app');
+    if (watch && watch.username === who.username) forget(watch, 'ended in the app');
     sendJson(res, 200, { ok: true });
   }
 
   /**
    * Which leg of call `uuid` is the app's other party, as Vobiz's Play API
    * names it ('aleg' or 'bleg'), or null when the call is not live or is not
-   * this endpoint's: a phone can only make the bridge act on its own calls.
+   * this SIP user's: an app can only make the bridge act on its own calls.
    */
   async function otherPartyLeg(uuid, username) {
     // An inbound call this bridge rang: its UUID is the caller's own leg.
@@ -1430,9 +903,9 @@ export function createBridge(options = {}) {
   // the room onto looping music (Transfer API) and resume brings them back:
   // Vobiz has no hold for a member.
   //
-  // A phone acts on its own calls only (its device token, and its endpoint
-  // must be on the live call); the bridge key may act on any live call of
-  // the account.
+  // A request that names its SIP user (X-Bridge-User) acts on that user's
+  // calls only (the user must be on the live call); the bridge key alone may
+  // act on any live call of the account.
 
   /** Conference rooms by name, and the room of every CallUUID in one. Memory only. */
   const rooms = new Map();
@@ -1448,8 +921,8 @@ export function createBridge(options = {}) {
   const ACTIONS = new Set(['mute', 'unmute', 'hold', 'resume', 'remove']);
 
   async function onConferenceAdd(req, res) {
-    const who = conferenceCaller(req);
-    if (!who) return sendJson(res, 401, { error: 'Send this phone\'s device token, or the bridge key' });
+    const who = appCaller(req, res);
+    if (!who) return;
     if (!config.authId || !config.authToken) return sendJson(res, 503, { error: 'VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN are not set' });
     const body = await readJson(req);
     const uuid = String(body.call_uuid || '').toLowerCase();
@@ -1462,11 +935,11 @@ export function createBridge(options = {}) {
     }
 
     let room = roomForCall(uuid);
-    if (room && !mayControl(room, who)) return sendJson(res, 403, { error: 'Not a conference of this phone\'s endpoint' });
+    if (room && !mayControl(room, who)) return sendJson(res, 403, { error: 'Not a conference of this SIP user' });
     if (room?.over) room = null;
     if (!room) {
       const legs = await conferenceLegs(uuid, who, body);
-      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this phone\'s endpoint' });
+      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this SIP user' });
       room = openRoom(uuid, legs);
       try {
         await moveIntoRoom(room);
@@ -1543,11 +1016,8 @@ export function createBridge(options = {}) {
    * act on it; otherwise answers the request itself and returns null.
    */
   async function conferenceRequest(req, res) {
-    const who = conferenceCaller(req);
-    if (!who) {
-      sendJson(res, 401, { error: 'Send this phone\'s device token, or the bridge key' });
-      return null;
-    }
+    const who = appCaller(req, res);
+    if (!who) return null;
     const body = await readJson(req);
     const uuid = String(body.call_uuid || '').toLowerCase();
     const room = CALL_UUID_RE.test(uuid) ? roomForCall(uuid) : null;
@@ -1556,18 +1026,10 @@ export function createBridge(options = {}) {
       return null;
     }
     if (!mayControl(room, who)) {
-      sendJson(res, 403, { error: 'Not a conference of this phone\'s endpoint' });
+      sendJson(res, 403, { error: 'Not a conference of this SIP user' });
       return null;
     }
     return { room, body, who };
-  }
-
-  /** A paired phone (its endpoint), or the operator with the bridge key. */
-  function conferenceCaller(req) {
-    const device = deviceFromRequest(req);
-    if (device) return { username: device.username, operator: false };
-    if (keyMatches(req)) return { username: null, operator: true };
-    return null;
   }
 
   function mayControl(room, who) {
@@ -1585,7 +1047,7 @@ export function createBridge(options = {}) {
 
   /**
    * Which leg of call `uuid` is the app's (the host) and who is at the other
-   * end, or null when the call is not live or not this phone's.
+   * end, or null when the call is not live or not this SIP user's.
    */
   async function conferenceLegs(uuid, who, body) {
     // An inbound call this bridge rang: `uuid` is the caller's own leg and
@@ -1966,78 +1428,60 @@ export function createBridge(options = {}) {
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
 
-  /** The registered phone whose device token is in `Authorization: Bearer`, or null. */
-  function deviceFromRequest(req) {
-    const match = String(req.headers.authorization || '').match(/^Bearer\s+([\w-]+)\.([\w-]+)$/);
-    if (!match || !Object.prototype.hasOwnProperty.call(state.devices, match[1])) return null;
-    const device = state.devices[match[1]];
-    if (!device.secretHash || !safeEqual(sha256(match[2]), device.secretHash)) return null;
-    return { id: match[1], ...device };
-  }
-
   function keyMatches(req) {
     const header = String(req.headers['x-bridge-key'] || '');
     return Boolean(header) && safeEqual(header, state.bridgeKey);
   }
 
-
-
-
-
-
-
   function publicBase() {
     return config.publicUrl || `http://localhost:${config.port}`;
   }
 
-
-
-
-
-
-
-
-
-
-
+  function background(promise, label) {
+    promise.catch((error) => log('!!', `${label} failed: ${error.message}`));
+  }
 
   function loadState() {
     try {
       const json = JSON.parse(fs.readFileSync(config.stateFile, 'utf8'));
       const object = (v) => (v && typeof v === 'object' ? v : {});
+      // Only these keys: an older file's `devices` (push tokens, device
+      // secrets' hashes) is dropped by the save at start.
       return {
         bridgeKey: json.bridgeKey || '',
         webhookSecret: json.webhookSecret || '',
-        // { deviceId: { username, token, secretHash, … } }. Records from the
-        // old { username: [devices] } layout had no per-phone secret: the
-        // phones pair again.
-        devices: Object.fromEntries(Object.entries(object(json.devices))
-          .filter(([, d]) => d && !Array.isArray(d) && d.username && d.secretHash)),
         nonces: object(json.nonces),
       };
     } catch {
-      return { bridgeKey: '', webhookSecret: '', devices: {}, nonces: {} };
+      return { bridgeKey: '', webhookSecret: '', nonces: {} };
     }
   }
 
   function saveState() {
     const tmp = `${config.stateFile}.tmp`;
-    // The bridge key, device secrets' hashes and push tokens: this user only.
+    // The bridge key and the webhook secret: this user only (Linux, macOS).
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, config.stateFile);
   }
 
-  return { server, config, state, calls, rooms, start, close, firebase, verifySignatures, ringTargets };
+  return { server, config, state, calls, start, close, sweep, verifySignatures, linkVobizNumber };
 }
 
 // ── Module helpers ───────────────────────────────────────────────────────────
 
-/** Settings that would leave the webhooks open. Empty when it is safe to start. */
+/** Settings that would leave the server open. Empty when it is safe to start. */
 export function configProblems(config, env, allowUnsigned) {
   const problems = [];
   if (env.VERIFY_SIGNATURES === 'false') {
     problems.push('VERIFY_SIGNATURES=false is no longer supported; for local testing only, set ALLOW_UNSIGNED_WEBHOOKS=true');
+  }
+  // The key lets anyone mint tokens and manage calls, so a short key or a
+  // sentence pasted in as one (a description left on the BRIDGE_KEY line)
+  // is refused. Empty: the server makes one.
+  const key = String(env.BRIDGE_KEY || '').trim();
+  if (key && (key.length < 16 || /\s/.test(key))) {
+    problems.push('BRIDGE_KEY must be at least 16 characters with no spaces (leave it empty and the server makes one)');
   }
   if (allowUnsigned) return problems;
   if (!config.publicUrl) problems.push('PUBLIC_URL is not set: it is part of every Vobiz signature, so webhooks cannot be checked');
@@ -2068,27 +1512,8 @@ export function parseRoutes(value) {
   return routes;
 }
 
-/** Ringback cadence bursts ([start, end] s) filling `seconds`: 0.4 on, 0.2 off, 0.4 on, 2 off. */
-function ringbackBursts(seconds) {
-  const bursts = [];
-  for (let t = 0; t < seconds; t += 3) bursts.push([t, t + 0.4], [t + 0.6, t + 1.0]);
-  return bursts;
-}
-
-function sha256(value) {
-  return crypto.createHash('sha256').update(String(value)).digest('base64url');
-}
-
 function esc(value) {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function b64url(value) {
-  return Buffer.from(value).toString('base64url');
-}
-
-function mask(token) {
-  return token ? `${token.slice(0, 6)}…${token.slice(-4)}` : '(none)';
 }
 
 function short(id) {
@@ -2189,6 +1614,43 @@ function sendText(res, status, text) {
   res.end(text);
 }
 
+/**
+ * The settings in the text of a .env file: `NAME=value` lines, `#` lines are
+ * comments. A quoted value ("…" or '…') is kept as written. An unquoted value
+ * ends at a ` #` comment, and may not contain a space: that is almost always
+ * a description left on the setting's line, which would silently become the
+ * value. Returns { values, problems }; a problem names the line, never the
+ * value.
+ */
+export function parseEnv(text) {
+  const values = {};
+  const problems = [];
+  String(text).split(/\r?\n/).forEach((line, index) => {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (!match || match[2].startsWith('#')) return;
+    const [, name, rest] = match;
+    let value;
+    if (rest[0] === '"' || rest[0] === '\'') {
+      const close = rest.indexOf(rest[0], 1);
+      const after = close < 0 ? '' : rest.slice(close + 1);
+      if (close < 0 || (after && !/^\s+#/.test(after))) {
+        problems.push(`line ${index + 1}: the quoted value of ${name} is not closed, or has text after it`);
+        return;
+      }
+      value = rest.slice(1, close);
+    } else {
+      value = rest.replace(/\s+#.*$/, '');
+      if (/\s/.test(value)) {
+        problems.push(`line ${index + 1}: the value of ${name} has a space in it. Put descriptions on their own # line, and quote a value that really has spaces`);
+        return;
+      }
+    }
+    values[name] = value;
+  });
+  return { values, problems };
+}
+
+/** Sets the .env file's settings that the environment does not already have. */
 function loadEnvFile(file) {
   let text;
   try {
@@ -2196,11 +1658,14 @@ function loadEnvFile(file) {
   } catch {
     return;
   }
-  for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (!match || match[2].startsWith('#')) continue;
-    const value = match[2].replace(/^(['"])(.*)\1$/, '$2');
-    if (process.env[match[1]] === undefined) process.env[match[1]] = value;
+  const { values, problems } = parseEnv(text);
+  if (problems.length) {
+    const error = new Error(`${file} cannot be read safely:\n  - ${problems.join('\n  - ')}`);
+    error.code = 'BRIDGE_CONFIG';
+    throw error;
+  }
+  for (const [name, value] of Object.entries(values)) {
+    if (process.env[name] === undefined) process.env[name] = value;
   }
 }
 
@@ -2212,8 +1677,8 @@ function sendWav(res, wav) {
 /**
  * `seconds` of an Indian call-progress tone (400 Hz modulated at 25 Hz),
  * sounding during `bursts` ([start, end] in seconds), as 8 kHz 16-bit mono
- * WAV. Ringback: see ringbackBursts(). Busy: 0.75 s on/off. `freqs`
- * replaces the tone's frequencies (the connection-lost beep is 1 kHz).
+ * WAV. Busy: 0.75 s on/off. `freqs` replaces the tone's frequencies (the
+ * connection-lost beep is 1 kHz).
  */
 function makeToneWav(seconds, bursts, freqs = [375, 425]) {
   const rate = 8000;
@@ -2282,8 +1747,8 @@ function defaultLog(tag, message) {
 
 // Run as a program (not when imported by the tests).
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  loadEnvFile(path.join(HERE, '.env'));
   try {
+    loadEnvFile(path.join(HERE, '.env'));
     createBridge().start();
   } catch (error) {
     if (error.code !== 'BRIDGE_CONFIG') throw error;

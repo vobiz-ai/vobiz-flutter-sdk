@@ -3,7 +3,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createBridge } from '../push-bridge.mjs';
-import { AUTH_TOKEN, PUBLIC_URL, answerCall, registerDevice, signV3, startBridge, webhook } from './helpers.mjs';
+import { AUTH_TOKEN, PUBLIC_URL, answerCall, signV3, startBridge, webhook } from './helpers.mjs';
+
+const RINGS_ALICE = { env: { ALWAYS_RING: 'alice' } };
 
 test('refuses to start without PUBLIC_URL', () => {
   assert.throws(
@@ -36,13 +38,13 @@ test('only ALLOW_UNSIGNED_WEBHOOKS=true turns the check off', async (t) => {
 });
 
 test('an unsigned /answer is rejected and rings nobody', async (t) => {
-  const ctx = await startBridge();
+  const ctx = await startBridge(RINGS_ALICE);
   t.after(ctx.stop);
   assert.equal(ctx.bridge.verifySignatures, true);
-  await registerDevice(ctx, 'alice');
   const r = await webhook(ctx, '/answer', { CallUUID: 'c1', From: '+919800000001', To: '+918000000000' }, { sign: false });
   assert.equal(r.status, 403);
-  assert.equal(ctx.pushes.length, 0);
+  assert.doesNotMatch(r.text, /<Dial/);
+  assert.equal(ctx.bridge.calls.size, 0);
 });
 
 test('a signature over a different path or with the wrong token is rejected', async (t) => {
@@ -57,12 +59,11 @@ test('a signature over a different path or with the wrong token is rejected', as
 });
 
 test('a signed /answer is accepted; replaying the same nonce with another body is rejected', async (t) => {
-  const ctx = await startBridge();
+  const ctx = await startBridge(RINGS_ALICE);
   t.after(ctx.stop);
-  await registerDevice(ctx, 'alice');
   const first = await webhook(ctx, '/answer', { CallUUID: 'c1', From: '+919800000001', To: '+918000000000' });
   assert.equal(first.status, 200);
-  assert.match(first.text, /<Redirect[^>]*>[^<]*\/dial-now\/c1\.[\w-]{22}<\/Redirect>/);
+  assert.match(first.text, /<Dial [^>]*action="[^"]*\/dial-result\/c1\.[\w-]{22}"/);
   const replay = await webhook(ctx, '/answer', { CallUUID: 'c2', From: '+910000000000' }, { sign: false, headers: first.headers });
   assert.equal(replay.status, 403);
   assert.equal(ctx.bridge.calls.has('c2'), false);
@@ -83,9 +84,8 @@ test('nonces survive a restart', async () => {
 });
 
 test('Dial callbacks carry the call id in the signed path; a captured signature cannot steer another call', async (t) => {
-  const ctx = await startBridge();
+  const ctx = await startBridge(RINGS_ALICE);
   t.after(ctx.stop);
-  await registerDevice(ctx, 'alice');
   const a = await answerCall(ctx, { CallUUID: 'call-A', From: '+919800000001', To: '+918000000000' });
   const b = await answerCall(ctx, { CallUUID: 'call-B', From: '+919800000002', To: '+918000000000' });
   const actionA = new URL(`${PUBLIC_URL}${a.action}`);
@@ -104,8 +104,4 @@ test('Dial callbacks carry the call id in the signed path; a captured signature 
   assert.equal(forged.status, 200);
   assert.match(forged.text, /<Hangup\/>/);
   assert.equal(ctx.bridge.calls.get('call-B').finished, null);
-
-  // The same for the hold's /dial-now path.
-  const forgedNow = await webhook(ctx, '/dial-now/call-B.AAAAAAAAAAAAAAAAAAAAAA', {});
-  assert.match(forgedNow.text, /<Hangup\/>/);
 });
