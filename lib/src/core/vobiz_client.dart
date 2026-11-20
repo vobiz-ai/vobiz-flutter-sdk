@@ -576,9 +576,10 @@ class VobizClient {
   /// The client claims the call: a REGISTER carries the push's hold
   /// reference ([VobizIncomingPush.hold]), and the registrar then sends the
   /// held INVITE to this registration. Signed in and registered, that
-  /// REGISTER goes at once. Otherwise sign in now ([connectWithCredentials],
-  /// [connectWithAccessToken], and so on), and the sign-in's REGISTER carries
-  /// it.
+  /// REGISTER goes at once. Signed in but between connections, or after
+  /// reconnecting gave up, the client reconnects at once and that REGISTER
+  /// carries it. Signed out, sign in now ([connectWithCredentials],
+  /// [connectWithAccessToken], and so on): the sign-in's REGISTER carries it.
   ///
   /// The INVITE arrives as a normal incoming call whose `CallEvent.sipCallId`
   /// is the push's `call_id`; [isPushedCall] tells it apart. Report the call
@@ -586,15 +587,19 @@ class VobizClient {
   /// [reportCallScreenDeclined]: a call accepted, or declined, before its
   /// INVITE arrives is answered, or declined, as soon as it does.
   /// [pushCallUpdates] reports each step, and `expired` when no INVITE came
-  /// by the push's expiry: take the call screen down then.
+  /// in time: take the call screen down then. In time means by the push's
+  /// `expires_at` plus 30 s (this phone's clock may run ahead of Vobiz's),
+  /// and never more than 60 s after the push was handed over (30 s for a
+  /// push without an expiry).
   ///
-  /// Returns false and does nothing for a push that has expired, or whose
-  /// hold reference cannot go into a REGISTER (an empty value, or a control
-  /// character). A repeat of the push being handled returns true and does
-  /// nothing more.
+  /// Returns false and does nothing for a push whose `expires_at` passed
+  /// more than 30 s ago by this phone's clock, or whose hold reference cannot
+  /// go into a REGISTER (an empty value, or a control character). A repeat
+  /// of the push being handled returns true and does nothing more.
   bool handleIncomingPush(VobizIncomingPush push) {
     final hold = push.hold;
-    if (push.isExpired()) return false;
+    final now = DateTime.now();
+    if (_isStalePush(push, now)) return false;
     if (hold.registerHeaders.values.any((v) => v.isEmpty || hasControlCharacter(v))) {
       _logger.warn('Ignored the push for ${push.callId}: its hold reference cannot go into a REGISTER');
       return false;
@@ -602,23 +607,49 @@ class VobizClient {
     final current = _pushed;
     if (current != null && current.push.callId == push.callId) return true;
     _forgetPushedCall();
-    final pushed = _PushedCall(push);
+    final pushed = _PushedCall(push, _pushDeadline(push, now));
     _pushed = pushed;
-    final expiresAt = push.expiresAt;
-    if (expiresAt != null) {
-      pushed.expiry = Timer(expiresAt.difference(DateTime.now()), () => _expirePushedCall(pushed));
-    }
+    pushed.expiry = Timer(pushed.deadline.difference(now), () => _expirePushedCall(pushed));
     _emitPushUpdate(pushed, VobizPushCallStatus.claiming);
     final sentNow = _sip.claimHeldCall(hold.registerHeaders);
     _logger.info(sentNow
         ? 'Claiming the call ${push.callId} that Vobiz holds: REGISTER sent with its hold reference'
         : 'Claiming the call ${push.callId} that Vobiz holds: the next REGISTER carries its hold reference');
-    // Signed in but between connections: reconnect now rather than at the
-    // next backoff step, so the claim is made while the call is still held.
-    if (!sentNow && _connectionState == ConnectionStateStatus.reconnecting) {
-      _supervisor.reconnectNow();
+    // Signed in but between connections, or given up on reconnecting:
+    // reconnect now, so the claim is made while the call is still held.
+    // reconnectNow does nothing after a sign-out or a refused sign-in.
+    if (!sentNow &&
+        _hasSignIn &&
+        (_connectionState == ConnectionStateStatus.reconnecting ||
+            _connectionState == ConnectionStateStatus.failed)) {
+      _supervisor.reconnectNow(reason: 'A pushed call is waiting to be claimed');
     }
     return true;
+  }
+
+  /// How far past its `expires_at` a push is still acted on: Vobiz's clock
+  /// sets it, this phone's clock reads it, and a phone a few seconds (or
+  /// tens of seconds) fast would otherwise drop every pushed call.
+  static const Duration _pushClockMargin = Duration(seconds: 30);
+
+  /// The longest a pushed call is awaited, whatever its `expires_at` says:
+  /// Vobiz holds a call for up to 30 s, plus the clock margin.
+  static const Duration _pushMaxWait = Duration(seconds: 60);
+
+  /// How long a push without an `expires_at` is awaited: Vobiz's hold.
+  static const Duration _pushDefaultWait = Duration(seconds: 30);
+
+  static bool _isStalePush(VobizIncomingPush push, DateTime now) {
+    final at = push.expiresAt;
+    return at != null && !now.isBefore(at.add(_pushClockMargin));
+  }
+
+  static DateTime _pushDeadline(VobizIncomingPush push, DateTime now) {
+    final at = push.expiresAt;
+    if (at == null) return now.add(_pushDefaultWait);
+    final late = at.add(_pushClockMargin);
+    final cap = now.add(_pushMaxWait);
+    return late.isAfter(cap) ? cap : late;
   }
 
   /// The user tapped Accept on the call screen for [push]. Answers its call
@@ -705,7 +736,7 @@ class VobizClient {
   void _claimPushedCallOnRegister() {
     final pushed = _pushed;
     if (pushed == null || pushed.claimed || pushed.callId != null) return;
-    if (pushed.push.isExpired()) return;
+    if (!DateTime.now().isBefore(pushed.deadline)) return;
     _sip.claimHeldCall(pushed.push.hold.registerHeaders);
   }
 
@@ -2146,9 +2177,13 @@ class _AlwaysOnlineMonitor implements ConnectivityMonitor {
 /// A call a Vobiz push announced, from [VobizClient.handleIncomingPush] until
 /// its call ends or the push expires.
 class _PushedCall {
-  _PushedCall(this.push);
+  _PushedCall(this.push, this.deadline);
 
   final VobizIncomingPush push;
+
+  /// When it stops being awaited: [VobizClient.handleIncomingPush] says how
+  /// that is worked out.
+  final DateTime deadline;
 
   /// The call's `CallEvent.callId`, once its INVITE has arrived.
   String? callId;

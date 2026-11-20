@@ -53,6 +53,10 @@ abstract final class VobizErrorCode {
   /// A conference request failed: your conference server could not be
   /// reached, or it refused (see [VobizException.statusCode]).
   static const String conferenceFailed = 'conference_failed';
+
+  /// Registering or removing this phone for Vobiz push failed: the push
+  /// service refused it or could not be reached (`VobizPushDevices`).
+  static const String pushDeviceFailed = 'push_device_failed';
 }
 
 /// An SDK operation failed.

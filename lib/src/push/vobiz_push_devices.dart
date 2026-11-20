@@ -66,9 +66,17 @@ class VobizPushDevice {
 /// Registers this phone with Vobiz's push service, so a call to its SIP user
 /// wakes the app when it is closed, and removes it at sign-out.
 ///
+/// Vobiz's gateway takes only the account's `X-Auth-ID` and `X-Auth-Token`,
+/// and the Auth Token is the account's API key: it must not ship in an app.
+/// So in production point [baseUrl] at your own backend, which checks the
+/// signed-in user and forwards the request to Vobiz with the account
+/// credentials it keeps; [authHeaders] then carries your app's session:
+///
 /// ```dart
 /// final devices = VobizPushDevices(
-///   authHeaders: () => VobizPushDevices.accountHeaders(authId, authToken),
+///   baseUrl: Uri.parse('https://api.example.com'),
+///   pathPrefix: '/vobiz/push-devices',
+///   authHeaders: () async => {'Authorization': 'Bearer ${await mySession()}'},
 /// );
 /// await devices.register(VobizPushDevice(
 ///   deviceId: installId,
@@ -81,12 +89,11 @@ class VobizPushDevice {
 /// await devices.logout(installId);
 /// ```
 ///
-/// **Authentication is not settled yet.** Vobiz's gateway takes the
-/// account's `X-Auth-ID` and `X-Auth-Token` ([accountHeaders]), which is fine
-/// for a test but must not ship in an app: the Auth Token is the account's
-/// API key. A way for an app to register with credentials scoped to its own
-/// endpoint is still to come from Vobiz; [authHeaders] lets you pass whatever
-/// that turns out to be (or your backend can register the device instead).
+/// Your backend must take `sip_username` from the signed-in user, not from
+/// the request, and remove only devices that user registered: Vobiz scopes
+/// devices to the account, not to the SIP user. For a demo or a test,
+/// [accountHeaders] sends the account credentials from the device straight to
+/// Vobiz, and only when asked to explicitly.
 class VobizPushDevices {
   VobizPushDevices({
     required this.authHeaders,
@@ -106,14 +113,25 @@ class VobizPushDevices {
   /// (without `/api`) is answered 404 by the gateway.
   static const String defaultPathPrefix = '/api/v1/devices';
 
-  /// The path in front of `register` and `logout`.
+  /// The path in front of `register` and `logout`, after any path [baseUrl]
+  /// has.
   final String pathPrefix;
 
-  /// The account's own credentials, as headers. **For testing only**: never
-  /// ship an account's Auth Token in an app.
-  static Map<String, String> accountHeaders(String authId, String authToken) =>
-      <String, String>{'X-Auth-ID': authId.trim(), 'X-Auth-Token': authToken.trim()};
+  /// The account's own credentials, as headers, for a demo or a test: never
+  /// ship an account's Auth Token in an app (see the class doc).
+  ///
+  /// Throws [VobizDemoModeRequiredException] unless [unsafeDemo] is true:
+  /// the same deliberate opt-in as `SdkConfig.unsafeDemoZeroConfig`, so a
+  /// build that must not send account credentials passes false (from a
+  /// compile-time switch, say) and cannot send them by mistake.
+  static Map<String, String> accountHeaders(String authId, String authToken, {required bool unsafeDemo}) {
+    if (!unsafeDemo) {
+      throw const VobizDemoModeRequiredException('Push sign-up with the account credentials');
+    }
+    return <String, String>{'X-Auth-ID': authId.trim(), 'X-Auth-Token': authToken.trim()};
+  }
 
+  /// Where requests go; its path, if any, is kept in front of [pathPrefix].
   final Uri baseUrl;
 
   /// The headers that authenticate each request. Called for every request.
@@ -126,7 +144,8 @@ class VobizPushDevices {
   final bool _ownsHttp;
 
   /// `POST <pathPrefix>/register`. Throws [VobizException]
-  /// (`push_device_failed`) when Vobiz refuses it or cannot be reached.
+  /// ([VobizErrorCode.pushDeviceFailed]) when Vobiz refuses it, cannot be
+  /// reached, or has not answered in full within [timeout].
   Future<void> register(VobizPushDevice device) async {
     if (device.deviceId.trim().isEmpty || device.pushToken.trim().isEmpty) {
       throw ArgumentError('A device id and a push token are required');
@@ -139,16 +158,19 @@ class VobizPushDevices {
   }
 
   /// `DELETE <pathPrefix>/logout`: stop pushing to [deviceId]. Throws
-  /// [VobizException] (`push_device_failed`) when Vobiz refuses it or cannot
-  /// be reached.
+  /// [VobizException] ([VobizErrorCode.pushDeviceFailed]) when Vobiz refuses
+  /// it, cannot be reached, or has not answered in full within [timeout].
   Future<void> logout(String deviceId) async {
     if (deviceId.trim().isEmpty) throw ArgumentError('A device id is required');
     await _send('DELETE', 'logout', <String, String>{'device_id': deviceId});
   }
 
   Future<void> _send(String method, String path, Map<String, String> body) async {
-    final prefix = pathPrefix.endsWith('/') ? pathPrefix.substring(0, pathPrefix.length - 1) : pathPrefix;
-    final url = baseUrl.resolve('$prefix/$path');
+    // Joined as text: Uri.resolve with a prefix that starts with '/' would
+    // drop a path on baseUrl (https://api.example.com/vobiz).
+    final base = baseUrl.toString().replaceAll(RegExp(r'/+$'), '');
+    final prefix = pathPrefix.replaceAll(RegExp(r'^/+|/+$'), '');
+    final url = Uri.parse(prefix.isEmpty ? '$base/$path' : '$base/$prefix/$path');
     final request = http.Request(method, url)
       ..headers.addAll(<String, String>{
         ...await authHeaders(),
@@ -158,18 +180,20 @@ class VobizPushDevices {
       ..body = jsonEncode(body);
     final http.Response response;
     try {
-      response = await http.Response.fromStream(await _http.send(request).timeout(timeout));
+      // The whole exchange, body included: a reply that stalls after its
+      // headers is a timeout too.
+      response = await _http.send(request).then(http.Response.fromStream).timeout(timeout);
     } on TimeoutException catch (e) {
-      throw VobizException('push_device_failed',
+      throw VobizException(VobizErrorCode.pushDeviceFailed,
           'Vobiz did not answer $method $url within ${timeout.inSeconds} s',
           cause: e);
     } catch (e) {
-      throw VobizException('push_device_failed', 'Could not reach Vobiz for $url: $e',
+      throw VobizException(VobizErrorCode.pushDeviceFailed, 'Could not reach Vobiz for $url: $e',
           cause: e);
     }
     if (response.statusCode >= 200 && response.statusCode < 300) return;
     throw VobizException(
-      'push_device_failed',
+      VobizErrorCode.pushDeviceFailed,
       'Vobiz refused $method $url (HTTP ${response.statusCode})'
           '${_reason(response.body)}',
       statusCode: response.statusCode,

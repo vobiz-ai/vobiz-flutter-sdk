@@ -118,7 +118,8 @@ class VobizIncomingPush {
   /// `index`, `label` and `registrar` are all there ([hold]).
   ///
   /// `expires_at` is read as Unix seconds, or as milliseconds when it is too
-  /// large to be seconds ([epochToDateTime]).
+  /// large to be seconds ([epochToDateTime]). One outside the range a
+  /// [DateTime] can hold is taken as no expiry.
   static VobizIncomingPush? tryParse(Map<String, Object?> data) {
     if ('${data['type'] ?? ''}' != 'incoming_call') return null;
     final callId = '${data['call_id'] ?? ''}';
@@ -126,12 +127,13 @@ class VobizIncomingPush {
     final hold = VobizPushHold.tryParse(data);
     if (hold == null) return null;
     final expires = int.tryParse('${data['expires_at'] ?? ''}');
+    final expiresMs = expires == null ? null : (expires < 100000000000 ? expires * 1000 : expires);
     return VobizIncomingPush(
       callId: callId,
       hold: hold,
       caller: '${data['caller'] ?? ''}',
       callee: '${data['callee'] ?? ''}',
-      expiresAt: expires == null ? null : epochToDateTime(expires),
+      expiresAt: expiresMs == null || expiresMs.abs() > _maxEpochMs ? null : epochToDateTime(expires!),
       callUuid: '${data['call_uuid'] ?? ''}',
       callerNumber: '${data['caller_number'] ?? ''}',
     );
@@ -143,6 +145,9 @@ class VobizIncomingPush {
   static DateTime epochToDateTime(int value) => value < 100000000000
       ? DateTime.fromMillisecondsSinceEpoch(value * 1000)
       : DateTime.fromMillisecondsSinceEpoch(value);
+
+  /// The largest time from the epoch a [DateTime] holds, in milliseconds.
+  static const int _maxEpochMs = 8640000000000000;
 
   /// The SIP Call-ID of the INVITE Vobiz's registrar is holding.
   final String callId;
