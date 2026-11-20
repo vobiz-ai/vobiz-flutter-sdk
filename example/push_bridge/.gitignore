@@ -1,6 +1,14 @@
 # Secrets and runtime state: never commit these.
 .env
+.env.*
+!.env.example
 bridge-state.json
 bridge-state.json.tmp
+# Key files. The server no longer uses a Firebase service account: if one is
+# still in this folder, delete it and revoke it in the Firebase console.
 *service-account*.json
 serviceAccountKey*.json
+*firebase-adminsdk*.json
+*.pem
+*.p12
+*.p8
