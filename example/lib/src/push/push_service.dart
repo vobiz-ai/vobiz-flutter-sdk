@@ -2,10 +2,11 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'call_screen.dart';
-import 'push_call.dart';
 
 /// Firebase Cloud Messaging for the running app: the device token Vobiz's
-/// push service sends to, and the pushes that arrive while the app is open.
+/// push service sends to, and the notification permission. The pushes
+/// themselves reach the app through its own receiver (CallPlatform.pushes),
+/// in every app state.
 ///
 /// Push is optional. Without `android/app/google-services.json` the app
 /// still rings for calls while it is open; [available] is false and
@@ -57,16 +58,6 @@ class PushService {
   /// Firebase replaces tokens now and then; Vobiz push must get the new one.
   Stream<String> get tokenRefresh =>
       available ? FirebaseMessaging.instance.onTokenRefresh : const Stream<String>.empty();
-
-  /// Call pushes that arrive while the app is in the foreground.
-  /// The same pushes also come through [CallPlatform.pushes]; the
-  /// controller handles each call once.
-  Stream<PushCall> get foregroundCalls => available
-      ? FirebaseMessaging.onMessage
-          .map((message) => PushCall.fromData(message.data))
-          .where((call) => call != null)
-          .cast<PushCall>()
-      : const Stream<PushCall>.empty();
 
   /// Android 13+: asks for the notification permission and says whether it
   /// was given. Null when it cannot tell (no Firebase).

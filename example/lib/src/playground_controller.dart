@@ -324,8 +324,6 @@ class PlaygroundController extends ChangeNotifier {
   /// Android 14+ permission to take over the lock screen; null while unknown.
   bool? fullScreenAllowed;
 
-  bool _inForeground = true;
-
   /// The call screen showing the current call, and whether Accept was
   /// tapped there (it then becomes the ongoing-call notification).
   String? _callScreenId;
@@ -386,8 +384,8 @@ class PlaygroundController extends ChangeNotifier {
   /// Call-ID of the held INVITE).
   final Map<String, PushCall> _ringingPushes = <String, PushCall>{};
 
-  /// Pushes handled already: one push can arrive both through Firebase's
-  /// onMessage (app open) and through the app's own receiver.
+  /// Pushes handled already: Firebase can deliver one message more than
+  /// once.
   final Set<String> _seenPushes = <String>{};
 
   /// The inbound call ringing or connected here, until its outcome is logged.
@@ -457,7 +455,6 @@ class PlaygroundController extends ChangeNotifier {
     _subs.add(client.callEvents.listen(_onCall));
     _subs.add(client.errorEvents.listen(_onError));
     _subs.add(callScreen.events.listen(_onCallScreenEvent, onError: (Object _) {}));
-    _subs.add(push.foregroundCalls.listen(_onPush));
     _subs.add(platform.pushes.listen(_onPushData));
     _subs.add(platform.hangUpRequests.listen((_) => hangup()));
     _subs.add(push.tokenRefresh.listen((_) => _registerWithVobizPush(quiet: true)));
@@ -1168,12 +1165,6 @@ class PlaygroundController extends ChangeNotifier {
   // headless when the app was closed, see CallEngine.kt), which shows the
   // system call screen and signs in at once to claim the call Vobiz holds.
 
-  /// The app moved to or from the foreground.
-  void setForeground(bool foreground) => _inForeground = foreground;
-
-  /// Whether the app is on screen.
-  bool get inForeground => _inForeground;
-
   /// Saves the line the sample server printed. Returns a problem to show, or
   /// null.
   Future<String?> setPushServer(String value) async {
@@ -1340,15 +1331,10 @@ class PlaygroundController extends ChangeNotifier {
     ));
   }
 
-  /// A push's raw data, from Android (any app state).
+  /// A push's raw data, from Android (any app state), handled once.
   void _onPushData(Map<String, String> data) {
     final call = PushCall.fromData(data);
-    if (call != null) _onPush(call);
-  }
-
-  /// An incoming-call push, once however many routes it arrives by.
-  void _onPush(PushCall call) {
-    if (!_seenPushes.add(call.callId)) return;
+    if (call == null || !_seenPushes.add(call.callId)) return;
     if (!call.isVobiz) {
       log('📲 Ignored a call push that is not a call Vobiz holds', LogType.info);
       return;
@@ -2237,6 +2223,10 @@ class PlaygroundController extends ChangeNotifier {
     transferError = '';
     transferNumber = '';
     transferUser = '';
+    conferenceBusy = false;
+    conferenceError = '';
+    conferenceNumber = '';
+    conferenceUser = '';
     if (registered && client.isConnected) {
       _setStatus(PhoneStatus.online, 'Registered');
     } else if (registered &&

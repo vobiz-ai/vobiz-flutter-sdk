@@ -23,16 +23,15 @@ class _PlaygroundAppState extends State<PlaygroundApp> {
   late final PlaygroundController _controller =
       widget.controller ?? PlaygroundController(push: widget.push);
 
-  /// Whether the app is on screen decides how an incoming call rings: the
-  /// app's own screen in the foreground, the system call screen otherwise.
+  /// Back in the app (from Settings, where "Allow" sends the user for
+  /// full-screen calls, or from the background): read the call permissions
+  /// again, so the Incoming calls checks are current.
   late final AppLifecycleListener _lifecycle;
 
   @override
   void initState() {
     super.initState();
-    _lifecycle = AppLifecycleListener(
-      onStateChange: (state) => _controller.setForeground(state == AppLifecycleState.resumed),
-    );
+    _lifecycle = AppLifecycleListener(onResume: _controller.refreshCallPermissions);
     _controller.init();
   }
 

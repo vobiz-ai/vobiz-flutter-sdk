@@ -102,7 +102,6 @@ void main() {
     test('a SIP call rings the system call screen in the foreground too', () async {
       await start();
       await signIn();
-      controller.setForeground(true);
       client.ring(headers: <String, String>{'X-VH-PushRef': 'c9'});
       await pumpEventQueue();
       expect(screen.shown, contains('c9'));

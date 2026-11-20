@@ -4,7 +4,6 @@ import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import 'package:vobiz_webrtc_example/src/push/call_platform.dart';
 import 'package:vobiz_webrtc_example/src/push/call_screen.dart';
-import 'package:vobiz_webrtc_example/src/push/push_call.dart';
 import 'package:vobiz_webrtc_example/src/push/push_service.dart';
 
 /// A VobizClient that never opens a socket: tests drive its events and read
@@ -332,9 +331,6 @@ class FakePush extends PushService {
 
   @override
   Stream<String> get tokenRefresh => refreshes.stream;
-
-  @override
-  Stream<PushCall> get foregroundCalls => const Stream<PushCall>.empty();
 
   @override
   Future<bool?> requestNotificationPermission() async => true;
