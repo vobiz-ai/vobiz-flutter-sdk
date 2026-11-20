@@ -277,8 +277,8 @@ has said who did; until then, any user it rang.
 
 ## DTMF test
 
-The SDK sends keypad presses as RFC 4733 telephone-events, which a phone on the other
-end does not hear as tones. To check that they reach Vobiz, call the app through the
+The SDK sends keypad presses as RFC 4733 telephone-events when the call negotiated
+them, otherwise as SIP INFO; a phone on the other end does not hear either as tones. To check that they reach Vobiz, call the app through the
 Vobiz API with this server as the answer URL, answer, and press four digits:
 
 ```bash
