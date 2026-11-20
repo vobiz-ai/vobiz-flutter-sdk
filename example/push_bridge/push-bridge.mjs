@@ -10,7 +10,9 @@
  *   2. mints access tokens (JWT) for the app with the account's Auth Token,
  *      which stays here;
  *   3. turns the app's call into a conference and manages it;
- *   4. watches the app's connection during a call, when the app reports.
+ *   4. watches the app's connection during a call, when the app reports;
+ *   5. signs the phone up for Vobiz push with the account's credentials, so
+ *      the phone never holds the Auth Token.
  *
  * Webhooks must carry a valid Vobiz signature (PUBLIC_URL and
  * VOBIZ_AUTH_TOKEN are required). The app sends the server's key
@@ -38,12 +40,14 @@ const CALL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  * Builds a bridge without starting it. `options.env` replaces process.env,
  * `options.stateFile` the state file, and `options.deps` lets tests swap the
  * outside world: `vobizApi(method, path, body)` for the Vobiz REST API,
- * `log(tag, message)`.
+ * `fetch(url, init)` for the requests the server sends itself (device
+ * sign-up), `log(tag, message)`.
  */
 export function createBridge(options = {}) {
   const env = options.env || process.env;
   const deps = options.deps || {};
   const log = deps.log || defaultLog;
+  const fetchFn = deps.fetch || fetch;
   const config = {
     port: clampInt(env.PORT, 8787, 1, 65535),
     publicUrl: (env.PUBLIC_URL || '').trim().replace(/\/+$/, ''),
@@ -135,6 +139,9 @@ export function createBridge(options = {}) {
     'GET /hangup': vobiz(onHangup),
     // The app
     'POST /token': onToken,
+    // Vobiz push: the SDK's VobizPushDevices, pointed at this server
+    'POST /push/devices/register': onDeviceRegister,
+    'DELETE /push/devices/logout': onDeviceLogout,
     // During a call: the app reports it still has its network
     'POST /call/alive': onCallAlive,
     'POST /call/ended': onCallEnded,
@@ -487,6 +494,137 @@ export function createBridge(options = {}) {
     const reason = typeof body.reason === 'string' ? ` (${body.reason.slice(0, 20)})` : '';
     log('ok', `Access token for ${sipUsername}, valid until ${new Date(claims.exp * 1000).toISOString()}${reason}`);
     sendJson(res, 200, { token: minted.token, sub, exp: claims.exp, sip_username: sipUsername });
+  }
+
+  // ── Vobiz push: the app signs its phone up through this server ───────────────
+  //
+  // Vobiz pushes a call for a SIP user to the devices registered for that
+  // user. The SDK's VobizPushDevices, pointed at this server (pathPrefix
+  // '/push/devices'), sends the body Vobiz takes. The server checks that the
+  // phone signs up for the SIP user the app says it is, and that this user is
+  // one of the account's; it then sends the request on with the account's
+  // credentials, which never reach the phone, and relays Vobiz's answer.
+
+  /** The fields of VobizPushDevices.register's body, and their longest length. */
+  const DEVICE_FIELDS = {
+    device_id: 200,
+    push_token: 4096,
+    platform: 20,
+    push_type: 20,
+    app_bundle_id: 200,
+    app_version: 100,
+    sdk_version: 100,
+    sip_username: 120,
+  };
+
+  async function onDeviceRegister(req, res) {
+    const who = appCaller(req, res, { needUser: true });
+    if (!who) return;
+    if (!config.authId || !config.authToken) return sendJson(res, 503, { error: 'VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN are not set' });
+    const body = await readJson(req);
+    const device = {};
+    for (const [field, max] of Object.entries(DEVICE_FIELDS)) {
+      const value = body[field];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== 'string' || value.length > max) return sendJson(res, 400, { error: `${field} must be a string of at most ${max} characters` });
+      device[field] = value.trim();
+    }
+    if (!device.device_id || !device.push_token || !device.sip_username) {
+      return sendJson(res, 400, { error: 'device_id, push_token and sip_username are required' });
+    }
+    if (device.sip_username !== who.username) {
+      return sendJson(res, 403, { error: 'sip_username must be the SIP user in X-Bridge-User' });
+    }
+    const known = await sipUserKnown(who.username);
+    if (known === null) return sendJson(res, 503, { error: 'Could not check the SIP user with Vobiz; try again' });
+    if (!known) {
+      log('!!', `Push: refused to sign up a device for ${who.username}: not a SIP user of ${config.authId}`);
+      return sendJson(res, 403, { error: `${who.username} is not an endpoint or access-token user of this account` });
+    }
+    // Whatever the app sent: the device belongs to this server's account.
+    device.auth_id = config.authId;
+    const reply = await forwardToVobiz('POST', '/api/v1/devices/register', device, [device.push_token]);
+    if (reply.status >= 200 && reply.status < 300) {
+      log('ok', `Push: device ${short(device.device_id)} signed up for ${who.username}`);
+    } else {
+      log('!!', `Push: Vobiz refused to sign up device ${short(device.device_id)} for ${who.username} (${reply.status}${vobizReason(reply.body)})`);
+    }
+    sendJson(res, reply.status, reply.body);
+  }
+
+  async function onDeviceLogout(req, res) {
+    if (!appCaller(req, res)) return;
+    if (!config.authId || !config.authToken) return sendJson(res, 503, { error: 'VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN are not set' });
+    const body = await readJson(req);
+    const deviceId = typeof body.device_id === 'string' ? body.device_id.trim() : '';
+    if (!deviceId || deviceId.length > DEVICE_FIELDS.device_id) return sendJson(res, 400, { error: 'device_id is required' });
+    const reply = await forwardToVobiz('DELETE', '/api/v1/devices/logout', { device_id: deviceId });
+    // Vobiz's reason is not logged: it could quote the device's push token,
+    // which this request does not carry, so it cannot be blanked out.
+    if (reply.status >= 200 && reply.status < 300) {
+      log('ok', `Push: device ${short(deviceId)} signed out`);
+    } else {
+      log('!!', `Push: Vobiz refused to sign out device ${short(deviceId)} (${reply.status})`);
+    }
+    sendJson(res, reply.status, reply.body);
+  }
+
+  /**
+   * Sends `body` to the Vobiz API at `pathname` with the account's
+   * credentials. Returns what to relay: Vobiz's status and JSON reply, with
+   * the Auth Token, the bridge key and every value in `hide` (push tokens)
+   * blanked out wherever they appear. Never throws: no answer is a 502.
+   */
+  async function forwardToVobiz(method, pathname, body, hide = []) {
+    let response;
+    let text;
+    try {
+      response = await fetchFn(`${config.vobizApi}${pathname}`, {
+        method,
+        headers: { 'X-Auth-ID': config.authId, 'X-Auth-Token': config.authToken, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      });
+      text = await response.text();
+    } catch (error) {
+      log('!!', `Vobiz: ${method} ${pathname} failed: ${error.name === 'TimeoutError' ? 'no answer in 15 s' : error.message}`);
+      return { status: 502, body: { error: 'Vobiz could not be reached' } };
+    }
+    let json;
+    try { json = text ? JSON.parse(text) : {}; } catch { json = { error: text.slice(0, 200) }; }
+    if (!json || typeof json !== 'object') json = { value: json };
+    const secrets = [config.authToken, state.bridgeKey, ...hide].filter((s) => s && s.length >= 8);
+    return { status: response.status, body: hideSecrets(json, secrets) };
+  }
+
+  const endpointCache = { at: 0, names: null };
+
+  /** An access-token identity on this account: "<sub>_<auth id>" (see /token). */
+  function isTokenIdentity(username) {
+    const suffix = `_${config.authId}`.toLowerCase();
+    const name = String(username || '').toLowerCase();
+    return Boolean(config.authId) && name.length > suffix.length && name.endsWith(suffix)
+      && SUB_RE.test(name.slice(0, -suffix.length));
+  }
+
+  /**
+   * Whether `username` is a SIP user of VOBIZ_AUTH_ID's account: an endpoint,
+   * or an access-token identity "<sub>_<auth id>" (an identity the token
+   * creates, not a Console endpoint). null when Vobiz could not be asked.
+   */
+  async function sipUserKnown(username) {
+    if (isTokenIdentity(username)) return true;
+    try {
+      if (!endpointCache.names || Date.now() - endpointCache.at > 60 * 1000) {
+        const endpoints = await listAll('/Endpoint/');
+        endpointCache.names = new Set(endpoints.filter((e) => e.username).map((e) => String(e.username).toLowerCase()));
+        endpointCache.at = Date.now();
+      }
+      return endpointCache.names.has(username.toLowerCase());
+    } catch (error) {
+      log('!!', `Vobiz: could not list endpoints: ${error.message}`);
+      return null;
+    }
   }
 
   // ── Vobiz: signatures, account set-up ────────────────────────────────────────
@@ -1518,6 +1656,29 @@ function esc(value) {
 
 function short(id) {
   return String(id).slice(0, 8);
+}
+
+/**
+ * `value` (any JSON) with every occurrence of each of `secrets` in its
+ * strings replaced, and every string under a key that names a token (such as
+ * push_token) replaced whole.
+ */
+function hideSecrets(value, secrets, key = '') {
+  if (typeof value === 'string') {
+    if (value && /token/i.test(key)) return '[hidden]';
+    return secrets.reduce((text, secret) => text.split(secret).join('[hidden]'), value);
+  }
+  if (Array.isArray(value)) return value.map((item) => hideSecrets(item, secrets, key));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, hideSecrets(item, secrets, name)]));
+  }
+  return value;
+}
+
+/** ": <Vobiz's own reason>" (message, error or detail) for a log line, or ''. */
+function vobizReason(body) {
+  const reason = [body?.message, body?.error, body?.detail].find((v) => typeof v === 'string' && v.trim());
+  return reason ? `: ${reason.trim().slice(0, 120)}` : '';
 }
 
 /** A Vobiz API error for a call that no longer exists. */

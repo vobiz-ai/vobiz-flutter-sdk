@@ -80,9 +80,10 @@ export async function webhook(ctx, pathAndQuery, params = {}, { sign = true, hea
   return { status: response.status, text: await response.text(), headers: signed };
 }
 
-export async function postJson(ctx, pathname, body, headers = {}) {
+/** Sends `body` as JSON with `method`. Returns { status, json, text }. */
+export async function requestJson(ctx, method, pathname, body, headers = {}) {
   const response = await fetch(`${ctx.base}${pathname}`, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
   });
@@ -91,6 +92,8 @@ export async function postJson(ctx, pathname, body, headers = {}) {
   try { json = JSON.parse(text); } catch { /* not JSON */ }
   return { status: response.status, json, text };
 }
+
+export const postJson = (ctx, pathname, body, headers = {}) => requestJson(ctx, 'POST', pathname, body, headers);
 
 /** Pulls an attribute value out of returned XML. */
 export function xmlAttr(xml, element, attr) {
