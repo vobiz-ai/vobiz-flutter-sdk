@@ -13,6 +13,7 @@ import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
 import 'call_harness.dart';
+import 'network_fakes.dart' show eventually;
 import 'services_auth_support.dart';
 
 /// A loopback SIP-over-WebSocket registrar that validates access tokens the
@@ -80,12 +81,6 @@ class _TokenRegistrar {
       await ws.close();
     }
     await _server.close(force: true);
-  }
-}
-
-Future<void> _until(bool Function() condition) async {
-  for (var i = 0; i < 300 && !condition(); i++) {
-    await Future<void>.delayed(const Duration(milliseconds: 10));
   }
 }
 
@@ -210,7 +205,7 @@ void main() {
       registrar.accepted.add(t);
       final client = newClient();
       await client.connectWithAccessToken(t);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
 
       expect(client.isConnected, isTrue);
       expect(client.authMode, VobizAuthMode.accessToken);
@@ -233,7 +228,7 @@ void main() {
       final errors = <ErrorEvent>[];
       client.errorEvents.listen(errors.add);
       await client.connectWithAccessToken(token());
-      await _until(() => errors.isNotEmpty);
+      await eventually(() => errors.isNotEmpty);
 
       expect(client.isConnected, isFalse);
       expect(client.registrationState, RegistrationState.failed);
@@ -262,9 +257,9 @@ void main() {
       registrar.accepted.add(t);
       final client = newClient();
       await client.connectWithAccessToken(t);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       await client.makeCall('+919876543210');
-      await _until(() => registrar.invites.isNotEmpty);
+      await eventually(() => registrar.invites.isNotEmpty);
 
       final invite = registrar.invites.single;
       expect(invite, startsWith('INVITE sip:+919876543210@$sipServer SIP/2.0'));
@@ -278,7 +273,7 @@ void main() {
       registrar.accepted.add(t);
       final client = newClient();
       await client.connectWithAccessToken(t);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
 
       await expectLater(
           client.makeCall('+919876543210'),
@@ -296,13 +291,13 @@ void main() {
       registrar.accepted.addAll(<String>[first, second]);
       final client = newClient();
       await client.connectWithAccessToken(first);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
 
       await client.updateAccessToken(second);
-      await _until(() => registrar.registers.length == 2);
+      await eventually(() => registrar.registers.length == 2);
       expect(header(registrar.registers.last, 'X-Vobiz-Jwt'), second);
       expect(client.accessToken?.token, second);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       expect(client.isConnected, isTrue);
       await client.dispose();
     });
@@ -312,10 +307,10 @@ void main() {
       registrar.accepted.add(good);
       final client = newClient();
       await client.connectWithAccessToken(token(nonce: 'stale'));
-      await _until(() => client.registrationState == RegistrationState.failed);
+      await eventually(() => client.registrationState == RegistrationState.failed);
 
       await client.updateAccessToken(good);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       expect(client.isConnected, isTrue);
       expect(header(registrar.registers.last, 'X-Vobiz-Jwt'), good);
       await client.dispose();
@@ -327,7 +322,7 @@ void main() {
       final client = newClient();
       await expectLater(client.updateAccessToken(t), throwsStateError);
       await client.connectWithAccessToken(t);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       await expectLater(client.updateAccessToken(token(sub: 'someone-else')),
           throwsArgumentError);
       await client.dispose();
@@ -338,7 +333,7 @@ void main() {
       registrar.accepted.add(t);
       final client = newClient();
       await client.connectWithAccessToken(t);
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       await client.disconnect();
       expect(client.accessToken, isNull);
       expect(client.authMode, VobizAuthMode.none);
