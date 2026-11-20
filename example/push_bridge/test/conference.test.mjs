@@ -336,8 +336,9 @@ test('in a conference the connection watch does not beep, and a lost host ends t
     const alice = appAuth('alice');
     const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice);
     assert.equal(added.status, 200);
-    await postJson(ctx, '/call/alive', { call_uuid: CALL }, alice);
+    // Taken before the report: the server's clock for it starts no earlier.
     const lastReport = Date.now();
+    await postJson(ctx, '/call/alive', { call_uuid: CALL }, alice);
     const ended = await until(() => calls(ctx, 'DELETE', `/Conference/${added.json.room}/`)[0], 3000);
     assert.ok(ended, 'the room was ended once the host had been silent for CONF_HOST_LOST_SECONDS');
     assert.ok(Date.now() - lastReport >= 300, 'not before the host had been silent that long');
