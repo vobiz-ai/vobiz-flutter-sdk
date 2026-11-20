@@ -6,6 +6,8 @@
 build/
 .flutter-plugins
 .flutter-plugins-dependencies
+coverage/
+*.log
 
 # IDE and OS files
 .idea/
@@ -24,8 +26,20 @@ example/ios/Flutter/flutter_export_environment.sh
 example/android/app/google-services.json
 example/ios/Runner/GoogleService-Info.plist
 
-# Push bridge: secrets and runtime state (also in example/push_bridge/.gitignore)
-example/push_bridge/.env
+# Secrets and signing files, wherever they are
+.env
+.env.*
+!.env.example
+*firebase-adminsdk*.json
+*.pem
+*.p12
+*.p8
+key.properties
+*.jks
+*.keystore
+
+# Sample server: secrets and runtime state (also in example/push_bridge/.gitignore)
 example/push_bridge/bridge-state.json
+example/push_bridge/bridge-state.json.tmp
 example/push_bridge/*service-account*.json
 example/push_bridge/serviceAccountKey*.json

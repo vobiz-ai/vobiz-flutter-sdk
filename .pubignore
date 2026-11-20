@@ -1,0 +1,53 @@
+# What `flutter pub publish` leaves out of the package.
+#
+# This file replaces the root .gitignore for publishing, so the rules from
+# .gitignore that still matter are repeated here. The .gitignore files inside
+# example/ still apply.
+
+# Dart and Flutter tooling
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+coverage/
+*.log
+
+# IDE and OS files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Secrets and signing files, wherever they are
+.env
+.env.*
+*firebase-adminsdk*.json
+*service-account*.json
+serviceAccountKey*.json
+*.pem
+*.p12
+*.p8
+key.properties
+*.jks
+*.keystore
+
+# Example app: build output and machine-specific files
+example/android/local.properties
+example/android/.gradle/
+example/ios/Pods/
+example/ios/Flutter/Generated.xcconfig
+example/ios/Flutter/flutter_export_environment.sh
+
+# Example app: Firebase config from your own Firebase project
+example/android/app/google-services.json
+example/ios/Runner/GoogleService-Info.plist
+
+# Not part of the package: the example's Node sample server and its tests,
+# and the example app's own tests. The example ships as an app to read and
+# run; its tests, like the server, stay in the repository.
+example/push_bridge/
+example/integration_test/
+example/test/
