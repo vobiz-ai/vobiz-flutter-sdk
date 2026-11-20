@@ -40,8 +40,8 @@ const CALL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  * Builds a bridge without starting it. `options.env` replaces process.env,
  * `options.stateFile` the state file, and `options.deps` lets tests swap the
  * outside world: `vobizApi(method, path, body)` for the Vobiz REST API,
- * `fetch(url, init)` for the requests the server sends itself (device
- * sign-up), `log(tag, message)`.
+ * `fetch(url, init)` for its other requests (device sign-up, the start-up
+ * tunnel check), `log(tag, message)`.
  */
 export function createBridge(options = {}) {
   const env = options.env || process.env;
@@ -850,7 +850,7 @@ export function createBridge(options = {}) {
       log('!!', 'PUBLIC_URL is not set. Start a tunnel to this port and put its https address in .env, then restart.');
     } else {
       try {
-        const response = await fetch(`${config.publicUrl}/health`, { signal: AbortSignal.timeout(10000) });
+        const response = await fetchFn(`${config.publicUrl}/health`, { signal: AbortSignal.timeout(10000) });
         const body = await response.json().catch(() => ({}));
         if (body.instance === INSTANCE) {
           log('ok', `Tunnel: ${config.publicUrl} reaches this server`);
