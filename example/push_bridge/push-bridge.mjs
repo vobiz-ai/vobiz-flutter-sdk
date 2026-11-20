@@ -54,7 +54,8 @@ export function createBridge(options = {}) {
     vobizApi: (env.VOBIZ_API_URL || 'https://api.vobiz.ai').trim().replace(/\/+$/, ''),
     authId: (env.VOBIZ_AUTH_ID || '').trim(),
     authToken: (env.VOBIZ_AUTH_TOKEN || '').trim(),
-    number: (env.VOBIZ_NUMBER || '').trim(),
+    // E.164 with its +, also when written as digits only.
+    number: (env.VOBIZ_NUMBER || '').trim().replace(/^(?=\d+$)/, '+'),
     appName: (env.VOBIZ_APP_NAME || 'Vobiz_Flutter_Push_Bridge').trim(),
     forceAttach: env.FORCE_ATTACH === 'true',
     ringSeconds: clampInt(env.RING_SECONDS, 45, 15, 120),
@@ -819,7 +820,7 @@ export function createBridge(options = {}) {
     }
     if (!app.app_id) throw new Error('Vobiz did not return the new application ID');
 
-    const e164 = config.number.startsWith('+') ? config.number : `+${config.number}`;
+    const e164 = config.number;
     let number = null;
     for (let page = 1; page <= 50 && !number; page += 1) {
       const list = await vobizApi('GET', `/numbers?page=${page}&per_page=100`);

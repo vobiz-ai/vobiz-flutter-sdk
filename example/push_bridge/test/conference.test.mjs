@@ -221,6 +221,18 @@ test('an app can only turn its own SIP user\'s call into a conference', async ()
   }
 });
 
+test('VOBIZ_NUMBER written without its + is still the default caller ID', async () => {
+  const ctx = await startBridge({ env: { VOBIZ_NUMBER: ' 919800000001 ' }, apiHandler: vobiz({ owner: 'alice' }) });
+  try {
+    assert.equal(ctx.bridge.config.number, CALLER_ID);
+    const ok = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, appAuth('alice'));
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal(calls(ctx, 'POST', '/Call/')[0].body.from, CALLER_ID);
+  } finally {
+    await ctx.stop();
+  }
+});
+
 test('the bridge key may manage any live call; bad input is refused', async () => {
   const ctx = await startBridge({ apiHandler: vobiz() });
   try {
