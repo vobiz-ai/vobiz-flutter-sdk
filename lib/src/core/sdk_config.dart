@@ -63,8 +63,10 @@ class SdkConfig {
   /// The default, [defaultWebhookUrl], is the shared Vobiz demo server. It is
   /// only used in demo mode ([unsafeDemoZeroConfig]): its recordings list is
   /// shared by everyone who uses it, so the SDK will not read it otherwise.
-  /// Production apps that use transfers or recordings set this to their own
-  /// server.
+  /// A server of your own here must implement the Playground server's
+  /// routes. Its recordings list is read with no authentication, so anyone
+  /// who finds the URL can read it too: keep recording URLs behind your own
+  /// API in production instead.
   ///
   /// Zero-Config Setup points the account's application at `<backendUrl>/api/answer`,
   /// so Vobiz must be able to reach it over HTTPS. Transfers and the recordings

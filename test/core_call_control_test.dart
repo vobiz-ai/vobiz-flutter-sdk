@@ -123,6 +123,28 @@ void main() {
     expect(methods(sent), <String>['INFO'], reason: 'no BYE for a call that is gone');
   });
 
+  test('a BYE still in flight on this very socket is not sent again; after a new socket it is, once', () {
+    final first = FakeSocket();
+    final s = SIPService(wsUrl: 'wss://test', sipServer: 'registrar.vobiz.ai')..debugAttachSocket(first);
+    s.register('play1', 'secret');
+    s.debugReceive(respond(first.fakeSink.sent.last, 200, 'OK'));
+    s.debugReceive(inboundInvite());
+    s.answer('v=0');
+    s.hangup();
+    int byes(FakeSocket socket) => methods(socket.fakeSink.sent).where((m) => m == 'BYE').length;
+    expect(byes(first), 1);
+    // A refresh answered on the same socket: the BYE's answer may still come.
+    expect(s.refreshRegistration(), isTrue);
+    s.debugReceive(respond(first.fakeSink.sent.last, 200, 'OK'));
+    expect(byes(first), 1);
+    // Registered on a new socket: the BYE goes again there, once.
+    final second = FakeSocket();
+    s.debugAttachSocket(second);
+    s.register('play1', 'secret');
+    s.debugReceive(respond(second.fakeSink.sent.last, 200, 'OK'));
+    expect(byes(second), 1);
+  });
+
   group('a late INVITE', () {
     test('with a To tag for a call that has ended gets 481 and does not ring', () {
       final sent = <String>[];

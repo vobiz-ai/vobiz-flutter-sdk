@@ -23,9 +23,10 @@ import 'reconnect_policy.dart';
 /// - When the network comes back, or moves (Wi-Fi to mobile), the socket is
 ///   bound to an interface that no longer exists, so it reconnects at once
 ///   instead of waiting for the keep-alive to notice. During a call it calls
-///   [onHandover] (ICE restart is the call layer's job) and leaves a socket
-///   that has not been reported dead alone; the keep-alive still catches a
-///   dead one. Back from no network at all, it reconnects even during a call.
+///   [onHandover] and leaves a socket that has not been reported dead alone;
+///   the keep-alive still catches a dead one, and the call layer restarts
+///   ICE if the call's audio is lost. Back from no network at all, it
+///   reconnects even during a call.
 /// - An attempt that opens the socket but is not registered within
 ///   [registerTimeout] counts as failed.
 @internal
@@ -55,8 +56,9 @@ class ConnectionSupervisor {
   /// instead of replacing the socket.
   final bool Function()? hasActiveCall;
 
-  /// Called when the network changes during a call: the hook for an ICE
-  /// restart (re-INVITE) on the new interface.
+  /// Called when the network changes during a call while the socket is kept.
+  /// The client only logs it: if the audio does not survive the change, ICE
+  /// reports the loss and the client restarts ICE then.
   final void Function(NetworkStatus from, NetworkStatus to)? onHandover;
 
   final Duration registerTimeout;

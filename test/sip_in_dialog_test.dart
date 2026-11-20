@@ -147,6 +147,31 @@ void main() {
       });
     }
 
+    test('OPTIONS (the registrar\'s ping) and INFO get 200 with their own CSeq', () {
+      s.debugReceive(_inDialog('OPTIONS', cseq: 106));
+      s.debugReceive(_inDialog('INFO', cseq: 107));
+      expect(sent.map(firstLine), <String>['SIP/2.0 200 OK', 'SIP/2.0 200 OK']);
+      expect(headerOf(sent[0], 'CSeq'), '106 OPTIONS');
+      expect(headerOf(sent[1], 'CSeq'), '107 INFO');
+    });
+
+    test('a re-INVITE while ours is pending gets 491, and ours still completes', () {
+      final ours = s.reInvite('v=0\r\no=- 7 2 IN IP4 0.0.0.0\r\na=sendonly');
+      final reInvite = sent.single;
+      sent.clear();
+      s.debugReceive(_inDialog('INVITE', cseq: 108, sdp: 'v=0\r\no=- 1 2 IN IP4 10.0.2.9'));
+      expect(firstLine(sent.single), 'SIP/2.0 491 Request Pending');
+      s.debugReceive(respond(reInvite, 200, 'OK', body: _remoteSdp));
+      expect(ours, completion(_remoteSdp));
+    });
+
+    test('a BYE with a Q.850 Reason ends the call with that reason in words', () {
+      s.debugReceive('${_inDialog('BYE', cseq: 109)}'
+          .replaceFirst('Content-Length: 0', 'Reason: Q.850;cause=16;text="NORMAL_CLEARING"\r\nContent-Length: 0'));
+      expect(firstLine(sent.single), 'SIP/2.0 200 OK');
+      expect(ended, <String?>['NORMAL_CLEARING (Q.850 16)']);
+    });
+
     test('an unknown method gets 501', () {
       s.debugReceive(_inDialog('FROB', cseq: 105));
       expect(firstLine(sent.single), 'SIP/2.0 501 Not Implemented');

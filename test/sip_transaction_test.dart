@@ -102,6 +102,15 @@ void main() {
       expect(methods(sent), <String>['ACK']);
       expect(branchOf(sent.single), branchOf(first));
     });
+
+    test('a 200 that comes after a hang-up with no provisional response is ACKed, then ended with BYE', () {
+      final invite = placeCall();
+      s.hangup();
+      expect(sent, isEmpty, reason: 'no CANCEL before a provisional response');
+      s.debugReceive(respond(invite, 200, 'OK', headers: <String>['Contact: <sip:ms@10.0.2.9>'], body: 'v=0'));
+      expect(methods(sent), <String>['ACK', 'BYE']);
+      expect(answered, isEmpty);
+    });
   });
 
   group('final responses to INVITE (#21, #24)', () {
@@ -368,6 +377,15 @@ void main() {
       sent.clear();
       s.hangup();
       expect(methods(sent), <String>['BYE']);
+    });
+
+    test('a declined INVITE frees the line: the next call rings instead of getting 486', () {
+      s.debugReceive(inboundInvite());
+      s.reject(480, 'Temporarily Unavailable');
+      expect(firstLine(sent.last), 'SIP/2.0 480 Temporarily Unavailable');
+      sent.clear();
+      s.debugReceive(inboundInvite(callId: 'in-call-2', branch: 'z9hG4bKkam.2'));
+      expect(firstLine(sent.single), 'SIP/2.0 180 Ringing');
     });
 
     test('reject() on an answered call hangs up with BYE', () {

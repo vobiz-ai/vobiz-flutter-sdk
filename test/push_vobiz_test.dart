@@ -445,7 +445,7 @@ void main() {
         'push_type': 'voip',
         'app_bundle_id': 'ai.vobiz.vobiz_webrtc_example',
         'app_version': '1.0.0',
-        'sdk_version': '0.2.0',
+        'sdk_version': VobizClient.sdkVersion,
         'sip_username': 'play1',
       });
     });

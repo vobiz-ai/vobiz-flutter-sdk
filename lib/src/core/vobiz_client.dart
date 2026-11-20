@@ -44,12 +44,19 @@ import 'sip_headers.dart';
 
 /// Makes and receives Vobiz calls.
 ///
-/// Sign in one of two ways, the same two the Vobiz WebRTC Playground offers:
+/// Sign in with credentials that your own backend hands each user; the
+/// account Auth Token never belongs on a device:
 ///
-/// - **Zero-Config Setup** — [connectWithAuthToken] with the account's Auth ID
-///   and Auth Token. The webhook server provisions the SIP endpoint.
-/// - **SIP Direct** — [connectWithCredentials] with an existing endpoint's
-///   SIP username and password.
+/// - `connectWithCredentialsProvider`: a SIP endpoint's username and
+///   password from your backend, fetched again whenever the registrar
+///   refuses them.
+/// - [connectWithAccessToken] or `connectWithAccessTokenProvider`: an access
+///   token (JWT) your backend minted; the provider renews it.
+/// - [connectWithCredentials] (SIP Direct): an endpoint's username and
+///   password you already hold.
+/// - [connectWithAuthToken] (Zero-Config Setup): **demo only**. It sends the
+///   account Auth ID and Auth Token to the webhook server and throws unless
+///   [SdkConfig.unsafeDemoZeroConfig] is set.
 ///
 /// No credentials are compiled in: whoever uses the app supplies them.
 class VobizClient {
@@ -447,7 +454,7 @@ class VobizClient {
         registrationState: _registrationState,
         message: 'Setup failed: ${explained.message}',
       ));
-      _emitError('setup_failed', explained.message, e);
+      _emitError(VobizErrorCode.setupFailed, explained.message, e);
       throw explained;
     }
     // Signed out, or in again, while the server was provisioning: do not
@@ -841,8 +848,9 @@ class VobizClient {
   /// Calls [destination], a phone number in E.164 format such as
   /// `+919876543210`.
   ///
-  /// - [callerId]: the number to present, sent as `X-VH-Caller-ID`. Carriers
-  ///   need a number the account owns (purchased or trial) to reach a phone.
+  /// - [callerId]: the number to present, sent as `X-VH-Caller-ID`, in E.164
+  ///   format with its plus (`+919876543210`). Carriers need a number the
+  ///   account owns (purchased or trial) to reach a phone.
   /// - [headers]: custom `X-VH-` headers. Vobiz passes each one to the answer
   ///   webhook as a parameter.
   /// - [record]: record the whole call (`X-VH-Record: true`). The recording
@@ -932,7 +940,7 @@ class VobizClient {
       // Ends the reservation, and the INVITE if it already went out.
       if (_callId == callId) _sip.hangup();
       await _cleanupCall(callId);
-      _emitError('make_call_failed', 'Could not start the call', e);
+      _emitError(VobizErrorCode.makeCallFailed, 'Could not start the call', e);
       rethrow;
     }
   }
@@ -949,7 +957,7 @@ class VobizClient {
     final all = <String, String>{...headers};
     final cli = callerId?.trim() ?? '';
     if (cli.isNotEmpty) {
-      if (!_callerIdPattern.hasMatch(cli)) {
+      if (!e164Number.hasMatch(cli)) {
         throw ArgumentError(
             'Caller ID must be a phone number in E.164 format, such as +919876543210');
       }
@@ -971,8 +979,6 @@ class VobizClient {
     if (raw.isEmpty) return '';
     return raw.replaceFirst(RegExp('^sip:', caseSensitive: false), '').split('@').first;
   }
-
-  static final RegExp _callerIdPattern = RegExp(r'^\+?\d{7,15}$');
 
   /// What cannot be in the user part of the INVITE's Request-URI and To: a
   /// space or control character (CR LF would add header lines), or a
@@ -1114,9 +1120,10 @@ class VobizClient {
   /// [number] (blind) or a SIP endpoint [sipUser], carrying [sipHeaders] on
   /// the new `<Dial>`.
   ///
-  /// [leg] picks what moves: [TransferLeg.aLeg] moves you onto the target and
-  /// drops the other party; [TransferLeg.bLeg] moves the other party and
-  /// drops you.
+  /// [leg] picks what moves, named the way Vobiz names a call's legs:
+  /// [TransferLeg.aLeg] is the side that started the call, [TransferLeg.bLeg]
+  /// the side its `<Dial>` reached. On a call this client placed, aLeg is
+  /// this client; on a call that rang it, aLeg is the caller.
   ///
   /// Needs Zero-Config Setup, because the redirect is made with the
   /// account's Auth ID and Auth Token. Returns the server's confirmation.
@@ -1128,7 +1135,7 @@ class VobizClient {
     Map<String, String> sipHeaders = const <String, String>{},
   }) async {
     final cli = callerId?.trim() ?? '';
-    if (cli.isNotEmpty && !_callerIdPattern.hasMatch(cli)) {
+    if (cli.isNotEmpty && !e164Number.hasMatch(cli)) {
       throw ArgumentError('Caller ID must be a phone number in E.164 format, such as +919876543210');
     }
     if (_callState != CallStateStatus.active) {
@@ -1150,10 +1157,10 @@ class VobizClient {
     if (user.isEmpty == phone.isEmpty) {
       throw ArgumentError('Give either a phone number or a SIP user to transfer to');
     }
-    if (user.isNotEmpty && !RegExp(r'^[a-zA-Z0-9_.\-+]{1,120}$').hasMatch(user)) {
+    if (user.isNotEmpty && !sipUserName.hasMatch(user)) {
       throw ArgumentError('Transfer target must be a SIP endpoint username, such as play123');
     }
-    if (phone.isNotEmpty && !RegExp(r'^\+\d{7,15}$').hasMatch(phone)) {
+    if (phone.isNotEmpty && !e164Number.hasMatch(phone)) {
       throw ArgumentError('Transfer number must be in E.164 format, such as +919876543210');
     }
     final check = VobizSipHeaders.check(sipHeaders);
@@ -1179,7 +1186,7 @@ class VobizClient {
       );
       return '${reply['message'] ?? 'Transfer accepted'}';
     } on VobizException catch (e) {
-      _emitError('transfer_failed', e.message, e);
+      _emitError(VobizErrorCode.transferFailed, e.message, e);
       rethrow;
     }
   }
@@ -1193,7 +1200,7 @@ class VobizClient {
     try {
       return await _api.recordings(webhookUrl: backendUrl);
     } on VobizException catch (e) {
-      _emitError('recordings_failed', e.message, e);
+      _emitError(VobizErrorCode.recordingsFailed, e.message, e);
       rethrow;
     }
   }
@@ -1311,7 +1318,7 @@ class VobizClient {
         await _peer.completeHold(answer);
       } catch (e) {
         if (_callId != id) return; // the call ended meanwhile
-        final code = hold ? 'hold_failed' : 'resume_failed';
+        final code = hold ? VobizErrorCode.holdFailed : VobizErrorCode.resumeFailed;
         final gone = e is SipRequestFailed && e.statusCode == 481;
         if (gone) {
           // Vobiz no longer has this call (its BYE was lost): end it here
@@ -1380,7 +1387,7 @@ class VobizClient {
       ));
       // A refused access token carries the registrar's reason (10001-10010).
       _emitError(
-          'registration_failed',
+          VobizErrorCode.registrationFailed,
           reason,
           _accessToken == null
               ? null
@@ -1435,7 +1442,7 @@ class VobizClient {
       registrationState: _registrationState,
       message: 'Socket error: $reason',
     ));
-    _emitError('socket_error', reason, null);
+    _emitError(VobizErrorCode.socketError, reason, null);
     _onSignalingLost();
     if (!_config.autoReconnect) return;
     if (immediately) {
@@ -1501,7 +1508,7 @@ class VobizClient {
         _logger.error('Failed to apply remote answer: $e');
         await _terminate(id,
             message: 'Could not connect audio', reason: 'answer_failed');
-        _emitError('answer_failed', 'Could not connect audio', e);
+        _emitError(VobizErrorCode.answerFailed, 'Could not connect audio', e);
       }
     };
 
@@ -1685,7 +1692,7 @@ class VobizClient {
         registrationState: _registrationState,
         message: 'Connection failed: $e',
       ));
-      _emitError('connect_failed', 'Could not connect', e);
+      _emitError(VobizErrorCode.connectFailed, 'Could not connect', e);
       // SIPService does not call onSocketError when connect fails, so a
       // first sign-in schedules its reconnect here.
       if (_config.autoReconnect) _scheduleReconnect('Could not connect: $e');
@@ -1774,7 +1781,7 @@ class VobizClient {
           registrationState: _registrationState,
           message: event.reason ?? 'Reconnect failed',
         ));
-        _emitError('reconnect_failed', event.reason ?? 'Reconnect failed', null);
+        _emitError(VobizErrorCode.reconnectFailed, event.reason ?? 'Reconnect failed', null);
         break;
       case NetworkEventType.online:
       case NetworkEventType.networkChanged:
@@ -1893,7 +1900,7 @@ class VobizClient {
           reason: 'answer_failed',
           declineCode: declineCode,
           declinePhrase: declinePhrase);
-      _emitError('answer_failed', why, e);
+      _emitError(VobizErrorCode.answerFailed, why, e);
     }
   }
 
@@ -1913,7 +1920,7 @@ class VobizClient {
         _logger.warn('Call setup timeout for $callId');
         await _terminate(callId,
             message: 'Call setup timed out', reason: 'setup_timeout');
-        _emitError('call_timeout', 'Call setup timed out', null);
+        _emitError(VobizErrorCode.callTimeout, 'Call setup timed out', null);
       }
     });
   }
@@ -1956,7 +1963,7 @@ class VobizClient {
       _logger.warn('Call $callId did not recover; ending it');
       await _terminate(callId,
           message: 'Network connection lost', reason: 'network_lost');
-      _emitError('network_lost', 'The call was lost with the network', null);
+      _emitError(VobizErrorCode.networkLost, 'The call was lost with the network', null);
     });
   }
 

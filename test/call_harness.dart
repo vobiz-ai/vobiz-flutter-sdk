@@ -17,10 +17,6 @@ class FakePeerConnection extends Fake implements RTCPeerConnection {
   final FakePeer peer;
 
   @override
-  Future<RTCIceGatheringState?> getIceGatheringState() async =>
-      RTCIceGatheringState.RTCIceGatheringStateComplete;
-
-  @override
   Future<RTCSessionDescription?> getLocalDescription() {
     final gate = peer.localDescriptionGate;
     if (gate != null) return gate.future;

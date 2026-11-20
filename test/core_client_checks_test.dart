@@ -35,6 +35,11 @@ void main() {
     expect(s.accessTokenExpiresIn, isNull);
   });
 
+  test('a caller ID needs its plus, the one E.164 rule transfers and conferences use too', () {
+    expect(() => VobizClient.buildCallHeaders(callerId: '919876543210'), throwsArgumentError);
+    expect(VobizClient.buildCallHeaders(callerId: '+919876543210')[VobizSipHeaders.callerId], '+919876543210');
+  });
+
   test('sign-out leaves no password or token in the SIP layer', () async {
     final h = Harness();
     expect(h.sip.debugHasCredentials, isTrue);

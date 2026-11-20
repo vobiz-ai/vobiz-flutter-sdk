@@ -181,33 +181,4 @@ void main() {
     });
   });
 
-  // ── CredentialConfig ───────────────────────────────────────────────────────
-
-  group('CredentialConfig', () {
-    test('stores username and password', () {
-      const cred = CredentialConfig(
-        username: 'alice',
-        password: 's3cr3t',
-      );
-      expect(cred.username, equals('alice'));
-      expect(cred.password, equals('s3cr3t'));
-      expect(cred.displayName, isNull);
-    });
-  });
-
-  // ── CallStateStatus ────────────────────────────────────────────────────────
-
-  group('CallStateStatus', () {
-    test('contains all expected states', () {
-      const states = CallStateStatus.values;
-      expect(states, contains(CallStateStatus.idle));
-      expect(states, contains(CallStateStatus.incoming));
-      expect(states, contains(CallStateStatus.ringing));
-      expect(states, contains(CallStateStatus.connecting));
-      expect(states, contains(CallStateStatus.active));
-      expect(states, contains(CallStateStatus.held));
-      expect(states, contains(CallStateStatus.ended));
-      expect(states, contains(CallStateStatus.failed));
-    });
-  });
 }
