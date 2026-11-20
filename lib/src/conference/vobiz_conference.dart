@@ -183,7 +183,7 @@ class VobizConferenceState {
 ///
 /// The first [add] moves both sides of the call into a room (Vobiz Transfer
 /// API) and dials the new person into it (Call API); later ones only dial.
-/// The example app's push bridge implements the routes
+/// The example's sample server implements the routes
 /// (example/push_bridge/README.md, "Conference"); a production app puts
 /// them in its own backend.
 ///
@@ -260,7 +260,8 @@ class VobizConference {
   /// The [_generation] whose call this class has already hung up.
   int _hungUpGeneration = -1;
 
-  static final RegExp _e164 = RegExp(r'^\+\d{6,15}$');
+  /// The same rule as `VobizClient.transferCall`: a plus and 7 to 15 digits.
+  static final RegExp _e164 = RegExp(r'^\+\d{7,15}$');
   static final RegExp _sipUser = RegExp(r'^[A-Za-z0-9_.\-+]{1,120}$');
 
   /// The current call's conference, or null when it is not one.
@@ -295,14 +296,19 @@ class VobizConference {
     }
     final uuid = _uuid ?? _currentCallUuid();
     if (uuid == null) throw StateError('Vobiz has not reported a CallUUID for this call yet');
+    final generation = _generation;
     final state = await _send('/conference/add', <String, Object?>{
       'call_uuid': uuid,
       if (number != null) 'number': number,
       if (user != null) 'user': user,
       if (callerId != null && callerId.isNotEmpty) 'caller_id': callerId,
     });
-    _uuid = uuid;
-    _startPolling();
+    // The call ended (or this object was disposed) while the server answered:
+    // its id must not come back for the next call.
+    if (_isCurrent(generation)) {
+      _uuid = uuid;
+      _startPolling();
+    }
     return state;
   }
 
@@ -332,23 +338,39 @@ class VobizConference {
 
   /// Ends the conference for everyone, this app's call included.
   Future<VobizConferenceState> end() async {
-    final state = await _send('/conference/end', <String, Object?>{'call_uuid': _requireConference()});
-    _stopPolling();
-    _hangUpEndedCall();
+    final uuid = _requireConference();
+    final generation = _generation;
+    final state = await _send('/conference/end', <String, Object?>{'call_uuid': uuid});
+    // Only the call this conference was for: never a call that came after.
+    if (_isCurrent(generation)) {
+      _stopPolling();
+      _hangUpEndedCall();
+    }
     return state;
   }
 
   /// Asks your server for the conference now. Null when the current call is
   /// not a conference.
+  ///
+  /// A conference this object did not start (another [VobizConference] made
+  /// the [add] for the same call) is taken over: its controls work and
+  /// [state] is refreshed from then on.
   Future<VobizConferenceState?> refresh() async {
     final uuid = _uuid ?? _currentCallUuid();
     if (uuid == null) return null;
+    final generation = _generation;
+    final VobizConferenceState state;
     try {
-      return await _send('/conference/state', <String, Object?>{'call_uuid': uuid});
+      state = await _send('/conference/state', <String, Object?>{'call_uuid': uuid});
     } on VobizException catch (e) {
       if (e.statusCode == 404) return null;
       rethrow;
     }
+    if (_uuid == null && state.active && _isCurrent(generation)) {
+      _uuid = uuid;
+      _startPolling();
+    }
+    return state;
   }
 
   /// Stops listening to the client and closes the HTTP client if this
@@ -371,6 +393,10 @@ class VobizConference {
     if (uuid == null) throw StateError('The current call is not a conference');
     return uuid;
   }
+
+  /// Whether the call a request was sent for ([generation]) is still the
+  /// current one, and this object still in use.
+  bool _isCurrent(int generation) => !_disposed && generation == _generation;
 
   void _onCallEvent(CallEvent event) {
     if (event.state != CallStateStatus.ended && event.state != CallStateStatus.failed) return;
