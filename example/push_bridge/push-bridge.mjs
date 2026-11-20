@@ -19,7 +19,7 @@
  * (X-Bridge-Key) and the SIP user it is signed in as (X-Bridge-User).
  * README.md has the app ↔ server protocol.
  *
- * Node 18 or newer, no npm packages. Settings come from a .env file next to
+ * Node 22 or newer, no npm packages. Settings come from a .env file next to
  * this script (see .env.example) or from environment variables.
  *
  *   node push-bridge.mjs
