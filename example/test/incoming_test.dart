@@ -196,6 +196,36 @@ void main() {
       expect(controller.history.records.first.outcome, CallOutcome.outgoing);
     });
 
+    test('a transfer sends the caller ID as + and digits, or none when it is empty', () async {
+      await start();
+      await signIn();
+      client.direction = CallDirection.outbound;
+      client.emit(CallStateStatus.active, dir: CallDirection.outbound);
+      await pumpEventQueue();
+      controller
+        ..transferTarget = TransferTarget.number
+        ..transferNumber = '9876543210';
+      await controller.transfer();
+      controller.callerIdNumber = '9999999999';
+      await controller.transfer();
+      expect(client.transferCallerIds, <String?>[null, '+919999999999']);
+      client.emit(CallStateStatus.ended, dir: CallDirection.outbound);
+      await pumpEventQueue();
+    });
+
+    test('a destination the SDK refuses is shown in the Trace, and the dialer is back', () async {
+      await start();
+      await signIn();
+      controller
+        ..callerIdNumber = '9999999999'
+        ..destNumber = '9876543210';
+      client.failMakeCall = ArgumentError('The destination must not contain a space');
+      await controller.call();
+      expect(controller.logs.last.message, contains('must not contain a space'));
+      expect(controller.status, PhoneStatus.online);
+      expect(platform.requests.last, 'stop', reason: 'the call service started for it is stopped');
+    });
+
     test('a call answered in the app runs under the service', () async {
       await start();
       await signIn();

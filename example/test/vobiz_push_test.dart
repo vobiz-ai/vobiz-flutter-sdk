@@ -189,7 +189,8 @@ void main() {
 
     test('a stale Vobiz push rings nothing', () async {
       await start();
-      platform.pushController.add(vobizPush(inSeconds: -5));
+      // Well past expiry: the SDK still takes a push up to 30 s late (a fast phone clock).
+      platform.pushController.add(vobizPush(inSeconds: -120));
       await pumpEventQueue();
       expect(screen.shown, isEmpty);
       expect(client.actions.where((a) => a.startsWith('handleIncomingPush')), isEmpty);

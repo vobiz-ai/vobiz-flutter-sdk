@@ -617,6 +617,16 @@ class PlaygroundController extends ChangeNotifier {
       connectError = token ? 'Access token error: ${e.message}' : 'API Setup Error: ${e.message}';
       log(connectError!, LogType.error);
       _setStatus(PhoneStatus.offline, 'Error');
+    } on ArgumentError catch (e) {
+      // Refused before anything was sent (a SIP username with a space, say).
+      if (session_ != _session) return;
+      _loginTimeout?.cancel();
+      connectedAs = null;
+      await _stopTokenSession();
+      connectError = 'Sign-in refused: ${e.message}';
+      if (sip) missingFields = <String>{'sipUsername'};
+      log(connectError!, LogType.error);
+      _setStatus(PhoneStatus.offline, 'Error');
     } catch (e) {
       if (session_ != _session) return;
       _loginTimeout?.cancel();
@@ -819,7 +829,7 @@ class PlaygroundController extends ChangeNotifier {
     if (destNumber.trim().isEmpty) return log('Please enter a destination', LogType.error);
     if (!client.isConnected) return log('Login first', LogType.error);
     final cli = callerId;
-    if (cli.isEmpty || !RegExp(r'^\+?\d{7,15}$').hasMatch(cli)) {
+    if (cli.isEmpty || !RegExp(r'^\+\d{7,15}$').hasMatch(cli)) {
       return log('⚠️ Caller ID is required for PSTN calls. Enter a verified number '
           '(e.g. +919876543210)', LogType.error);
     }
@@ -1029,7 +1039,8 @@ class PlaygroundController extends ChangeNotifier {
         number: transferTarget == TransferTarget.number ? transferDestination : null,
         sipUser: transferTarget == TransferTarget.user ? user : null,
         leg: transferLeg,
-        callerId: callerId,
+        // `+` and digits, as the SDK requires, or none (the account's default).
+        callerId: callerId.isEmpty ? null : callerId,
         sipHeaders: built.headers,
       );
       transferStatus = TransferStatus.accepted;
@@ -1551,7 +1562,7 @@ class PlaygroundController extends ChangeNotifier {
     final id = pushAuthId.trim().isNotEmpty ? pushAuthId.trim() : authId.trim();
     final token = pushAuthToken.trim().isNotEmpty ? pushAuthToken.trim() : authToken.trim();
     if (id.isEmpty || token.isEmpty) return null;
-    return VobizPushDevices.accountHeaders(id, token);
+    return <String, String>{'X-Auth-ID': id, 'X-Auth-Token': token};
   }
 
   /// This install's id with Vobiz push: made once, then kept.
@@ -2121,9 +2132,8 @@ class PlaygroundController extends ChangeNotifier {
         _endCallScreen();
         _resetCallState();
         break;
-      case CallStateStatus.idle:
-      case CallStateStatus.outgoing:
-      case CallStateStatus.held:
+      // idle, held: nothing to show.
+      default:
         break;
     }
   }

@@ -301,6 +301,22 @@ void main() {
       controller.dispose();
     });
 
+    test('a SIP username the SDK refuses is shown under Connect, not thrown', () async {
+      final controller = make();
+      await controller.init();
+      controller.setAuthTab(AuthTab.sipDirect);
+      controller
+        ..sipUsername = 'play 1'
+        ..sipPassword = 'pw';
+      client.failConnect = ArgumentError.value('play 1', 'username', 'must not contain a space');
+      await controller.connect();
+      expect(controller.connectError, startsWith('Sign-in refused:'));
+      expect(controller.connectError, contains('must not contain a space'));
+      expect(controller.missingFields, contains('sipUsername'));
+      expect(controller.status, PhoneStatus.offline);
+      controller.dispose();
+    });
+
     test('the registrar refusing the login shows Login failed', () async {
       final controller = make();
       await controller.init();

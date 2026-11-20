@@ -34,7 +34,8 @@ void main() {
     });
 
     test('a push past its expiry is stale', () {
-      final stale = PushCall.fromData(vobiz(expires: DateTime.now().subtract(const Duration(seconds: 5))))!;
+      // Well past expiry: the SDK still takes a push up to 30 s late (a fast phone clock).
+      final stale = PushCall.fromData(vobiz(expires: DateTime.now().subtract(const Duration(minutes: 2))))!;
       expect(stale.sdkPush!.isExpired(), isTrue);
       final live = PushCall.fromData(vobiz(expires: DateTime.now().add(const Duration(seconds: 30))))!;
       expect(live.sdkPush!.isExpired(), isFalse);

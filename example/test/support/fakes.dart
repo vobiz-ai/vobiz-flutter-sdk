@@ -151,6 +151,10 @@ class FakeClient implements VobizClient {
     mode = VobizAuthMode.none;
   }
 
+  /// When set, [makeCall] throws it before anything is sent, as the SDK
+  /// does for a destination or caller ID it refuses.
+  Object? failMakeCall;
+
   @override
   Future<String> makeCall(
     String destination, {
@@ -160,9 +164,27 @@ class FakeClient implements VobizClient {
     String? dialUser,
   }) async {
     actions.add('makeCall');
+    final fail = failMakeCall;
+    if (fail != null) throw fail;
     state = CallStateStatus.connecting;
     direction = CallDirection.outbound;
     return 'out-1';
+  }
+
+  /// The caller ID of each [transferCall].
+  final List<String?> transferCallerIds = <String?>[];
+
+  @override
+  Future<String> transferCall({
+    String? number,
+    String? sipUser,
+    TransferLeg leg = TransferLeg.aLeg,
+    String? callerId,
+    Map<String, String> sipHeaders = const <String, String>{},
+  }) async {
+    actions.add('transferCall');
+    transferCallerIds.add(callerId);
+    return 'Transfer accepted';
   }
 
   @override
