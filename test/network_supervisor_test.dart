@@ -1,6 +1,7 @@
 // Issue #18: reconnect backoff with a cap, a terminal event, offline gating,
 // and an immediate reconnect when the network comes back or changes.
 // ignore_for_file: implementation_imports
+import 'dart:async';
 import 'dart:math';
 
 import 'package:fake_async/fake_async.dart';
@@ -21,6 +22,8 @@ class _Harness {
       monitor: monitor,
       reconnect: () async {
         attempts++;
+        final pending = gate;
+        if (pending != null) await pending.future;
         if (failAttempts) throw StateError('refused');
       },
       onEvent: events.add,
@@ -37,6 +40,9 @@ class _Harness {
   int attempts = 0;
   bool failAttempts;
   bool activeCall;
+
+  /// While set, an attempt waits for it before it succeeds or fails.
+  Completer<void>? gate;
 
   List<NetworkEventType> get types => events.map((e) => e.type).toList();
 }
@@ -254,6 +260,80 @@ void main() {
         expect(h.attempts, 1);
         async.elapse(const Duration(seconds: 31));
         expect(h.attempts, 1, reason: 'the cancelled timer must not fire');
+        h.supervisor.stop();
+      });
+    });
+
+    test('a sign-in after a sign-out on another network does not take the report for a change', () {
+      fakeAsync((FakeAsync async) {
+        final h = _Harness(failAttempts: false);
+        h.supervisor.start();
+        async.flushMicrotasks();
+        h.supervisor.connected();
+        h.supervisor.stop();
+        h.monitor.mobile(); // while signed out
+        h.supervisor.start();
+        async.flushMicrotasks();
+        // connectivity_plus reports the current network again to a new listener.
+        h.monitor.mobile();
+        async.flushMicrotasks();
+        expect(h.attempts, 0, reason: 'no second connect over the sign-in');
+        expect(h.types, isNot(contains(NetworkEventType.networkChanged)));
+        h.supervisor.stop();
+      });
+    });
+
+    test('the first report after start() is not published as a change', () {
+      fakeAsync((FakeAsync async) {
+        final h = _Harness(failAttempts: false);
+        h.supervisor.start();
+        h.monitor.mobile(); // before current() has answered
+        async.flushMicrotasks();
+        expect(h.events, isEmpty);
+        expect(h.attempts, 0);
+        h.supervisor.stop();
+      });
+    });
+
+    test('an attempt still running across stop() and start() leaves the new session alone', () {
+      fakeAsync((FakeAsync async) {
+        final h = _Harness(failAttempts: false)..gate = Completer<void>();
+        h.supervisor.start();
+        async.flushMicrotasks();
+        h.supervisor.connectionLost('drop');
+        async.elapse(const Duration(seconds: 1));
+        expect(h.attempts, 1, reason: 'in flight, waiting on the gate');
+
+        h.supervisor.stop();
+        h.supervisor.start();
+        async.flushMicrotasks();
+        h.supervisor.connected();
+        h.events.clear();
+        h.failAttempts = true;
+        h.gate!.complete();
+        async.flushMicrotasks();
+        expect(h.events, isEmpty, reason: 'the old attempt failing is not a drop of the new session');
+        expect(h.supervisor.quality, SignalingQuality.good);
+        async.elapse(const Duration(minutes: 1));
+        expect(h.attempts, 1);
+        h.supervisor.stop();
+      });
+    });
+
+    test('asked to reconnect while marked offline, it reads the network again', () {
+      fakeAsync((FakeAsync async) {
+        final h = _Harness(failAttempts: false);
+        h.supervisor.start();
+        async.flushMicrotasks();
+        h.supervisor.connected();
+        h.monitor.goOffline();
+        async.flushMicrotasks();
+        // The network came back, but no report of it arrived.
+        h.monitor.changeSilently(NetworkStatus(const <NetworkType>[NetworkType.wifi]));
+        h.supervisor.reconnectNow(reason: 'app resumed');
+        async.flushMicrotasks();
+        expect(h.types, contains(NetworkEventType.online));
+        expect(h.attempts, 1);
         h.supervisor.stop();
       });
     });

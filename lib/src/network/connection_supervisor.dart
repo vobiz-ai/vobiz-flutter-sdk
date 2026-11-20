@@ -78,6 +78,10 @@ class ConnectionSupervisor {
   int _attempts = 0;
   NetworkStatus? _network;
 
+  // Bumped by stop(): an attempt or a network read still pending from an
+  // earlier sign-in must not act on the next one.
+  int _generation = 0;
+
   bool get isRunning => _running;
 
   /// The device has no network.
@@ -110,6 +114,7 @@ class ConnectionSupervisor {
   /// Stops everything. Call at sign-out.
   void stop() {
     _running = false;
+    _generation++;
     _sub?.cancel();
     _sub = null;
     _retryTimer?.cancel();
@@ -122,6 +127,9 @@ class ConnectionSupervisor {
     _gaveUp = false;
     _reconnecting = false;
     _attempts = 0;
+    // The next sign-in reads the network afresh: a stale one would make its
+    // first report look like a change.
+    _network = null;
   }
 
   /// The connection is up and registered.
@@ -178,6 +186,10 @@ class ConnectionSupervisor {
 
   /// Reconnects now, resetting the backoff: for app resume, a push, or a user
   /// tapping "retry" after [NetworkEventType.reconnectFailed].
+  ///
+  /// While marked offline it asks the monitor again first: a report that the
+  /// network came back can be missed (iOS sends none while the app is in the
+  /// background), and an online answer then reconnects at once.
   void reconnectNow({String reason = 'Reconnect requested'}) {
     if (!_running) return;
     _retryTimer?.cancel();
@@ -188,6 +200,10 @@ class ConnectionSupervisor {
       _connected = false;
       _reconnecting = true;
       _emit(NetworkEventType.reconnecting, reason: 'Waiting for the network');
+      final generation = _generation;
+      monitor.current().then((NetworkStatus status) {
+        if (_running && generation == _generation) _onNetwork(status);
+      }, onError: (Object e) => _logger.warn('Could not read the network: $e'));
       return;
     }
     if (_attemptInFlight) return;
@@ -202,12 +218,14 @@ class ConnectionSupervisor {
       _emit(NetworkEventType.reconnecting, reason: 'Waiting for the network');
       return;
     }
+    final generation = _generation;
     _attemptInFlight = true;
     _attempts++;
     _connected = false;
     _socketAlive = false;
     try {
       await reconnect();
+      if (generation != _generation) return;
       _attemptInFlight = false;
       if (!_running || _connected) return;
       // Socket open; REGISTER must succeed in time or this attempt failed.
@@ -217,6 +235,7 @@ class ConnectionSupervisor {
         if (!_connected) connectionLost('No answer to REGISTER');
       });
     } catch (e) {
+      if (generation != _generation) return;
       _attemptInFlight = false;
       connectionLost('Reconnect failed: $e');
     }
@@ -239,14 +258,14 @@ class ConnectionSupervisor {
       return;
     }
 
-    final cameBack = prev != null && !prev.isOnline;
+    // The first report after start() is not a change.
+    if (prev == null) return;
+    final cameBack = !prev.isOnline;
     _emit(cameBack ? NetworkEventType.online : NetworkEventType.networkChanged,
         previous: prev,
         reason: cameBack
             ? 'Network is back (${next.primary.name})'
             : 'Network changed to ${next.primary.name}');
-    // The first report after start() is not a change.
-    if (prev == null) return;
 
     if (cameBack) {
       // Every network was down. The old socket may never report its death

@@ -940,30 +940,44 @@ class SIPService {
   /// answered without it.
   Future<String?> Function(String offerSdp)? onSessionOffer;
 
+  /// Opens the WebSocket. Throws when it cannot be opened, and
+  /// [SipConnectSuperseded] when [disconnect] or another [connect] replaced
+  /// it before its handshake finished: that socket is closed, and the state
+  /// is left to whatever replaced it.
   Future<void> connect() async {
     _manualDisconnect = false;
     _connectionState.value = SipConnectionState.connecting;
+    WebSocketChannel? socket;
     try {
-      _socket = IOWebSocketChannel.connect(
+      socket = IOWebSocketChannel.connect(
         Uri.parse(wsUrl),
         protocols: const <String>['sip'],
         pingInterval: keepAlive.pingInterval,
         connectTimeout: const Duration(seconds: 20),
       );
+      _socket = socket;
       // Await the actual TCP/TLS/WebSocket handshake. Without this, the
       // TimeoutException from connectTimeout escapes into an unguarded async
       // zone and becomes an Unhandled Exception in the Flutter error handler.
-      await _socket!.ready;
-      _connectionState.value = SipConnectionState.connected;
-      _logger.info('SIP WebSocket connected to $wsUrl');
-      _listenToSocket();
+      await socket.ready;
     } catch (e) {
+      if (socket != null && !identical(socket, _socket)) {
+        throw const SipConnectSuperseded();
+      }
       _connectionState.value = SipConnectionState.disconnected;
       _logger.error('SIP WebSocket connection failed: $e');
       // Don't call onSocketError here — the exception propagates to VobizClient
       // which emits the error event and schedules reconnects in its own catch.
       rethrow;
     }
+    if (!identical(socket, _socket)) {
+      _logger.info('SIP WebSocket to $wsUrl replaced before it opened; closing it');
+      _closeQuietly(socket);
+      throw const SipConnectSuperseded();
+    }
+    _connectionState.value = SipConnectionState.connected;
+    _logger.info('SIP WebSocket connected to $wsUrl');
+    _listenToSocket(socket);
   }
 
   void register(String username, String password) {
@@ -998,6 +1012,18 @@ class SIPService {
   /// From the registrar's last 200 OK (`X-vobiz-Jwt: expires=<s>;epoch-exp=<t>`):
   /// seconds the token had left by the server's clock.
   int? get accessTokenExpiresIn => _accessTokenExpiresIn;
+
+  /// Whether the registration failure just reported to [onRegistrationFailed]
+  /// was temporary: no answer, or a 408, 480 or 5xx without an access-token
+  /// error. Registering again later may work. False for a refusal of the
+  /// credentials (401, 403, 407, a token error code) and any other answer.
+  bool get registrationFailureTemporary => _registrationFailureTemporary;
+  bool _registrationFailureTemporary = false;
+
+  /// A REGISTER answer, or no answer at all ([code] null), that says the
+  /// registrar could not take the registration now rather than refused it.
+  static bool _isTemporaryRegisterFailure(int? code) =>
+      code == null || code == 408 || code == 480 || (code >= 500 && code < 600);
 
   bool get _hasCredentials =>
       _username != null && (_password != null || _accessToken != null);
@@ -1277,7 +1303,9 @@ class SIPService {
       await done.future.timeout(unregisterTimeout, onTimeout: () {
         _logger.warn('No answer to the unregistration; closing anyway');
       });
-      _dropTransactions('REGISTER');
+      // Only this socket's: a sign-in on a new socket may have sent its
+      // REGISTER meanwhile.
+      _dropRegistersSentOn(socket);
       if (identical(_closingSocket, socket)) _closingSocket = null;
     }
     _closeQuietly(socket);
@@ -1324,9 +1352,17 @@ class SIPService {
     });
   }
 
-  void _dropTransactions(String method) {
+  void _dropTransactions(String method) => _dropWhere((tx) => tx.method == method);
+
+  /// A socket that closed, or was replaced, never brings the answer to a
+  /// REGISTER sent on it: drop those, so their timeouts cannot fail a later
+  /// registration.
+  void _dropRegistersSentOn(WebSocketChannel? socket) =>
+      _dropWhere((tx) => tx.method == 'REGISTER' && identical(tx.socket, socket));
+
+  void _dropWhere(bool Function(_ClientTransaction tx) test) {
     _transactions.removeWhere((_, tx) {
-      if (tx.method != method) return false;
+      if (!test(tx)) return false;
       tx.timer?.cancel();
       return true;
     });
@@ -1377,7 +1413,8 @@ class SIPService {
           ? onUnregistered
           : auth.refresh
               ? () => _transportDead(sentOn, 'No answer to the REGISTER refresh')
-              : () => _failRegistration('Registration timed out: no answer from the registrar'),
+              : () => _failRegistration('Registration timed out: no answer from the registrar',
+                  temporary: true),
     );
   }
 
@@ -1787,20 +1824,19 @@ class SIPService {
     _manualDisconnect = false;
     _socket = socket;
     _connectionState.value = SipConnectionState.connected;
-    _listenToSocket();
+    _listenToSocket(socket);
   }
 
   // ---------------------------------------------------------------------------
   // Private — receiving
   // ---------------------------------------------------------------------------
 
-  void _listenToSocket() {
+  void _listenToSocket(WebSocketChannel socket) {
     // Guard so onError + onDone both firing only triggers onSocketError once.
     var errorReported = false;
     // A sign-in replaces the socket. The old one's close arrives later and
     // must not be mistaken for the new connection dropping, which would
     // schedule a reconnect over a healthy session.
-    final socket = _socket!;
     bool isCurrent() => identical(socket, _socket);
 
     socket.stream.listen(
@@ -1815,6 +1851,7 @@ class SIPService {
       onError: (Object e) {
         if (!isCurrent()) return;
         _logger.error('SIP WebSocket error: $e');
+        _dropRegistersSentOn(socket);
         _connectionState.value = SipConnectionState.disconnected;
         _registrationState.value = SipRegistrationState.failed;
         _registrationRefreshTimer?.cancel();
@@ -1827,6 +1864,7 @@ class SIPService {
       onDone: () {
         if (!isCurrent()) return;
         _logger.warn('SIP WebSocket closed');
+        _dropRegistersSentOn(socket);
         _connectionState.value = SipConnectionState.disconnected;
         _registrationRefreshTimer?.cancel();
         _crlfKeepAlive?.stop();
@@ -2159,7 +2197,8 @@ class SIPService {
       }
       final tokenError = _accessTokenErrorIn(msg);
       _accessTokenError = tokenError;
-      _failRegistration(_accessTokenRefusal(code, msg, tokenError));
+      _failRegistration(_accessTokenRefusal(code, msg, tokenError),
+          temporary: tokenError == null && _isTemporaryRegisterFailure(code));
       return;
     }
 
@@ -2247,7 +2286,8 @@ class SIPService {
       _failRegistration('Wrong credentials (403 Forbidden)');
       return;
     }
-    _failRegistration('Registration failed ($code ${_reasonPhrase(msg)})');
+    _failRegistration('Registration failed ($code ${_reasonPhrase(msg)})',
+        temporary: _isTemporaryRegisterFailure(code));
   }
 
   /// The token error code on a refusal (`X-vobiz-Jwt-Error-Code: 10006`).
@@ -2305,11 +2345,14 @@ class SIPService {
 
   /// A registration that cannot go on: report it, stop refreshing and
   /// pinging, and close the socket (once any call on it has ended).
-  void _failRegistration(String reason) {
+  /// [temporary] says whether registering again later may work
+  /// ([registrationFailureTemporary]).
+  void _failRegistration(String reason, {bool temporary = false}) {
     _registrationRefreshTimer?.cancel();
     _crlfKeepAlive?.stop();
     _registrationRefreshDelay = null;
     _registrationState.value = SipRegistrationState.failed;
+    _registrationFailureTemporary = temporary;
     onRegistrationFailed?.call(reason);
     if (_activeCallId != null || _pendingInvite != null) {
       _closeWhenCallEnds = true;
@@ -2326,6 +2369,7 @@ class SIPService {
     _logger.warn('$reason: the WebSocket is dead, closing it');
     // Its close, whenever it comes, is no longer the current socket's.
     _socket = null;
+    _dropRegistersSentOn(socket);
     _registrationRefreshTimer?.cancel();
     _crlfKeepAlive?.stop();
     _registrationRefreshDelay = null;
@@ -2711,6 +2755,15 @@ class SIPService {
       (_) => chars[rand.nextInt(chars.length)],
     ).join();
   }
+}
+
+/// [SIPService.connect] was overtaken: a sign-out or a newer connect replaced
+/// the socket before its handshake finished. Not a connection failure.
+class SipConnectSuperseded implements Exception {
+  const SipConnectSuperseded();
+
+  @override
+  String toString() => 'The connection was replaced before it opened';
 }
 
 /// A SIP request the far end refused or never answered.

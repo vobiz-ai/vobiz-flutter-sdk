@@ -76,25 +76,50 @@ void main() {
   });
 
   group('failures (#22, #16)', () {
-    test('a 5xx fails the registration with its code', () {
+    test('a 5xx fails the registration with its code, as a temporary failure', () {
       s.register('play1', 'secret');
       s.debugReceive(respond(sent.last, 503, 'Service Unavailable'));
       expect(s.registrationState.value, SipRegistrationState.failed);
       expect(failures.single, 'Registration failed (503 Service Unavailable)');
+      expect(s.registrationFailureTemporary, isTrue);
     });
 
-    test('a 404 fails it too', () {
+    test('a 404 fails it too, as a refusal', () {
       s.register('play1', 'secret');
       s.debugReceive(respond(sent.last, 404, 'Not Found'));
       expect(failures.single, contains('404'));
+      expect(s.registrationFailureTemporary, isFalse);
     });
 
-    test('no answer within Timer F fails it', () async {
+    test('no answer within Timer F fails it, as a temporary failure', () async {
       s.transactionTimeout = const Duration(milliseconds: 20);
       s.register('play1', 'secret');
       await Future<void>.delayed(const Duration(milliseconds: 60));
       expect(s.registrationState.value, SipRegistrationState.failed);
       expect(failures.single, contains('timed out'));
+      expect(s.registrationFailureTemporary, isTrue);
+    });
+
+    test('408 and 480 are temporary; 403 and 603 are refusals', () {
+      for (final (code, temporary) in <(int, bool)>[(408, true), (480, true), (500, true), (403, false), (603, false)]) {
+        s.register('play1', 'secret');
+        s.debugReceive(respond(sent.last, code, 'Some reason'));
+        expect(s.registrationFailureTemporary, temporary, reason: '$code');
+      }
+      expect(failures, hasLength(5));
+    });
+
+    test('an access token: a 5xx is temporary, a token error or a 401 is a refusal', () {
+      s.registerWithAccessToken('u_MA1', 'jwt');
+      s.debugReceive(respond(sent.last, 503, 'Service Unavailable'));
+      expect(s.registrationFailureTemporary, isTrue);
+      s.registerWithAccessToken('u_MA1', 'jwt');
+      s.debugReceive(respond(sent.last, 503, 'Service Unavailable',
+          headers: <String>['X-vobiz-Jwt-Error-Code: 10006']));
+      expect(s.registrationFailureTemporary, isFalse);
+      s.registerWithAccessToken('u_MA1', 'jwt');
+      s.debugReceive(respond(sent.last, 401, 'Unauthorized', headers: <String>[_challenge]));
+      expect(s.registrationFailureTemporary, isFalse);
     });
 
     test('a provisional response is not a final one', () {
@@ -110,6 +135,7 @@ void main() {
       expect(headerOf(sent.last, 'Authorization'), startsWith('Digest '));
       s.debugReceive(respond(sent.last, 401, 'Unauthorized', headers: <String>[_challenge]));
       expect(failures.single, contains('wrong password'));
+      expect(s.registrationFailureTemporary, isFalse);
       expect(sent.where((m) => m.startsWith('REGISTER')), hasLength(2));
     });
 
@@ -225,6 +251,25 @@ void main() {
       sent.clear();
       await s.disconnect();
       expect(methods(sent), <String>['BYE', 'REGISTER']);
+    });
+
+    test('a sign-in on a new socket while the old one unregisters keeps its REGISTER', () async {
+      final old = FakeSocket();
+      s
+        ..unregisterTimeout = const Duration(milliseconds: 20)
+        ..debugAttachSocket(old);
+      s.register('play1', 'secret');
+      s.debugReceive(respond(sent.last, 200, 'OK'));
+      // The unregistration goes unanswered while the next sign-in starts.
+      final closing = s.disconnect();
+      final next = FakeSocket();
+      s.debugAttachSocket(next);
+      s.register('play1', 'secret');
+      final register = next.fakeSink.sent.single;
+      await closing;
+      s.debugReceive(respond(register, 200, 'OK'));
+      expect(s.registrationState.value, SipRegistrationState.registered);
+      expect(registered, 2);
     });
 
     test('without a registration it just closes', () async {

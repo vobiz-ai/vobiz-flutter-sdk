@@ -25,6 +25,10 @@ class FakeConnectivityMonitor implements ConnectivityMonitor {
     _changes.add(status);
   }
 
+  /// Changes what [current] answers without a change event: a report the
+  /// platform never sent.
+  void changeSilently(NetworkStatus status) => _now = status;
+
   void goOffline() => emit(NetworkStatus.offline());
   void wifi() => emit(NetworkStatus(const <NetworkType>[NetworkType.wifi]));
   void mobile() => emit(NetworkStatus(const <NetworkType>[NetworkType.mobile]));

@@ -206,6 +206,14 @@ class VobizClient {
   bool get _hasSignIn =>
       _username != null && (_password != null || _accessToken != null);
 
+  /// Bumped by every sign-in and sign-out, so a sign-in still connecting
+  /// when it is replaced stops quietly instead of reporting on the new one.
+  int _signInEpoch = 0;
+
+  /// The registrar could not take a REGISTER during a call (no answer, 408,
+  /// 480, 5xx): reconnect once the call is over, as the socket closes then.
+  bool _reconnectWhenCallEnds = false;
+
   // Inbound call state
   String? _pendingInboundCaller;
   String? _pendingInboundSdp;
@@ -380,6 +388,7 @@ class VobizClient {
     }
 
     _closeExistingConnection();
+    final epoch = _signInEpoch;
     _connectionState = ConnectionStateStatus.connecting;
     _connectionEvents.addIfOpen(ConnectionEvent(
       connectionState: _connectionState,
@@ -397,6 +406,8 @@ class VobizClient {
       );
     } on VobizException catch (e) {
       final explained = _explainSetupFailure(e);
+      // Signed out, or in again, meanwhile: that sign-in owns the state.
+      if (epoch != _signInEpoch) throw explained;
       _connectionState = ConnectionStateStatus.failed;
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
@@ -406,6 +417,9 @@ class VobizClient {
       _emitError('setup_failed', explained.message, e);
       throw explained;
     }
+    // Signed out, or in again, while the server was provisioning: do not
+    // sign in as this endpoint over that.
+    if (epoch != _signInEpoch) return session;
 
     _authMode = VobizAuthMode.zeroConfig;
     _authId = id;
@@ -692,7 +706,9 @@ class VobizClient {
   /// registrar holds it and pushes the devices registered for this SIP user
   /// ([VobizPushDevices]). For testing that path; a sign-out leaves it true.
   Future<void> disconnect({bool unregister = true}) async {
+    _signInEpoch++;
     _supervisor.stop();
+    _reconnectWhenCallEnds = false;
     _stopWatchingLifecycle();
     _clearCallSetupTimer();
     _forgetPushedCall();
@@ -1162,6 +1178,7 @@ class VobizClient {
     _sip.onRegistered = () {
       _registrationState = RegistrationState.registered;
       _connectionState = ConnectionStateStatus.connected;
+      _reconnectWhenCallEnds = false;
       _supervisor.connected();
       final onForeground = _reregisteringOnForeground;
       _reregisteringOnForeground = false;
@@ -1185,6 +1202,10 @@ class VobizClient {
 
     _sip.onRegistrationFailed = (reason) {
       _reregisteringOnForeground = false;
+      if (_sip.registrationFailureTemporary && _config.autoReconnect && _supervisor.isRunning) {
+        _onTemporaryRegistrationFailure(reason);
+        return;
+      }
       // Wrong credentials are not a network problem: retrying cannot help.
       _supervisor.stop();
       _registrationState = RegistrationState.failed;
@@ -1214,6 +1235,29 @@ class VobizClient {
       if (_direction == CallDirection.outbound) _clearCallSetupTimer();
     };
     _wireSipCalls();
+  }
+
+  /// The registrar could not take the REGISTER now (no answer, 408, 480,
+  /// 5xx): not a refusal of the credentials, so keep trying with the
+  /// reconnect backoff. The SIP layer has closed the socket, or closes it
+  /// when the call on it ends; the reconnect waits for that.
+  void _onTemporaryRegistrationFailure(String reason) {
+    _logger.warn('Registration failed for now, trying again: $reason');
+    // Already reported as given up: a network change or reconnect() starts
+    // again.
+    if (_supervisor.hasGivenUp) return;
+    _registrationState = RegistrationState.unregistered;
+    _connectionState = ConnectionStateStatus.reconnecting;
+    _connectionEvents.addIfOpen(ConnectionEvent(
+      connectionState: _connectionState,
+      registrationState: _registrationState,
+      message: 'Registration failed: $reason. Trying again',
+    ));
+    if (_callId != null) {
+      _reconnectWhenCallEnds = true;
+      return;
+    }
+    _scheduleReconnect('Registration failed: $reason');
   }
 
   /// The signalling socket is gone. A connected call rides it out (its
@@ -1376,9 +1420,18 @@ class VobizClient {
   }
 
   /// A new sign-in replaces the old connection rather than opening a second
-  /// socket next to it.
+  /// socket next to it. Until it signs in, nothing describes the old one.
   void _closeExistingConnection() {
+    _signInEpoch++;
     _supervisor.stop();
+    _reconnectWhenCallEnds = false;
+    _registrationState = RegistrationState.unregistered;
+    _authMode = VobizAuthMode.none;
+    _authId = null;
+    _authToken = null;
+    _username = null;
+    _password = null;
+    _accessToken = null;
     final callId = _callId;
     if (callId != null) {
       unawaited(_terminate(callId,
@@ -1406,9 +1459,15 @@ class VobizClient {
 
   /// Opens the socket and sends the first REGISTER with whatever this client
   /// signs in with: a password, or an access token.
+  ///
+  /// A sign-in or sign-out that comes while it connects replaces it: it then
+  /// stops without reporting anything. A reconnect attempt that fails is
+  /// rethrown to the supervisor, which counts it and reports when it gives
+  /// up, so the state stays `reconnecting` meanwhile.
   Future<void> _connectAndRegister({required bool reconnecting}) async {
     final username = _username;
     if (username == null) return;
+    final epoch = _signInEpoch;
     _registrationState = RegistrationState.registering;
     _connectionState = reconnecting
         ? ConnectionStateStatus.reconnecting
@@ -1423,8 +1482,10 @@ class VobizClient {
     try {
       if (_config.autoReconnect && !_supervisor.isRunning) {
         await _supervisor.start();
+        if (epoch != _signInEpoch) return;
       }
       await _sip.connect();
+      if (epoch != _signInEpoch) return;
       // A pushed call not claimed yet rides on this sign-in's REGISTER.
       _claimPushedCallOnRegister();
       final token = _accessToken;
@@ -1433,7 +1494,16 @@ class VobizClient {
       } else {
         _sip.register(username, _password ?? '');
       }
+    } on SipConnectSuperseded {
+      // A sign-out, or a newer connection, replaced this one.
+      return;
     } catch (e) {
+      if (epoch != _signInEpoch) return;
+      if (reconnecting) {
+        _registrationState = RegistrationState.unregistered;
+        _logger.warn('Reconnect attempt failed: $e');
+        rethrow;
+      }
       _registrationState = RegistrationState.failed;
       _connectionState = ConnectionStateStatus.failed;
       _connectionEvents.addIfOpen(ConnectionEvent(
@@ -1442,8 +1512,8 @@ class VobizClient {
         message: 'Connection failed: $e',
       ));
       _emitError('connect_failed', 'Could not connect', e);
-      // SIPService no longer calls onSocketError on connect failure, so we
-      // schedule the reconnect here for both initial and retry code paths.
+      // SIPService does not call onSocketError when connect fails, so a
+      // first sign-in schedules its reconnect here.
       if (_config.autoReconnect) _scheduleReconnect('Could not connect: $e');
       rethrow;
     }
@@ -1872,6 +1942,11 @@ class VobizClient {
     _callState = CallStateStatus.idle;
     _interruptions.reset();
     _reInviteInProgress = false;
+    if (_reconnectWhenCallEnds) {
+      // The SIP layer closes the socket now that the call is over.
+      _reconnectWhenCallEnds = false;
+      _scheduleReconnect('Registration failed during the call');
+    }
     await _peer.disposeCall(callId);
   }
 
