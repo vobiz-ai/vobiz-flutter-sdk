@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -337,15 +336,11 @@ class VobizClient {
       callId: id,
       remoteIdentity: _pendingInboundCaller ?? _activeCallDestination ?? '',
       isIncoming: _direction == CallDirection.inbound,
-      answerUrl: null,
       state: _callState,
       callUuid: _callUuid,
       headers: _callHeaders,
     );
   }
-
-  Iterable<CallSession> get calls =>
-      currentCall != null ? <CallSession>[currentCall!] : const [];
 
   // ---------------------------------------------------------------------------
   // Sign in / out
@@ -421,6 +416,8 @@ class VobizClient {
 
   /// SIP Direct with a [CredentialConfig], or a [TokenConfig] whose token is
   /// the endpoint password.
+  @Deprecated('Use connectWithCredentials for an endpoint, or connectWithAccessToken '
+      'for a JWT.')
   Future<void> connect(Object credentials) async {
     if (credentials is CredentialConfig) {
       _beginSipDirect();
@@ -620,7 +617,7 @@ class VobizClient {
     final sipCallId = _sip.activeSipCallId;
     if (!pushed.push.matchesIncomingCall(sipCallId: sipCallId)) {
       final number = pushed.push.callerNumber.isNotEmpty ? pushed.push.callerNumber : pushed.push.caller;
-      if (VobizIncomingPush.samePhoneNumber(callerId, number)) {
+      if (_samePhoneNumber(callerId, number)) {
         _logger.warn('A call from $callerId arrived while the pushed call ${pushed.push.callId} was '
             'awaited, with another Call-ID ($sipCallId): not taken for the pushed call');
       }
@@ -637,6 +634,16 @@ class VobizClient {
       _emitPushUpdate(pushed, VobizPushCallStatus.answering);
       unawaited(acceptCall(callId));
     }
+  }
+
+  /// Two numbers are the same when their last ten digits match (at least six
+  /// digits each), so `+91 98765 43210` matches `09876543210`.
+  static bool _samePhoneNumber(String a, String b) {
+    final x = a.replaceAll(RegExp(r'\D'), '');
+    final y = b.replaceAll(RegExp(r'\D'), '');
+    if (x.length < 6 || y.length < 6) return false;
+    String tail(String s) => s.length > 10 ? s.substring(s.length - 10) : s;
+    return tail(x) == tail(y);
   }
 
   /// A pushed call that no REGISTER has claimed yet rides on the next one.
@@ -1113,35 +1120,6 @@ class VobizClient {
   /// the user held stays held.
   Future<void> audioInterruptionEnded({bool shouldResume = true}) =>
       _interruptions.ended(shouldResume: shouldResume);
-
-  // ---------------------------------------------------------------------------
-  // Legacy call control — Node reference backend only
-  // ---------------------------------------------------------------------------
-  //
-  // These call routes such as /add-call on [backendUrl]. The Node reference
-  // server (Vobiz-RTC-demo in the vobiz_inbound monorepo) implements them;
-  // the Playground server does not, so against it they throw
-  // UnsupportedError rather than appear to work. For a transfer that works
-  // with the Playground server, use transferCall().
-
-  Future<void> transfer(String to) =>
-      _backend('/transfer', body: {'to': to});
-
-  Future<void> warmTransferStart(String to) =>
-      _backend('/warm-transfer/start', body: {'to': to});
-
-  Future<void> warmTransferComplete() async {
-    final id = _callId;
-    if (id != null) await _terminate(id, message: 'Call ended');
-  }
-
-  Future<void> addCall(String to) => _backend('/add-call', body: {'to': to});
-  Future<void> startSecondCall(String to) =>
-      _backend('/second-call', body: {'to': to});
-  Future<void> swapCalls() => _backend('/swap-calls');
-  Future<void> mergeCalls() => _backend('/merge-calls');
-  Future<void> endSecondCall() => _backend('/end-second-call');
-  Future<void> removeAddedCall() => _backend('/remove-added-call');
 
   String _requireCurrentCall(String? callId) {
     final id = _callId;
@@ -1895,48 +1873,6 @@ class VobizClient {
     _interruptions.reset();
     _reInviteInProgress = false;
     await _peer.disposeCall(callId);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Private — backend HTTP calls (legacy routes)
-  // ---------------------------------------------------------------------------
-
-  static const Duration _backendTimeout = Duration(seconds: 10);
-
-  Future<void> _backend(
-    String path, {
-    String method = 'POST',
-    Map<String, String>? body,
-  }) async {
-    final url = Uri.parse('${WebhookServerApi.normalizeBase(backendUrl)}$path');
-    try {
-      final response = body != null
-          ? await _http
-              .post(url,
-                  headers: {'Content-Type': 'application/json'},
-                  body: jsonEncode(body))
-              .timeout(_backendTimeout)
-          : method == 'DELETE'
-              ? await _http.delete(url).timeout(_backendTimeout)
-              : await _http.post(url).timeout(_backendTimeout);
-      final status = response.statusCode;
-      if (status == 404 || status == 405 || status == 501) {
-        throw UnsupportedError(
-            'The webhook server at $backendUrl does not implement $path '
-            '(HTTP $status). Only the Node reference server has the legacy '
-            'call-control routes; use transferCall() for transfers.');
-      }
-      if (status >= 400) {
-        throw VobizException('backend_failed',
-            'The webhook server refused $path', statusCode: status);
-      }
-    } on UnsupportedError {
-      rethrow;
-    } on VobizException {
-      rethrow;
-    } catch (e) {
-      throw VobizException('backend_failed', 'Could not reach $path: $e');
-    }
   }
 
   // ---------------------------------------------------------------------------

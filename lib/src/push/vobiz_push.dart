@@ -174,14 +174,4 @@ class VobizIncomingPush {
   /// [callId]. Only an exact match counts: matching by phone number could
   /// auto-answer a different call from the same caller.
   bool matchesIncomingCall({required String? sipCallId}) => sipCallId != null && sipCallId == callId;
-
-  /// Two numbers are the same when their last ten digits match (at least six
-  /// digits each), so `+91 98765 43210` matches `09876543210`.
-  static bool samePhoneNumber(String a, String b) {
-    final x = a.replaceAll(RegExp(r'\D'), '');
-    final y = b.replaceAll(RegExp(r'\D'), '');
-    if (x.length < 6 || y.length < 6) return false;
-    String tail(String s) => s.length > 10 ? s.substring(s.length - 10) : s;
-    return tail(x) == tail(y);
-  }
 }

@@ -1,13 +1,11 @@
 // VobizClient wiring of the media fixes: mute across hold (#43), real hold
-// (#30), early media (#23), RFC 4733 DTMF (#30), legacy routes (#30),
-// hangup during setup (#28), interruptions (#17).
+// (#30), early media (#23), RFC 4733 DTMF (#30), hangup during setup (#28),
+// interruptions (#17).
 // ignore_for_file: implementation_imports
 import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
 import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
@@ -41,13 +39,12 @@ String _header(String msg, String name) => msg
     .trim();
 
 class _Rig {
-  _Rig({http.Client? httpClient}) {
+  _Rig() {
     sip = SIPService(wsUrl: 'wss://t', sipServer: 'registrar.vobiz.ai')
       ..debugOnSend = sent.add;
     client = VobizClient.withServices(
       sip: sip,
       peer: media.service,
-      httpClient: httpClient,
     );
     client.errorEvents.listen(errors.add);
     sip.register('play1', 'secret');
@@ -259,21 +256,6 @@ void main() {
       expect(rig.media.peer.disposed, isTrue);
       expect(rig.methods, isNot(contains('INVITE')));
       expect(rig.errors, isEmpty);
-      await rig.dispose();
-    });
-  });
-
-  group('#30 legacy call control', () {
-    test('a route the webhook server lacks throws instead of doing nothing', () async {
-      final rig = _Rig(httpClient: MockClient((_) async => http.Response('Not found', 404)));
-      await expectLater(rig.client.addCall('+919876543210'), throwsUnsupportedError);
-      await expectLater(rig.client.swapCalls(), throwsUnsupportedError);
-      await rig.dispose();
-    });
-
-    test('other server errors surface as VobizException', () async {
-      final rig = _Rig(httpClient: MockClient((_) async => http.Response('boom', 500)));
-      await expectLater(rig.client.mergeCalls(), throwsA(isA<VobizException>()));
       await rig.dispose();
     });
   });

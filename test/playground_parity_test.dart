@@ -191,7 +191,6 @@ void main() {
       final ok = SipParser.parse(SipBuilder.ok200(
         invite: incoming,
         contactUri: contact,
-        sipServer: 'registrar.vobiz.ai',
         localTag: 'tag1',
         sdp: 'v=0',
       ));

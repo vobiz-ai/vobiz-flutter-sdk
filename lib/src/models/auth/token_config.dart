@@ -12,7 +12,6 @@ class TokenConfig {
   const TokenConfig({
     required this.token,
     this.displayName,
-    this.answerUrl,
   });
 
   /// Sent as the SIP digest password.
@@ -20,5 +19,4 @@ class TokenConfig {
 
   /// Used as the SIP username (not a display name).
   final String? displayName;
-  final String? answerUrl;
 }

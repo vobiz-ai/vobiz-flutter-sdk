@@ -1,4 +1,3 @@
-import '../calls/call_session.dart';
 import '../models/call/call_direction.dart';
 import '../state/call_state.dart';
 import 'sdk_event.dart';
@@ -7,7 +6,6 @@ class CallEvent extends SdkEvent {
   CallEvent({
     required this.callId,
     required this.state,
-    this.session,
     this.message,
     this.direction,
     this.remoteIdentity,
@@ -26,7 +24,6 @@ class CallEvent extends SdkEvent {
 
   final String callId;
   final CallStateStatus state;
-  final CallSession? session;
   final String? message;
 
   /// Whether this client placed the call or it rang this client.

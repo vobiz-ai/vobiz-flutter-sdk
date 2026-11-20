@@ -306,7 +306,6 @@ class SipBuilder {
   static String ok200({
     required SipMessage invite,
     required String contactUri,
-    required String sipServer,
     required String localTag,
     required String sdp,
   }) {
@@ -809,7 +808,6 @@ class SIPService {
   String? _accessToken;
   int? _accessTokenError;
   int? _accessTokenExpiresIn;
-  int? _accessTokenExpiresAt;
   int _cseq = 1;
   bool _manualDisconnect = false;
 
@@ -818,7 +816,6 @@ class SIPService {
   Map<String, String>? _pendingClaim;
 
   String? _activeCallId;
-  String? _activeRemoteTag;
   String? _activeToUser;
   String? _activeRemoteTarget;
   String? _activeRemotePartyHeader;
@@ -993,19 +990,14 @@ class SIPService {
     _accessToken = accessToken;
   }
 
-  /// Whether this client signs in with an access token rather than a
-  /// password.
-  bool get usesAccessToken => _accessToken != null;
-
   /// The registrar's reason for its last refusal of the access token (10001
   /// to 10010, from `X-vobiz-Jwt-Error-Code`), until the next REGISTER is
   /// accepted.
   int? get accessTokenError => _accessTokenError;
 
   /// From the registrar's last 200 OK (`X-vobiz-Jwt: expires=<s>;epoch-exp=<t>`):
-  /// seconds the token had left by the server's clock, and its expiry.
+  /// seconds the token had left by the server's clock.
   int? get accessTokenExpiresIn => _accessTokenExpiresIn;
-  int? get accessTokenExpiresAt => _accessTokenExpiresAt;
 
   bool get _hasCredentials =>
       _username != null && (_password != null || _accessToken != null);
@@ -1173,7 +1165,6 @@ class SIPService {
     _send(SipBuilder.ok200(
       invite: _pendingInvite!,
       contactUri: _contactUri,
-      sipServer: sipServer,
       localTag: _localTag,
       sdp: sdp,
     ));
@@ -1760,7 +1751,7 @@ class SIPService {
   _Dialog _currentDialog() => _Dialog(
         callId: _activeCallId!,
         remoteTarget: _inDialogRequestUri(),
-        remoteParty: _activeRemotePartyHeader ?? _buildFallbackToHeader(),
+        remoteParty: _activeRemotePartyHeader!,
         routes: _routeSet,
       );
 
@@ -1945,7 +1936,6 @@ class SIPService {
     final parsedTo = _extractUser(msg.header('To') ?? '');
     _activeToUser = parsedTo == 'Unknown' ? callerId : parsedTo;
     final fromHeader = msg.header('From') ?? '';
-    _activeRemoteTag = _extractTag(fromHeader);
     _activeRemoteTarget = _extractUri(msg.header('Contact') ?? fromHeader);
     _activeRemotePartyHeader = fromHeader;
     _routeSet = msg.headerValues('Record-Route');
@@ -1988,7 +1978,6 @@ class SIPService {
       _send(SipBuilder.ok200(
         invite: answered,
         contactUri: _contactUri,
-        sipServer: sipServer,
         localTag: _localTag,
         sdp: _lastAnsweredSdp!,
       ));
@@ -2290,7 +2279,6 @@ class SIPService {
     int? param(String name) => int.tryParse(
         RegExp('(?:^|;)\\s*$name\\s*=\\s*(-?\\d+)').firstMatch(value)?.group(1) ?? '');
     _accessTokenExpiresIn = param('expires') ?? _accessTokenExpiresIn;
-    _accessTokenExpiresAt = param('epoch-exp') ?? _accessTokenExpiresAt;
   }
 
   /// The lifetime the registrar granted: our Contact's `expires` parameter
@@ -2567,7 +2555,6 @@ class SIPService {
   }
 
   void _updateDialog(SipMessage msg) {
-    _activeRemoteTag = _extractTag(msg.header('To') ?? '');
     _activeRemoteTarget =
         _extractUri(msg.header('Contact') ?? msg.header('To') ?? '');
     _activeRemotePartyHeader =
@@ -2639,7 +2626,6 @@ class SIPService {
 
   void _clearCallState() {
     _activeCallId = null;
-    _activeRemoteTag = null;
     _activeToUser = null;
     _activeRemoteTarget = null;
     _activeRemotePartyHeader = null;
@@ -2685,23 +2671,11 @@ class SIPService {
   int _extractCSeqNumber(String? header) =>
       int.tryParse((header ?? '').trim().split(' ').first.trim()) ?? 1;
 
-  String _extractTag(String header) =>
-      RegExp(r'tag=([^;>\s]+)').firstMatch(header)?.group(1) ?? '';
-
   String? _extractUri(String header) =>
       RegExp(r'sip:[^>;]+').firstMatch(header)?.group(0);
 
   String _extractUser(String header) =>
       RegExp(r'sip:([^@>]+)').firstMatch(header)?.group(1) ?? 'Unknown';
-
-  String _buildFallbackToHeader() {
-    final toUser = _activeToUser;
-    if (toUser == null) return '<sip:unknown@$sipServer>';
-    if (_activeRemoteTag == null || _activeRemoteTag!.isEmpty) {
-      return '<sip:$toUser@$sipServer>';
-    }
-    return '<sip:$toUser@$sipServer>;tag=$_activeRemoteTag';
-  }
 
   String _reasonPhrase(SipMessage msg) {
     final parts = msg.firstLine.split(' ');

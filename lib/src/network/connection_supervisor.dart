@@ -37,7 +37,6 @@ class ConnectionSupervisor {
     required this.onEvent,
     this.hasActiveCall,
     this.onHandover,
-    this.onOffline,
     this.registerTimeout = const Duration(seconds: 10),
     Random? random,
     Logger? logger,
@@ -59,9 +58,6 @@ class ConnectionSupervisor {
   /// Called when the network changes during a call: the hook for an ICE
   /// restart (re-INVITE) on the new interface.
   final void Function(NetworkStatus from, NetworkStatus to)? onHandover;
-
-  /// Called when the device goes offline while signed in.
-  final void Function()? onOffline;
 
   final Duration registerTimeout;
 
@@ -240,7 +236,6 @@ class ConnectionSupervisor {
       _connected = false;
       _reconnecting = true;
       _emit(NetworkEventType.offline, previous: prev, reason: 'No network');
-      onOffline?.call();
       return;
     }
 

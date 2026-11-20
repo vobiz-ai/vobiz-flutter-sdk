@@ -34,7 +34,6 @@ class SdkConfig {
     this.sipServer = 'registrar.vobiz.ai',
     this.backendUrl = defaultWebhookUrl,
     this.voiceApiUrl = defaultVoiceApiUrl,
-    this.answerUrl,
     this.autoReconnect = true,
     this.debug = false,
     this.iceConfig = const IceConfig(),
@@ -72,22 +71,11 @@ class SdkConfig {
   /// list also go through it. Defaults to [defaultWebhookUrl]; point it at your
   /// own deployment of the Playground server (or a tunnel to it while
   /// developing) to use your own.
-  ///
-  /// The legacy call-control methods (`hold`, `resume`, `transfer(String)`,
-  /// `addCall`, `swapCalls`, `mergeCalls` and friends) call routes such as
-  /// `/hold-start` on this same URL. Only the Node reference server
-  /// implements those; the Playground server does not.
   final String backendUrl;
 
   /// The Vobiz REST API base URL that the webhook server calls on the
   /// account's behalf. Defaults to [defaultVoiceApiUrl].
   final String voiceApiUrl;
-
-  /// Public answer webhook URL sent to Vobiz during login.
-  ///
-  /// Vobiz calls this URL when routing an inbound PSTN call to this client.
-  /// Must be publicly reachable (e.g. your ngrok URL + `/answer`).
-  final String? answerUrl;
 
   /// Reconnect automatically when the WebSocket drops.
   final bool autoReconnect;

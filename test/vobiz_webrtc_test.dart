@@ -210,15 +210,4 @@ void main() {
       expect(states, contains(CallStateStatus.failed));
     });
   });
-
-  // ── DtmfTone ───────────────────────────────────────────────────────────────
-
-  group('DtmfTone', () {
-    test('digit values are correct', () {
-      expect(DtmfTone.digit0.value, equals('0'));
-      expect(DtmfTone.digit9.value, equals('9'));
-      expect(DtmfTone.star.value, equals('*'));
-      expect(DtmfTone.hash.value, equals('#'));
-    });
-  });
 }

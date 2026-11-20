@@ -7,11 +7,12 @@ class CredentialConfig {
     required this.username,
     required this.password,
     this.displayName,
-    this.answerUrl,
   });
 
   final String username;
   final String password;
+
+  /// A name for the app's own use, such as the one a backend returns with
+  /// the credentials. The SDK does not send it.
   final String? displayName;
-  final String? answerUrl;
 }
