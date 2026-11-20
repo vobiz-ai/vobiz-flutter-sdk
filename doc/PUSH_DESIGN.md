@@ -1,184 +1,135 @@
-# Incoming-call push: design note
+# Incoming calls to a closed app: how Vobiz push works
 
-Status: **design**, with the Vobiz-side path built (see "Vobiz's own push" below).
-The plugin-free payload API ships today.
+The SDK registers over a WebSocket. When Android suspends or kills the app, the socket
+closes, but the registration the app left behind stays on Vobiz's registrar until it
+expires: the SDK asks for an hour (`Expires: 3600`), and every REGISTER (sign-in, the
+refresh at 80 % of the lifetime, the return to the foreground, the claim of a pushed
+call) starts the hour again. While that registration lasts, a call to its SIP user is
+held and pushed instead of being refused. Android only for now; see [iOS](#ios).
 
-## The problem
+## The flow
 
-The SDK registers over a WebSocket. When Android or iOS suspends or kills the app, the
-socket closes and Vobiz drops the registration, so the endpoint cannot be rung. Ringing
-a closed app takes three pieces:
+```
+caller ──> Vobiz ──> registrar: the SIP user's registration is left behind, its socket gone
+                       │  holds the call (up to 30 s)
+                       ▼
+                     Vobiz push service ──> Firebase ──> every phone signed up for that SIP user
+                                                           │
+   app wakes, shows its call screen, hands the push to     │
+   client.handleIncomingPush(push) and signs in   <────────┘
+                       │  REGISTER with X-Index, X-Label, X-vobiz-Registrar-Info
+                       ▼
+                     registrar sends the held INVITE to this registration,
+                     with the push's call_id as its Call-ID
+                       │
+                       ▼
+   the SDK reports it as an incoming call (CallEvent.sipCallId == push.callId),
+   and answers or declines it if the call screen's button was already pressed
+```
 
-1. Something that sees the inbound call while the endpoint is offline and sends a push.
-2. A native call screen (Android `ConnectionService` / full-screen notification, iOS
-   CallKit) that rings while the app starts.
-3. The app signing back in and matching the SIP INVITE that follows to the screen
-   already showing.
+1. **Sign-up.** After each sign-in, and whenever Firebase replaces the token, the app
+   signs the phone up for its SIP user with `VobizPushDevices.register`, through its own
+   backend ([CREDENTIALS.md](../CREDENTIALS.md#push-sign-up-through-your-backend)). At
+   sign-out, `VobizPushDevices.logout`.
+2. **Hold and push.** A call for that SIP user finds the registration left behind. The
+   registrar holds the call and Vobiz's push service sends a Firebase data message to the
+   phones signed up for the user:
 
-Today (1) is the single-tenant example bridge in `example/push_bridge`, and (2) and (3)
-are about 1,000 lines in `example/lib`. A customer has to copy all of it.
+   ```json
+   {"type": "incoming_call", "call_id": "<SIP Call-ID>", "call_uuid": "...",
+    "caller": "...", "caller_number": "+91...", "callee": "<SIP user>",
+    "index": "...", "label": "...", "registrar": "...",
+    "expires_at": "1762900030"}
+   ```
 
-## What ships now
+   `expires_at` is Unix seconds.
+3. **Claim.** The app reads it with `VobizIncomingPush.tryParse(data)` and hands it to
+   `client.handleIncomingPush(push)`. The next REGISTER carries the hold reference
+   (`index`, `label` and `registrar` as `X-Index`, `X-Label` and
+   `X-vobiz-Registrar-Info`): at once if the app is still signed in and registered, after
+   an immediate reconnect if it is signed in but between connections, or as part of the
+   sign-in the app starts next. Only that one REGISTER carries it.
+4. **Delivery.** The registrar sends the held INVITE to the registration that claimed it,
+   with the push's `call_id` as its Call-ID. The SDK ties the two by that Call-ID only,
+   never by the caller's number, so another call from the same person is never answered
+   in its place.
+5. **Call screen.** `reportCallScreenAccepted(push)` answers the call as soon as its
+   INVITE arrives (at once if it is already ringing); `reportCallScreenDeclined(push)`
+   declines it (486). `pushCallUpdates` reports `claiming`, `claimed`, `ringing`,
+   `answering` or `declining`, and `expired` when no INVITE came in time.
 
-`VobizIncomingPush` (in the SDK, no plugin dependency):
+## In the app
 
 ```dart
-final push = VobizIncomingPush.tryParse(remoteMessage.data);
-if (push == null || push.isExpired()) return;
-// show your call screen with push.caller …
-// after sign-in, when the INVITE arrives:
+// Firebase message handler (the app may have been started just for this).
+final push = VobizIncomingPush.tryParse(message.data);
+if (push == null) return;                     // not Vobiz's incoming-call push
+if (!client.handleIncomingPush(push)) return; // expired: do not ring
+showCallScreen(caller: push.caller, id: push.callId);
+if (client.sipUsername == null) {
+  // Closed app: sign in now, from cached credentials (no round trip to your
+  // backend first). This sign-in's REGISTER claims the call.
+  await client.connectWithCredentialsProvider(cachedProvider);
+}
+
+// Call-screen buttons:
+onAccept: () => client.reportCallScreenAccepted(push);
+onDecline: () => client.reportCallScreenDeclined(push);
+
+// Take the screen down when the call never came, or ended:
+client.pushCallUpdates.listen((u) {
+  if (u.status == VobizPushCallStatus.expired) hideCallScreen(u.push.callId);
+});
 client.callEvents.listen((e) {
-  if (e.state == CallStateStatus.incoming &&
-      push.matchesIncomingCall(headers: e.headers)) {
-    client.acceptCall(); // if the user already tapped Accept
-  }
+  if (client.isPushedCall(e.callId) && e.state == CallStateStatus.ended) hideCallScreen(e.callId);
 });
 ```
 
-It reads the payload the reference bridge sends (`type`, `call_id`, `caller`,
-`callee`, `expires_at`, …) and matches the INVITE by its `PushRef` SIP header, falling
-back to the caller's number.
+The SDK has no Firebase or call-screen dependency: the app receives the push, shows the
+screen and keeps the call alive with a foreground service
+([PLATFORM_SETUP.md](../PLATFORM_SETUP.md#keep-a-call-alive-in-the-background)). The
+example app does all of it (`example/lib/src/push/`, and `CallPushReceiver.kt`, which
+hands the push to the app's one Flutter engine, starting it without a screen when the
+app is closed).
 
-## What the SDK will expose
+## Rules and limits
 
-```dart
-// 1. Tell Vobiz (or your backend) where to push for this endpoint.
-await client.registerPushToken(token, platform: VobizPushPlatform.fcm /* or apnsVoip */);
-await client.unregisterPushToken();
+- **Reachable while the registration lasts.** A closed phone rings only while the
+  registration it left behind lasts (an hour from its last REGISTER) and only if it is
+  signed up. After that, or after a sign-out (REGISTER `Expires: 0`), the call fails at
+  once for that phone and nothing is pushed.
+- **The registrar holds a call for up to 30 seconds.** The claim has to reach it in that
+  time, so sign in from cached credentials and start nothing slow before it. A
+  `<Dial>` that rings the user should ring for longer than that (the example's sample
+  server defaults to 45 s).
+- **Clocks.** `expires_at` is set by Vobiz's clock and read by the phone's. The SDK still
+  acts on a push until 30 s past `expires_at`, and awaits its call at most 60 s after the
+  push was handed over (30 s for a push without `expires_at`). `handleIncomingPush`
+  returns false for a push older than that.
+- **Decline claims first.** A held call cannot be declined without claiming it, so
+  Decline still sends the claiming REGISTER and then declines the INVITE with 486 on
+  this phone's leg. Other phones rung for the same call keep ringing.
+- **No stop-ringing message.** Nothing tells the app that the caller gave up, or that
+  another phone answered, before the INVITE arrived: the call screen comes down when the
+  push expires (`expired`). Once the INVITE has arrived, the caller's CANCEL ends the
+  call as usual.
+- **Android delivery.** Android delivers no push to an app that was force-stopped from
+  Settings until it is opened again; swiping it from Recents is fine. Some phone makers
+  also stop pushes to apps swiped from Recents unless the app may run in the background.
+- **Testing.** `client.disconnect(unregister: false)` closes the connection without
+  unregistering, as when Android kills the app, so a call placed right after takes the
+  push path. The example's *Call this phone through Vobiz* (debug builds) does that and
+  then calls the phone's own SIP user through Vobiz's Call API.
 
-// 2. Hand a push to the SDK. It signs in through the app's credentials provider
-//    (cached credentials, no Auth Token, no rotation), waits for the INVITE that
-//    matches the push, and reports it as a normal incoming call.
-final call = await client.handleIncomingPush(payload, credentials: provider);
-
-// 3. Call-screen hooks, so any call-screen plugin can drive the SDK:
-client.reportCallScreenAccepted(push);   // answer as soon as the INVITE arrives
-client.reportCallScreenDeclined(push);   // reject the INVITE, or tell the sender
-Stream<VobizPushCallState> client.pushCallStates; // ringing / answered / missed / ended
-```
-
-Design rules:
-
-- The SDK stays free of Firebase, CallKit and ConnectionService plugins. Native call
-  UI lives in an optional companion package (`vobiz_webrtc_callkit`) or in the app.
-- Sign-in on wake uses the credentials provider with `VobizCredentialsRequest.signIn`,
-  so it reuses cached per-user credentials and never rotates them (issue #14).
-- Correlation is by an opaque push reference carried both in the push and on the
-  INVITE; caller-number matching is only the fallback.
-
-## Vobiz's own push (deployed 2026-11-13; the last step does not work yet)
-
-Vobiz's platform team built the server side (push-service #2 and #3, and a registrar
-change in sip-trunking-infrastructure), deployed on 2026-11-13:
-
-1. A call for a SIP user reaches the registrar's "Outbound Call" branch.
-2. The registrar holds the call for up to 30 s and asks push-service to push the
-   devices registered for that SIP user (`/v1/notify/voip` with `endpoint`; only the
-   registrar may call it, with its internal token).
-3. The app wakes and REGISTERs with the hold reference from the push.
-4. The registrar sends the held INVITE to the new registration, with the push's
-   `call_id` as its Call-ID.
-
-Live on Android, 2026-11-13 (emulator; Vobiz's registrar logs and the SDK's SIP log):
-
-- **Steps 1 to 3 work.** With the app's registration left behind (killed, or
-  `disconnect(unregister: false)`), a call took the Outbound branch, the relay to the
-  dead socket failed, and the registrar logged `push sent to 1 device(s) … index …
-  label …`. The push woke a killed app in about 1.3 s and its call screen showed in
-  about 5 s; the app's claim REGISTER got `200 OK` (`Register for …;transport=wss
-  user-agent external - index …`).
-- **Step 4 fails.** The registrar relays the held INVITE to the claim's contact as
-  `transport=wss` and gets no reply: `failure` after 10 s. The SDK's SIP log shows
-  nothing arriving on that socket after the claim's `200 OK`. Normal deliveries to the
-  same SDK use `transport=ws` and get `180 Ringing` at once, even on the very socket
-  the claim had registered (once a plain REGISTER refreshed its contact as `ws`).
-- **Push only starts while a registration is left behind.** The registrar's
-  keep-alive deletes a WSS registration whose socket is gone within about 3 to 8 s
-  (`OPTIONS … entry deleted`). After that a call goes out the media server's external
-  route, arrives as an "Inbound Call", vapor `IncomingRoute` answers 500, and the call
-  ends at once: no push. A clean sign-out (REGISTER `Expires: 0`) has the same effect
-  straight away.
-- A call placed by the Call API straight to `sip:<user>@registrar.vobiz.ai` (or a
-  `<Dial><User>`) takes the Outbound branch only while the user has a registration.
-- With the app in the background and its connection alive, calls come straight in: the
-  call screen shows, Accept connects and Decline sends `486 Busy Here`.
-
-**Fixed on Vobiz's side, re-tested live on 2026-11-17** (emulator; the registrar's logs
-and the SDK's SIP log). The registrar now relays the held INVITE to the claim as
-`transport=ws`, and keeps a registration whose User-Agent is `vobiz_flutter_sdk` after
-its socket closes (it logs `… kept after websocket close (push-capable)`), until it
-expires:
-
-| Case | Result |
-|---|---|
-| App in the background, connection alive | The call came straight in, rang, and Accept connected it. |
-| Killed, called 2 s later | Pushed (the relay to the dead socket failed at once); the app woke, its claim REGISTER got `200 OK` and the held INVITE arrived 34 ms later, as `transport=ws`; it rang, and Accept connected it (audio). |
-| Killed, called 90 s later | Same: the registration was still there, so the call was pushed; it rang and connected. Before the fix, an instant busy with no push. |
-| Killed, called 6 min 40 s later | Pushed and rang, so the registrar keeps the lifetime the SDK asked for (600 s then). |
-| Killed, called 11 min later, with `Expires: 600` | Busy at once, no push: the registration had expired. |
-| Killed, called 11 min later, with `Expires: 3600` (twice) | The registration was still there and the call was pushed. The app then missed it: see below. |
-
-How long a closed app stays reachable is therefore the lifetime of its last REGISTER:
-this SDK now asks for an hour (`Expires: 3600`), and every REGISTER (sign-in, the
-refresh at 80 %, the return to the foreground, the claim of a pushed call) starts it
-again.
-
-The registrar holds a pushed call at most 30 s for the claim. On the test emulator
-(headless, software graphics, a debug build) the time from the push to the claim's
-`200 OK` grew with how long the app had been closed: 16 s and 11 s after 2 s and 90 s,
-26 s after 6 min 40 s, and 32 s and 37 s after 11 min, so those last two calls ended
-before the claim. Release builds on real phones start far faster; check them there.
-
-What the SDK does for it:
-
-| Step | API |
-|---|---|
-| Register the phone for its SIP user | `VobizPushDevices.register(VobizPushDevice(...))`, `POST /api/v1/devices/register`; `logout` at sign-out |
-| Read the push | `VobizIncomingPush.tryParse`: `index`, `label`, `registrar` become `hold`; `expires_at` is Unix **seconds** (the bridge sends milliseconds; told apart by size) |
-| Claim the held call | `client.handleIncomingPush(push)`: the next REGISTER (at once when registered, else the sign-in's) carries `X-Index`, `X-Label`, `X-vobiz-Registrar-Info`, its digest answer too, and only that REGISTER |
-| Tie the INVITE to the push | Call-ID equal to the push's `call_id` (`CallEvent.sipCallId`, `client.isPushedCall`); never by number |
-| Call screen | `reportCallScreenAccepted` answers on arrival; `reportCallScreenDeclined` claims and then turns the call away, so the caller hears busy at once |
-| Expiry | `pushCallUpdates` reports `expired` when no INVITE came by `expires_at` |
-
-Trying it: in the example, Incoming calls → Vobiz push → **Call this phone through
-Vobiz**. It drops the connection without signing off (`disconnect(unregister: false)`),
-then has Vobiz's Call API call this phone's SIP user, so the registrar pushes it.
-
-Open on Vobiz's side (from the SDK work, 2026-11-12 and the live test on 2026-11-13):
-
-- ~~The held INVITE is relayed to the claim as `transport=wss` and never delivered.~~
-  Fixed (re-tested 2026-11-17, above).
-- ~~A WSS registration is deleted seconds after its socket goes.~~ Fixed for this SDK:
-  it is kept until it expires (above). After that, a call to a killed app is busy with no
-  push, until the app registers again.
-- The address is `/api/v1/devices/register` (confirmed by the platform team; `/v1/…`
-  is 404 through the gateway).
-- Device registration takes the account's Auth ID and Auth Token: there is no
-  endpoint-scoped sign-in for apps yet.
-- No way to decline a held call without claiming it.
-- A REGISTER that lands on another registrar is forwarded by SIP MESSAGE, and the
-  holding registrar answers the INVITE with a 302: whether the new INVITE keeps the
-  Call-ID decides whether the SDK can match it.
-- `expires_at` depends on the phone's clock agreeing with the server's.
-
-## Platform work this depends on
-
-| Need | Owner |
-|---|---|
-| Vobiz-side push: when an endpoint with a push token is offline, push it and hold the call until it registers (the Console already lists "Push Notifications" tokens) | Vobiz platform |
-| An API to attach a push token to an endpoint | Vobiz platform |
-| A documented SIP header that carries the push reference onto the INVITE | Vobiz platform |
-| Until then: a multi-tenant reference push server (the example bridge is single-tenant) | SDK team |
-
-## iOS (remaining)
+## iOS
 
 Not implemented, because it needs native Swift that has to be verified on a device:
 
 - `PKPushRegistry` for VoIP pushes, and `CXProvider.reportNewIncomingCall`
   **synchronously** inside the PushKit callback (iOS 13+ terminates the app
   otherwise).
-- APNs VoIP sending in the push server (the bridge sends FCM with Android options only).
+- APNs VoIP pushes from Vobiz's push service.
 - Then, and only then, the `voip` background mode in `Info.plist`.
 
 Until this lands, iOS rings only while the app is in the foreground, and
-PLATFORM_SETUP.md says so.
+[PLATFORM_SETUP.md](../PLATFORM_SETUP.md) says so.
