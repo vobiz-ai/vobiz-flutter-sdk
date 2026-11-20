@@ -164,7 +164,14 @@ export function createBridge(options = {}) {
   };
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url || '/', 'http://localhost');
+    // A target that is not a URL ("//", "http://[") throws here; outside a
+    // try, one such request would stop the whole server.
+    let url;
+    try {
+      url = new URL(req.url || '/', 'http://localhost');
+    } catch {
+      return sendJson(res, 400, { error: 'Bad request' });
+    }
     const prefix = url.pathname.split('/').slice(0, 2).join('/');
     const handler = routes[`${req.method} ${url.pathname}`]
       || (url.pathname.split('/').length === 3 && routes[`${req.method} ${prefix}/*`]);
