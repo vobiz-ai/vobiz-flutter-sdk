@@ -150,8 +150,9 @@ class WebhookServerApi {
           VobizErrorCode.recordingsFailed,
           'The shared demo server\'s recordings list is readable by everyone '
           'who uses it, so it is only available with '
-          'SdkConfig(unsafeDemoZeroConfig: true). Point backendUrl at your own '
-          'server, scoped to your account, for recordings in production.');
+          'SdkConfig(unsafeDemoZeroConfig: true). This request carries no '
+          'credentials: list recordings through your own authenticated API in '
+          'production.');
     }
     final http.Response response;
     try {
