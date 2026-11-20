@@ -118,16 +118,17 @@ async function vobiz(method, path, body) {
 async function endpointFor(user) {
   const existing = store.get(user.id);
   if (existing) return existing;                              // never rotate on sign-in
-  // username: letters and digits, unique per account, cannot be changed later.
+  // username: letters and digits; it cannot be changed later. Vobiz adds digits to
+  // it, so the SIP username is the one in the reply, not the one sent.
   const username = `u${crypto.createHash('sha256').update(user.id).digest('hex').slice(0, 20)}`;
   const password = crypto.randomBytes(24).toString('base64url'); // Vobiz never returns it: keep it
   const created = await vobiz('POST', '/Endpoint/', {
     username,
     password,
-    alias: `agent-${username}`,     // letters, digits, - and _ only
+    alias: `agent-${username}`,     // letters, digits, - and _ only; stable per user
     app_id: APP_ID,
   });
-  const record = { endpointId: created.endpoint_id, username, password };
+  const record = { endpointId: created.endpoint_id, username: created.username, password };
   store.set(user.id, record);
   return record;
 }
@@ -147,11 +148,13 @@ app.post('/voice/sip-credentials', requireUser, async (req, res) => {
 });
 ```
 
-A `409` from Create means the username already exists on the account (for example the
-store was lost): look it up with
-[List all endpoints](https://docs.vobiz.ai/endpoint/list-all-endpoints)
-(`?username__exact=`), set a new password with
-[Update an Endpoint](https://docs.vobiz.ai/endpoint/update-endpoint), and store that.
+Vobiz does not refuse a username it has seen before: it adds different digits, so a
+second Create for the same user makes a second endpoint. If your store is lost, find the
+user's endpoint by its alias with
+[List all endpoints](https://docs.vobiz.ai/endpoint/list-all-endpoints) (it pages 20 at
+a time; `?username__exact=` matches only the full username, digits included), set a new
+password with [Update an Endpoint](https://docs.vobiz.ai/endpoint/update-endpoint), and
+store that.
 
 ### Access tokens (JWT)
 
