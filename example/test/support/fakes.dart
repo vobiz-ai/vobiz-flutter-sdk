@@ -225,8 +225,13 @@ class FakeClient implements VobizClient {
     return true;
   }
 
+  /// As the SDK does: a pushed call that rings here already is answered at
+  /// once, so the state moves on from incoming.
   @override
-  void reportCallScreenAccepted(VobizIncomingPush push) => actions.add('reportAccepted:${push.callId}');
+  void reportCallScreenAccepted(VobizIncomingPush push) {
+    actions.add('reportAccepted:${push.callId}');
+    if (state == CallStateStatus.incoming && pushedCallId != null) state = CallStateStatus.connecting;
+  }
   @override
   void reportCallScreenDeclined(VobizIncomingPush push) => actions.add('reportDeclined:${push.callId}');
 

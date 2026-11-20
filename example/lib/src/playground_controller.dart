@@ -1420,9 +1420,12 @@ class PlaygroundController extends ChangeNotifier {
     // Accept is the user's tap: the moment Android allows the call's
     // microphone service to start.
     _startCallService(outbound: false, caller: call.displayCaller);
+    // Read before the report: when the held call's INVITE rings here already,
+    // the SDK answers it at once and the state moves on from incoming.
+    final ringingHere = client.callState == CallStateStatus.incoming;
     client.reportCallScreenAccepted(sdk);
     if (client.isConnected || status == PhoneStatus.connecting || _sdkReconnecting) {
-      if (client.callState != CallStateStatus.incoming) log('Waiting for the call Vobiz is holding...', LogType.info);
+      if (!ringingHere) log('Waiting for the call Vobiz is holding...', LogType.info);
       return;
     }
     if (!_hasSavedSignIn) {

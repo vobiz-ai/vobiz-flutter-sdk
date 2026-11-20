@@ -155,12 +155,30 @@ void main() {
       await pumpEventQueue();
       expect(client.actions, contains('reportAccepted:held-1@10.0.2.9'));
       expect(platform.requests, contains('start:Asha'), reason: "the call's microphone service starts on the tap");
+      expect(controller.logs.map((l) => l.message), contains(contains('Waiting for the call Vobiz is holding')));
       final shownBefore = screen.shown.length;
       client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
       await pumpEventQueue();
       expect(screen.shown.length, shownBefore, reason: 'the push\'s screen is this call\'s');
       expect(controller.statusText, 'Answering...');
       expect(client.actions.where((a) => a == 'acceptCall'), isEmpty, reason: 'the SDK answers, not the app');
+    });
+
+    test('Accept after the INVITE rings: the SDK answers it at once, and the Trace does not say it is waiting',
+        () async {
+      await start();
+      await controller.connect();
+      await pumpEventQueue();
+      final data = vobizPush();
+      platform.pushController.add(data);
+      await pumpEventQueue();
+      client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
+      await pumpEventQueue();
+      screen.controller.add(accept('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      expect(client.actions, contains('reportAccepted:held-1@10.0.2.9'));
+      expect(client.callState, CallStateStatus.connecting, reason: 'the SDK answered the ringing call');
+      expect(controller.logs.map((l) => l.message), isNot(contains(contains('Waiting for the call Vobiz is holding'))));
     });
 
     test('Decline before the INVITE: reported to the SDK, logged as declined', () async {
