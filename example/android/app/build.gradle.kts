@@ -26,7 +26,8 @@ if (keyPropertiesFile.exists()) {
 } else {
     gradle.taskGraph.whenReady {
         if (allTasks.any { it.name.contains("Release") }) {
-            logger.warn(
+            // quiet, not warn: `flutter build` runs Gradle with -q, which hides warnings.
+            logger.quiet(
                 "WARNING: android/key.properties not found, so this release build is signed with the " +
                     "DEBUG key. Play Console refuses it. See example/README.md, \"Release builds\".",
             )
