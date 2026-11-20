@@ -21,7 +21,6 @@ const String _challenge = 'WWW-Authenticate: Digest realm="registrar.vobiz.ai", 
 Map<String, Object?> vobizPush({
   String callId = 'held-call-1@10.0.2.9',
   int? expiresAt,
-  bool test = false,
 }) =>
     <String, Object?>{
       'type': 'incoming_call',
@@ -34,21 +33,18 @@ Map<String, Object?> vobizPush({
       'label': '1938273',
       'registrar': '203.0.113.10',
       'expires_at': '${expiresAt ?? DateTime.now().millisecondsSinceEpoch ~/ 1000 + 30}',
-      if (test) 'test': '1',
     };
 
 void main() {
   group('reading a Vobiz push', () {
     test('reads the call, the hold reference and an expiry in seconds', () {
       final push = VobizIncomingPush.tryParse(vobizPush(expiresAt: 1762900030))!;
-      expect(push.kind, VobizPushKind.incomingCall);
       expect(push.callId, 'held-call-1@10.0.2.9');
       expect(push.callUuid, '5f0c5c7e-0000-4000-8000-000000000001');
       expect(push.caller, 'Asha');
       expect(push.callerNumber, '+918000000000');
       expect(push.callee, 'play1');
-      expect(push.isHeldByVobiz, isTrue);
-      expect(push.hold!.registerHeaders, <String, String>{
+      expect(push.hold.registerHeaders, <String, String>{
         'X-Index': '4211',
         'X-Label': '1938273',
         'X-vobiz-Registrar-Info': '203.0.113.10',
@@ -59,33 +55,30 @@ void main() {
       expect(push.isExpired(DateTime.fromMillisecondsSinceEpoch(1762900030000)), isTrue);
     });
 
-    test('the push bridge\'s milliseconds are still milliseconds', () {
-      final push = VobizIncomingPush.tryParse(<String, Object?>{
-        'type': 'incoming_call',
-        'call_id': 'c-1',
-        'expires_at': '1762900030000',
-      })!;
-      expect(push.expiresAt, DateTime.fromMillisecondsSinceEpoch(1762900030000));
-      expect(push.isHeldByVobiz, isFalse);
+    test('a time too large to be seconds is read as milliseconds', () {
+      expect(VobizIncomingPush.epochToDateTime(1762900030000), DateTime.fromMillisecondsSinceEpoch(1762900030000));
+      expect(VobizIncomingPush.epochToDateTime(1762900030), DateTime.fromMillisecondsSinceEpoch(1762900030000));
     });
 
-    test('without all three of index, label and registrar there is no hold', () {
+    test('ignores other data messages', () {
+      expect(VobizIncomingPush.tryParse(<String, Object?>{'type': 'check'}), isNull);
+      expect(VobizIncomingPush.tryParse(<String, Object?>{'type': 'incoming_call'}), isNull);
+      expect(VobizIncomingPush.tryParse(<String, Object?>{...vobizPush(), 'type': 'call_ended'}), isNull);
+      expect(VobizIncomingPush.tryParse(<String, Object?>{...vobizPush(), 'call_id': ''}), isNull);
+    });
+
+    test('without any one of index, label and registrar it is not a push to act on', () {
       for (final missing in <String>['index', 'label', 'registrar']) {
         final data = vobizPush()..remove(missing);
-        expect(VobizIncomingPush.tryParse(data)!.hold, isNull, reason: 'without $missing');
+        expect(VobizIncomingPush.tryParse(data), isNull, reason: 'without $missing');
       }
     });
 
-    test('a held call matches its INVITE by Call-ID only, never by a header or the number', () {
+    test('a held call matches its INVITE by Call-ID only', () {
       final push = VobizIncomingPush.tryParse(vobizPush())!;
-      expect(push.matchesIncomingCall(headers: const <String, String>{}, sipCallId: 'held-call-1@10.0.2.9'),
-          isTrue);
-      expect(push.matchesIncomingCall(headers: const <String, String>{}, sipCallId: 'other@10.0.2.9'), isFalse);
-      expect(push.matchesIncomingCall(headers: const <String, String>{}), isFalse);
-      expect(
-          push.matchesIncomingCall(
-              headers: <String, String>{'X-VH-PushRef': 'held-call-1@10.0.2.9'}, sipCallId: 'other'),
-          isFalse);
+      expect(push.matchesIncomingCall(sipCallId: 'held-call-1@10.0.2.9'), isTrue);
+      expect(push.matchesIncomingCall(sipCallId: 'other@10.0.2.9'), isFalse);
+      expect(push.matchesIncomingCall(sipCallId: null), isFalse);
     });
   });
 
@@ -280,13 +273,9 @@ void main() {
       expect(h.client.pushedCall, isNull);
     });
 
-    test('a push that is not a call Vobiz holds, a test or a stale one is not acted on', () {
-      final bridge = VobizIncomingPush.tryParse(<String, Object?>{'type': 'incoming_call', 'call_id': 'c-1'})!;
-      final testPush = VobizIncomingPush.tryParse(vobizPush(test: true))!;
-      final stale = push(expiresAt: 1000);
-      for (final p in <VobizIncomingPush>[bridge, testPush, stale]) {
-        expect(h.client.handleIncomingPush(p), isFalse);
-      }
+    test('a push without a hold does not parse, and a stale one is not acted on', () {
+      expect(VobizIncomingPush.tryParse(<String, Object?>{'type': 'incoming_call', 'call_id': 'c-1'}), isNull);
+      expect(h.client.handleIncomingPush(push(expiresAt: 1000)), isFalse);
       expect(h.sent, isEmpty);
       expect(updates, isEmpty);
     });

@@ -1,12 +1,3 @@
-/// What an incoming-call push says happened.
-enum VobizPushKind {
-  /// A call is ringing: show the call screen and sign in.
-  incomingCall,
-
-  /// The call ended before it was answered: stop ringing.
-  callEnded,
-}
-
 /// What became of a call push handed to `VobizClient.handleIncomingPush`.
 enum VobizPushCallStatus {
   /// The REGISTER that claims the held call is on its way, or waits for the
@@ -89,91 +80,57 @@ class VobizPushHold {
   String toString() => 'VobizPushHold(index $index, label $label, registrar $registrar)';
 }
 
-/// A call push, read from a push message's data map (for example
-/// `RemoteMessage.data` from `firebase_messaging`).
+/// Vobiz's incoming-call push, read from a push message's data map (for
+/// example `RemoteMessage.data` from `firebase_messaging`).
 ///
 /// The SDK does not depend on any push service or call-screen plugin; the app
-/// receives the push and hands its data here. Two senders are understood:
+/// receives the push and hands its data here. Vobiz's registrar sends it,
+/// through Vobiz's push service, and holds the call for up to 30 s while the
+/// push wakes the app:
 ///
-/// * **Vobiz** (the registrar, through Vobiz's push service). It holds the
-///   call for up to 30 s while the push wakes the app:
+/// ```json
+/// {"type": "incoming_call", "call_id": "<SIP Call-ID>", "call_uuid": "...",
+///  "caller": "...", "caller_number": "+91...", "callee": "<SIP user>",
+///  "index": "...", "label": "...", "registrar": "...",
+///  "expires_at": "1762900030"}
+/// ```
 ///
-///   ```json
-///   {"type": "incoming_call", "call_id": "<SIP Call-ID>", "call_uuid": "...",
-///    "caller": "...", "caller_number": "+91...", "callee": "<SIP user>",
-///    "index": "...", "label": "...", "registrar": "...",
-///    "expires_at": "1762900030"}
-///   ```
-///
-///   `expires_at` is in Unix seconds. Hand the push to
-///   `VobizClient.handleIncomingPush`: the next REGISTER claims the held call
-///   ([hold]), and the INVITE that follows carries [callId] as its Call-ID.
-/// * **The reference push bridge** (`example/push_bridge`), which puts its
-///   own reference on the INVITE as a `PushRef` SIP header:
-///
-///   ```json
-///   {"type": "incoming_call", "call_id": "...", "caller": "+91...",
-///    "callee": "+91...", "expires_at": "1729600000000"}
-///   ```
-///
-///   `expires_at` is in Unix milliseconds.
-///
-/// [matchesIncomingCall] ties the SIP INVITE that follows to the screen the
-/// app already showed. See doc/PUSH_DESIGN.md.
+/// `expires_at` is in Unix seconds. Hand the push to
+/// `VobizClient.handleIncomingPush`: the next REGISTER claims the held call
+/// ([hold]), and the INVITE that follows carries [callId] as its Call-ID,
+/// which [matchesIncomingCall] checks. See doc/PUSH_DESIGN.md.
 class VobizIncomingPush {
   const VobizIncomingPush({
-    required this.kind,
     required this.callId,
-    this.callKey = '',
+    required this.hold,
     this.caller = '',
     this.callee = '',
-    this.server = '',
     this.expiresAt,
-    this.reason = '',
-    this.isTest = false,
-    this.lineBusy = false,
     this.callUuid = '',
     this.callerNumber = '',
-    this.hold,
   });
 
-  /// Reads a push's data map. Null when it is not a Vobiz call push.
+  /// Reads a push's data map. Null unless it is Vobiz's push for a call its
+  /// registrar holds: `type` is `incoming_call`, `call_id` is not empty, and
+  /// `index`, `label` and `registrar` are all there ([hold]).
   ///
-  /// [receivedAt] (default: now) anchors the sender's relative `ttl_ms`, so
-  /// the expiry does not depend on the phone's clock agreeing with the
-  /// sender's. An absolute `expires_at` is used only when there is no
-  /// `ttl_ms`; it is read as Unix seconds when it is too small to be
-  /// milliseconds (Vobiz sends seconds, the push bridge milliseconds).
-  static VobizIncomingPush? tryParse(Map<String, Object?> data,
-      {DateTime? receivedAt}) {
-    final kind = switch ('${data['type'] ?? ''}') {
-      'incoming_call' => VobizPushKind.incomingCall,
-      'call_ended' => VobizPushKind.callEnded,
-      _ => null,
-    };
+  /// `expires_at` is read as Unix seconds, or as milliseconds when it is too
+  /// large to be seconds ([epochToDateTime]).
+  static VobizIncomingPush? tryParse(Map<String, Object?> data) {
+    if ('${data['type'] ?? ''}' != 'incoming_call') return null;
     final callId = '${data['call_id'] ?? ''}';
-    if (kind == null || callId.isEmpty) return null;
-    final ttlMs = int.tryParse('${data['ttl_ms'] ?? ''}');
+    if (callId.isEmpty) return null;
+    final hold = VobizPushHold.tryParse(data);
+    if (hold == null) return null;
     final expires = int.tryParse('${data['expires_at'] ?? ''}');
-    final DateTime? expiresAt = ttlMs != null
-        ? (receivedAt ?? DateTime.now()).add(Duration(milliseconds: ttlMs))
-        : expires == null
-            ? null
-            : epochToDateTime(expires);
     return VobizIncomingPush(
-      kind: kind,
       callId: callId,
-      callKey: '${data['call_key'] ?? ''}',
+      hold: hold,
       caller: '${data['caller'] ?? ''}',
       callee: '${data['callee'] ?? ''}',
-      server: '${data['server'] ?? ''}',
-      expiresAt: expiresAt,
-      reason: '${data['reason'] ?? ''}',
-      isTest: '${data['test'] ?? ''}' == '1',
-      lineBusy: '${data['line_busy'] ?? ''}' == '1',
+      expiresAt: expires == null ? null : epochToDateTime(expires),
       callUuid: '${data['call_uuid'] ?? ''}',
       callerNumber: '${data['caller_number'] ?? ''}',
-      hold: VobizPushHold.tryParse(data),
     );
   }
 
@@ -184,52 +141,27 @@ class VobizIncomingPush {
       ? DateTime.fromMillisecondsSinceEpoch(value * 1000)
       : DateTime.fromMillisecondsSinceEpoch(value);
 
-  final VobizPushKind kind;
-
-  /// The sender's reference for this call: the SIP Call-ID of the INVITE
-  /// Vobiz is holding, or the push bridge's own reference, which it also puts
-  /// on the INVITE as a `PushRef` SIP header.
+  /// The SIP Call-ID of the INVITE Vobiz's registrar is holding.
   final String callId;
 
-  /// Vobiz's CallUUID for the call (Vobiz pushes), for logs and call records.
+  /// Vobiz's CallUUID for the call, for logs and call records.
   final String callUuid;
 
-  /// The caller's number (Vobiz pushes), where [caller] may be a name.
+  /// The caller's number, where [caller] may be a name.
   final String callerNumber;
 
-  /// Where Vobiz's registrar holds the call (Vobiz pushes only): the next
-  /// REGISTER hands it back to claim the call. Null for the push bridge's
-  /// pushes.
-  final VobizPushHold? hold;
+  /// Where Vobiz's registrar holds the call: the next REGISTER hands it back
+  /// to claim the call.
+  final VobizPushHold hold;
 
-  /// Whether Vobiz's registrar is holding this call for a REGISTER that
-  /// claims it ([hold]), rather than a push bridge ringing again.
-  bool get isHeldByVobiz => hold != null;
-
-  /// A per-call secret the sender issued, for declining through it.
-  final String callKey;
-
-  /// Who is calling, as the sender saw it.
+  /// Who is calling, as Vobiz saw it.
   final String caller;
 
-  /// The number that was called.
+  /// The SIP user that was called.
   final String callee;
 
-  /// The sender's public base URL.
-  final String server;
-
-  /// When the sender stops ringing this device.
+  /// When Vobiz stops holding the call for this device.
   final DateTime? expiresAt;
-
-  /// Why the call ended ([VobizPushKind.callEnded] only).
-  final String reason;
-
-  /// A test push, not a real call.
-  final bool isTest;
-
-  /// The user is already on a call: show call waiting, not a full-screen
-  /// incoming-call screen.
-  final bool lineBusy;
 
   /// Whether the push has expired at [now] (default: the current time).
   bool isExpired([DateTime? now]) {
@@ -237,43 +169,11 @@ class VobizIncomingPush {
     return at != null && !(now ?? DateTime.now()).isBefore(at);
   }
 
-  /// Whether an incoming SIP call is the one this push announced.
-  ///
-  /// For a call Vobiz holds ([isHeldByVobiz]), the INVITE's SIP Call-ID
-  /// ([sipCallId], from `CallEvent.sipCallId`) must be [callId]. For the push
-  /// bridge, [headers] (the INVITE's custom headers, `VobizClient.callHeaders`)
-  /// must carry it as `PushRef`. Only an exact match counts: matching by phone
-  /// number could auto-answer a different call from the same caller.
-  bool matchesIncomingCall({required Map<String, String> headers, String? sipCallId}) =>
-      isHeldByVobiz ? sipCallId != null && sipCallId == callId : pushRefFromHeaders(headers) == callId;
-
-  /// The push reference on an INVITE's headers: any header whose name
-  /// contains `PushRef` (Vobiz documents two spellings for `<User
-  /// sipHeaders>` keys).
-  static String? pushRefFromHeaders(Map<String, String> headers) {
-    for (final entry in headers.entries) {
-      if (entry.key.toLowerCase().contains('pushref') && entry.value.isNotEmpty) {
-        try {
-          return Uri.decodeComponent(entry.value);
-        } on ArgumentError {
-          return entry.value;
-        }
-      }
-    }
-    return null;
-  }
-
-  /// The real caller passed as an `X-VH-Caller` header, when present.
-  static String? callerFromHeaders(Map<String, String> headers) {
-    for (final entry in headers.entries) {
-      final name = entry.key.toLowerCase();
-      if (name.endsWith('-caller') || name.endsWith('-callerx-vh')) {
-        final digits = entry.value.replaceAll(RegExp(r'\D'), '');
-        if (digits.isNotEmpty) return '+$digits';
-      }
-    }
-    return null;
-  }
+  /// Whether an incoming SIP call is the one this push announced: the
+  /// INVITE's SIP Call-ID ([sipCallId], from `CallEvent.sipCallId`) must be
+  /// [callId]. Only an exact match counts: matching by phone number could
+  /// auto-answer a different call from the same caller.
+  bool matchesIncomingCall({required String? sipCallId}) => sipCallId != null && sipCallId == callId;
 
   /// Two numbers are the same when their last ten digits match (at least six
   /// digits each), so `+91 98765 43210` matches `09876543210`.
