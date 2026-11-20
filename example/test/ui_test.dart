@@ -10,6 +10,7 @@ import 'package:vobiz_webrtc_example/src/screens/trace_panel.dart';
 import 'package:vobiz_webrtc_example/src/widgets/keypad.dart';
 
 import 'support/fakes.dart';
+import 'support/setup.dart';
 
 /// The screens themselves: sheets, fields, the pill, the trace, and what a
 /// screen reader hears.
@@ -18,9 +19,7 @@ void main() {
   late PlaygroundController controller;
 
   Future<void> openApp(WidgetTester tester, {Map<String, String> secure = const <String, String>{}}) async {
-    tester.view.physicalSize = const Size(1236, 2745);
-    tester.view.devicePixelRatio = 3.0;
-    addTearDown(tester.view.reset);
+    usePhoneScreen(tester);
     SharedPreferences.setMockInitialValues(<String, Object>{});
     FlutterSecureStorage.setMockInitialValues(<String, String>{
       'vobiz_sip_username': 'play1',

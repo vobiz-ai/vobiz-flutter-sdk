@@ -7,16 +7,11 @@ import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 import 'package:vobiz_webrtc_example/src/screens/identity_panel.dart';
 
 import 'support/fakes.dart';
+import 'support/setup.dart';
 
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
 
-  /// A phone-sized screen (412 x 915 logical pixels), like the emulator.
-  void usePhoneScreen(WidgetTester tester) {
-    tester.view.physicalSize = const Size(1236, 2745);
-    tester.view.devicePixelRatio = 3.0;
-    addTearDown(tester.view.reset);
-  }
 
   /// The Identity list builds lazily: scroll back to its top, where the
   /// sign-in form is, before looking for the form's buttons.

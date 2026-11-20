@@ -187,6 +187,8 @@ void main() {
     expect(prefs.getString('vobiz_playground_mode'), 'token');
     final stored = await const FlutterSecureStorage().readAll();
     expect(stored.values.any((v) => v.contains(token)), isFalse);
+    expect(prefs.getKeys().any((k) => '${prefs.get(k)}'.contains(token)), isFalse,
+        reason: 'nor next to the sign-in settings, in plain text');
 
     final second = make(MockClient((_) async => http.Response('{}', 500)));
     await second.init();

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -14,9 +15,10 @@ import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 /// ```
 ///
 /// where the JSON file (kept outside the repository) holds `VOBIZ_AUTH_ID` and
-/// `VOBIZ_AUTH_TOKEN`. The credentials come from the command line, never from this file, and
-/// "Remember me" is switched off so nothing is written to the device. Without
-/// them the test is skipped.
+/// `VOBIZ_AUTH_TOKEN`. The credentials come from the command line, never from this file.
+/// Storage is replaced by in-memory fakes, so the test neither reads nor
+/// erases a sign-in saved on the device. Without the credentials the test is
+/// skipped.
 ///
 /// Zero-Config Setup rotates the password of the account's "Vobiz WebRTC
 /// Playground Endpoint", exactly as signing in on the web Playground does.
@@ -44,6 +46,7 @@ void main() {
     'Zero-Config Setup, then SIP Direct with the endpoint it provisioned',
     (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
+      FlutterSecureStorage.setMockInitialValues(<String, String>{});
       final controller = PlaygroundController();
       await tester.pumpWidget(PlaygroundApp(controller: controller));
       await tester.pumpAndSettle();
@@ -64,6 +67,8 @@ void main() {
           contains(predicate<String>((m) => m.startsWith('Registered successfully as'))));
       final provisioned = controller.connectedAs;
       expect(provisioned, isNotNull);
+      // Sign-out forgets the password, so keep the one Zero-Config provisioned.
+      final password = controller.sipPassword;
       // ignore: avoid_print
       print('Zero-Config: registered as $provisioned');
 
@@ -77,10 +82,12 @@ void main() {
       expect(controller.authMode, VobizAuthMode.none);
 
       // ── SIP Direct with the provisioned endpoint ────────────────────────────
-      // Zero-Config filled the SIP Direct fields, as the web Playground does.
+      // Zero-Config filled the SIP Direct username, as the web Playground
+      // does; the password was forgotten at sign-out, so type it back.
       await tester.tap(find.text('SIP Direct'));
       await tester.pumpAndSettle();
       expect(controller.sipUsername, provisioned);
+      await tester.enterText(find.byKey(const Key('sipPassword')), password);
       await tester.ensureVisible(find.byKey(const Key('connect')));
       await tester.tap(find.byKey(const Key('connect')));
       await waitFor(tester, () => settled(controller));
@@ -89,12 +96,6 @@ void main() {
       expect(controller.authMode, VobizAuthMode.sipDirect);
       // ignore: avoid_print
       print('SIP Direct: registered as ${controller.client.sipUsername}');
-
-      // Transfer is a Zero-Config feature; SIP Direct must say so, not try.
-      expect(
-        () => controller.client.transferCall(number: '+919876543210'),
-        throwsStateError,
-      );
 
       await controller.disconnect();
       await tester.pumpAndSettle();

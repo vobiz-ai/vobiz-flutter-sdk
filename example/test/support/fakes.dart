@@ -290,8 +290,16 @@ class FakeCallPlatform extends CallPlatform {
   @override
   Stream<void> get hangUpRequests => hangUpController.stream;
 
+  /// Pushes Android received before Dart was listening (the push that
+  /// started a closed app): [ready] hands them over once.
+  final List<Map<String, String>> queued = <Map<String, String>>[];
+
   @override
-  Future<List<Map<String, String>>> ready() async => const <Map<String, String>>[];
+  Future<List<Map<String, String>>> ready() async {
+    final pushes = List<Map<String, String>>.of(queued);
+    queued.clear();
+    return pushes;
+  }
 
   /// What [packageName] returns: the application id in build.gradle.kts.
   String? appId = 'ai.vobiz.vobiz_webrtc_example';

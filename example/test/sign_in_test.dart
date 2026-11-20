@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -13,6 +14,7 @@ import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 import 'package:vobiz_webrtc_example/src/screens/identity_panel.dart';
 
 import 'support/fakes.dart';
+import 'support/setup.dart';
 
 void main() {
   late FakeClient client;
@@ -29,11 +31,6 @@ void main() {
         platform: FakeCallPlatform(),
       );
 
-  void usePhoneScreen(WidgetTester tester) {
-    tester.view.physicalSize = const Size(1236, 2745);
-    tester.view.devicePixelRatio = 3.0;
-    addTearDown(tester.view.reset);
-  }
 
   group('Connect shows what is wrong on the Identity tab (#57)', () {
     testWidgets('empty fields: an error under each, and the reason under Connect', (tester) async {
@@ -62,7 +59,8 @@ void main() {
       expect(find.descendant(of: identity, matching: find.text('Required')), findsOneWidget);
     });
 
-    testWidgets('a failed sign-in is shown under Connect too', (tester) async {
+    testWidgets('a sign-in refused before it starts (an http webhook) is shown under Connect too',
+        (tester) async {
       usePhoneScreen(tester);
       final controller = make();
       await tester.pumpWidget(PlaygroundApp(controller: controller));
@@ -81,7 +79,14 @@ void main() {
   });
 
   group('Sign-out (#27)', () {
-    test('removes the saved Auth Token and SIP password from secure storage', () async {
+    test('removes every saved secret from secure storage', () async {
+      FlutterSecureStorage.setMockInitialValues(<String, String>{
+        'vobiz_sip_username': 'play1',
+        'vobiz_sip_password': 'pw',
+        'vobiz_push_auth_id': 'MA_X',
+        'vobiz_push_auth_token': 'account-token',
+        'vobiz_push_server': 'https://bridge.example#key=k1',
+      });
       final controller = make();
       await controller.init();
       controller
@@ -93,11 +98,11 @@ void main() {
       expect(await storage.read(key: 'vobiz_auth_token'), 'master-token');
 
       await controller.disconnect();
-      expect(await storage.read(key: 'vobiz_auth_token'), isNull);
-      expect(await storage.read(key: 'vobiz_auth_id'), isNull);
-      expect(await storage.read(key: 'vobiz_sip_password'), isNull);
+      expect(await storage.readAll(), isEmpty);
       expect(controller.authToken, isEmpty);
       expect(controller.sipPassword, isEmpty);
+      expect(controller.pushAuthToken, isEmpty);
+      expect(controller.pushServer, isEmpty);
     });
 
     test('a sign-in still waiting for /api/setup does not come back after sign-out', () async {
@@ -278,6 +283,65 @@ void main() {
       expect(controller.status, PhoneStatus.online);
       expect(await const FlutterSecureStorage().read(key: 'vobiz_sip_password'), 'pw');
       controller.dispose();
+    });
+  });
+
+  group('a sign-in that fails', () {
+    test('Vobiz refusing the setup shows an API Setup Error under Connect', () async {
+      final controller = make();
+      await controller.init();
+      controller
+        ..authId = 'MA_X'
+        ..authToken = 'wrong';
+      client.failConnect = const VobizException('setup_failed', 'Invalid Auth ID or Auth Token');
+      await controller.connect();
+      expect(controller.connectError, 'API Setup Error: Invalid Auth ID or Auth Token');
+      expect(controller.status, PhoneStatus.offline);
+      expect(controller.statusText, 'Error');
+      controller.dispose();
+    });
+
+    test('the registrar refusing the login shows Login failed', () async {
+      final controller = make();
+      await controller.init();
+      controller.setAuthTab(AuthTab.sipDirect);
+      controller
+        ..sipUsername = 'play1'
+        ..sipPassword = 'wrong';
+      client.registerOnConnect = false;
+      await controller.connect();
+      client.fakeConnections.add(ConnectionEvent(
+        connectionState: ConnectionStateStatus.failed,
+        registrationState: RegistrationState.failed,
+        message: 'Registration failed: 403 Forbidden',
+      ));
+      await pumpEventQueue();
+      expect(controller.connectError, 'Login failed: 403 Forbidden');
+      expect(controller.status, PhoneStatus.error);
+      expect(controller.statusText, 'Auth Failed');
+      controller.dispose();
+    });
+
+    test('a registrar that never answers times out after 20 s', () {
+      fakeAsync((async) {
+        final controller = make();
+        controller.init();
+        async.flushMicrotasks();
+        controller.setAuthTab(AuthTab.sipDirect);
+        controller
+          ..sipUsername = 'play1'
+          ..sipPassword = 'pw';
+        client.registerOnConnect = false;
+        controller.connect();
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 19));
+        expect(controller.status, PhoneStatus.connecting);
+        async.elapse(const Duration(seconds: 2));
+        expect(controller.status, PhoneStatus.error);
+        expect(controller.statusText, 'Timeout');
+        expect(controller.connectError, contains('No response from registrar'));
+        controller.dispose();
+      });
     });
   });
 

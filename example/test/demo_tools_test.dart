@@ -9,6 +9,7 @@ import 'package:vobiz_webrtc_example/src/demo_client.dart';
 import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 
 import 'support/fakes.dart';
+import 'support/setup.dart';
 
 /// The release gate: demo and test-only tools (Zero-Config, account
 /// credentials for push sign-up, the test call) only with kDemoTools.
@@ -123,11 +124,6 @@ void main() {
   });
 
   group('the Identity tab', () {
-    void usePhoneScreen(WidgetTester tester) {
-      tester.view.physicalSize = const Size(1236, 2745);
-      tester.view.devicePixelRatio = 3.0;
-      addTearDown(tester.view.reset);
-    }
 
     for (final demoTools in <bool>[true, false]) {
       testWidgets(demoTools ? 'with the demo tools: Zero-Config and the test tools are offered' : 'without them: none of them is built',

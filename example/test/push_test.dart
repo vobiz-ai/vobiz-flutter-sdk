@@ -11,6 +11,8 @@ import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 import 'package:vobiz_webrtc_example/src/push/push_bridge_api.dart';
 import 'package:vobiz_webrtc_example/src/push/push_call.dart';
 
+import 'support/setup.dart';
+
 void main() {
   group('PushCall', () {
     Map<String, dynamic> vobiz({required DateTime expires}) => <String, dynamic>{
@@ -161,11 +163,6 @@ void main() {
       FlutterSecureStorage.setMockInitialValues(<String, String>{});
     });
 
-    void usePhoneScreen(WidgetTester tester) {
-      tester.view.physicalSize = const Size(1236, 2745);
-      tester.view.devicePixelRatio = 3.0;
-      addTearDown(tester.view.reset);
-    }
 
     testWidgets('Vobiz push starts off, the connection watch waits for a server line, and a bad line is refused',
         (tester) async {

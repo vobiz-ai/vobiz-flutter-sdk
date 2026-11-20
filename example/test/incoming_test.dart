@@ -9,6 +9,7 @@ import 'package:vobiz_webrtc_example/src/call_history.dart';
 import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 
 import 'support/fakes.dart';
+import 'support/setup.dart';
 
 /// Incoming calls over SIP: the call screen, the call service and the log.
 void main() {
@@ -19,26 +20,21 @@ void main() {
   late List<http.Request> requests;
 
   Future<void> start({Map<String, String> secure = const <String, String>{}, Map<String, Object> prefs = const <String, Object>{}}) async {
-    SharedPreferences.setMockInitialValues(prefs);
-    FlutterSecureStorage.setMockInitialValues(<String, String>{
-      'vobiz_auth_id': 'MA_X',
-      'vobiz_auth_token': 'tok',
-      ...secure,
-    });
     client = FakeClient();
     screen = FakeCallScreen();
     platform = FakeCallPlatform();
     requests = <http.Request>[];
-    controller = PlaygroundController(
+    controller = await startController(
       client: client,
-      callScreen: screen,
+      screen: screen,
       platform: platform,
+      secure: <String, String>{...savedZeroConfig, ...secure},
+      prefs: prefs,
       httpClient: MockClient((request) async {
         requests.add(request);
         return http.Response('{}', 200);
       }),
     );
-    await controller.init();
   }
 
   Future<void> signIn() async {
