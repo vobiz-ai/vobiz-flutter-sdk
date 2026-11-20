@@ -13,7 +13,10 @@ const bool kAllowHttp = !kReleaseMode;
 /// sends it.
 ///
 /// The server prints both as one line, `https://<tunnel>#key=<key>`, so they
-/// can be pasted into the app together.
+/// can be pasted into the app together. The key is the server's whole
+/// credential: whoever holds it can mint access tokens, run conferences,
+/// watch calls and sign phones up for Vobiz push, so the app keeps the line
+/// in secure storage and forgets it at sign-out.
 class PushBridgeConfig {
   const PushBridgeConfig({required this.baseUrl, required this.key});
 
