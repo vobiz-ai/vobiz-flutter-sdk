@@ -59,31 +59,15 @@ class _SipHeaderEditorState extends State<SipHeaderEditor> {
       ),
       child: Column(
         children: <Widget>[
-          InkWell(
-            borderRadius: BorderRadius.circular(18),
+          SectionHeader(
+            icon: Icons.tag,
+            title: 'SIP HEADERS',
+            open: _open,
             onTap: () => setState(() => _open = !_open),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              child: Row(
-                children: <Widget>[
-                  Icon(Icons.tag, size: 14, color: pg.accent.withValues(alpha: 0.8)),
-                  const SizedBox(width: 8),
-                  Text('SIP HEADERS',
-                      style: TextStyle(
-                          fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
-                  if (c.activeHeaderCount > 0) ...<Widget>[
-                    const SizedBox(width: 8),
-                    Chip2('${c.activeHeaderCount}', color: pg.accent),
-                  ],
-                  if (c.recordCall) ...<Widget>[
-                    const SizedBox(width: 6),
-                    Chip2('REC', color: pg.danger),
-                  ],
-                  const Spacer(),
-                  Icon(_open ? Icons.expand_less : Icons.expand_more, size: 18, color: pg.faint),
-                ],
-              ),
-            ),
+            chips: <Widget>[
+              if (c.activeHeaderCount > 0) Chip2('${c.activeHeaderCount}', color: pg.accent),
+              if (c.recordCall) Chip2('REC', color: pg.danger),
+            ],
           ),
           if (_open)
             Padding(

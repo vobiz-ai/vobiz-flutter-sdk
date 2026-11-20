@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../countries.dart';
 import '../theme.dart';
+import 'common.dart';
 
 /// A country-code picker joined to a national-number input.
 ///
@@ -20,7 +21,6 @@ class PhoneNumberField extends StatefulWidget {
     this.placeholder = '',
     this.large = false,
     this.accent = false,
-    this.enabled = true,
     this.onSubmitted,
   });
 
@@ -32,7 +32,6 @@ class PhoneNumberField extends StatefulWidget {
   final String placeholder;
   final bool large;
   final bool accent;
-  final bool enabled;
   final VoidCallback? onSubmitted;
 
   @override
@@ -45,8 +44,11 @@ class _PhoneNumberFieldState extends State<PhoneNumberField> {
   @override
   void didUpdateWidget(PhoneNumberField old) {
     super.didUpdateWidget(old);
-    // Keep the field in step when the number changes from outside (the keypad).
-    if (widget.number != _text.text) {
+    // Keep the field in step when the number changes from outside (the
+    // keypad, a pasted +code moving into the picker). A change that only
+    // follows what was typed leaves the text alone: its "+", spaces and
+    // brackets stay, and the cursor stays where it is.
+    if (widget.number != old.number && widget.number != _text.text.replaceAll(RegExp(r'\D'), '')) {
       _text.value = TextEditingValue(
         text: widget.number,
         selection: TextSelection.collapsed(offset: widget.number.length),
@@ -66,8 +68,9 @@ class _PhoneNumberFieldState extends State<PhoneNumberField> {
       if (split != null) {
         if (split.country.iso != widget.iso) widget.onIsoChanged(split.country.iso);
         widget.onNumberChanged(split.national);
-        return;
       }
+      // No calling code yet ("+", "+4"): keep typing.
+      return;
     }
     widget.onNumberChanged(raw.replaceAll(RegExp(r'\D'), ''));
   }
@@ -83,48 +86,47 @@ class _PhoneNumberFieldState extends State<PhoneNumberField> {
     final country = findCountry(widget.iso);
     final size = widget.large ? 20.0 : 15.0;
     final color = widget.accent ? pg.accent : pg.text;
-    return Opacity(
-      opacity: widget.enabled ? 1 : 0.5,
-      child: Container(
-        decoration: BoxDecoration(
-          color: pg.field,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-              color: widget.accent ? pg.accent.withValues(alpha: 0.45) : pg.border, width: 1.5),
-        ),
-        child: Row(
-          children: <Widget>[
-            InkWell(
-              onTap: widget.enabled ? _pickCountry : null,
-              borderRadius: const BorderRadius.horizontal(left: Radius.circular(14)),
-              child: Semantics(
-                button: true,
-                label: '${widget.label} country code, ${country.name} ${country.dial}',
-                child: Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 12, vertical: widget.large ? 14 : 11),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: <Widget>[
-                      Text(country.iso,
-                          style: TextStyle(fontWeight: FontWeight.w700, fontSize: size * 0.8, color: pg.muted)),
-                      const SizedBox(width: 6),
-                      Text(country.dial,
-                          style: TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: size,
-                              fontWeight: FontWeight.w600,
-                              color: color)),
-                      Icon(Icons.expand_more, size: 18, color: pg.faint),
-                    ],
-                  ),
+    return Container(
+      decoration: BoxDecoration(
+        color: pg.field,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+            color: widget.accent ? pg.accent.withValues(alpha: 0.45) : pg.border, width: 1.5),
+      ),
+      child: Row(
+        children: <Widget>[
+          InkWell(
+            onTap: _pickCountry,
+            borderRadius: const BorderRadius.horizontal(left: Radius.circular(14)),
+            child: Semantics(
+              button: true,
+              label: '${widget.label} country code, ${country.name} ${country.dial}',
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12, vertical: widget.large ? 14 : 11),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Text(country.iso,
+                        style: TextStyle(fontWeight: FontWeight.w700, fontSize: size * 0.8, color: pg.muted)),
+                    const SizedBox(width: 6),
+                    Text(country.dial,
+                        style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: size,
+                            fontWeight: FontWeight.w600,
+                            color: color)),
+                    Icon(Icons.expand_more, size: 18, color: pg.faint),
+                  ],
                 ),
               ),
             ),
-            Container(width: 1, height: widget.large ? 30 : 24, color: pg.border),
-            Expanded(
+          ),
+          Container(width: 1, height: widget.large ? 30 : 24, color: pg.border),
+          Expanded(
+            child: Semantics(
+              label: widget.label,
               child: TextField(
                 controller: _text,
-                enabled: widget.enabled,
                 keyboardType: TextInputType.phone,
                 textInputAction: widget.onSubmitted != null ? TextInputAction.go : TextInputAction.next,
                 inputFormatters: <TextInputFormatter>[
@@ -148,12 +150,11 @@ class _PhoneNumberFieldState extends State<PhoneNumberField> {
                   focusedBorder: InputBorder.none,
                   disabledBorder: InputBorder.none,
                   contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: widget.large ? 16 : 12),
-                  semanticCounterText: widget.label,
                 ),
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -219,11 +220,7 @@ class _CountryPickerSheetState extends State<_CountryPickerSheet> {
       child: Column(
         children: <Widget>[
           const SizedBox(height: 8),
-          Container(
-            width: 40,
-            height: 4,
-            decoration: BoxDecoration(color: pg.border, borderRadius: BorderRadius.circular(2)),
-          ),
+          const SheetHandle(),
           Padding(
             padding: const EdgeInsets.all(16),
             child: TextField(

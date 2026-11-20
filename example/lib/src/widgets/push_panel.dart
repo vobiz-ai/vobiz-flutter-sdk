@@ -25,6 +25,43 @@ class _PushPanelState extends State<PushPanel> {
   bool _showServer = false;
   String? _error;
 
+  // The controller's values each field was last filled from. init() reads
+  // secure storage after the first frame, and a sign-out clears the server
+  // line: a field takes the controller's new value then, but never
+  // overwrites what the user is typing.
+  late String _serverFrom;
+  late String _pushAuthIdFrom;
+  late String _pushAuthTokenFrom;
+  late String _callFromFrom;
+  late String _callAnswerUrlFrom;
+
+  @override
+  void initState() {
+    super.initState();
+    final c = widget.controller;
+    _serverFrom = c.pushServer;
+    _pushAuthIdFrom = c.pushAuthId;
+    _pushAuthTokenFrom = c.pushAuthToken;
+    _callFromFrom = c.vobizCallFrom;
+    _callAnswerUrlFrom = c.vobizCallAnswerUrl;
+  }
+
+  @override
+  void didUpdateWidget(PushPanel old) {
+    super.didUpdateWidget(old);
+    final c = widget.controller;
+    _serverFrom = _follow(_server, _serverFrom, c.pushServer);
+    _pushAuthIdFrom = _follow(_pushAuthId, _pushAuthIdFrom, c.pushAuthId);
+    _pushAuthTokenFrom = _follow(_pushAuthToken, _pushAuthTokenFrom, c.pushAuthToken);
+    _callFromFrom = _follow(_callFrom, _callFromFrom, c.vobizCallFrom);
+    _callAnswerUrlFrom = _follow(_callAnswerUrl, _callAnswerUrlFrom, c.vobizCallAnswerUrl);
+  }
+
+  String _follow(TextEditingController field, String from, String now) {
+    if (now != from) field.text = now;
+    return now;
+  }
+
   @override
   void dispose() {
     _server.dispose();
@@ -241,6 +278,7 @@ class _PushPanelState extends State<PushPanel> {
         keyboardType: TextInputType.url,
         style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
         decoration: InputDecoration(
+          labelText: 'Sample server',
           hintText: 'https://….trycloudflare.com#key=…',
           errorText: _error,
           suffixIcon: Row(

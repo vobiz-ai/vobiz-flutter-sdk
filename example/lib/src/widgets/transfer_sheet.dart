@@ -7,22 +7,8 @@ import 'common.dart';
 import 'phone_number_field.dart';
 
 /// Opens the transfer panel for the connected call.
-Future<void> showTransferSheet(BuildContext context, PlaygroundController controller) {
-  return showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    useSafeArea: true,
-    backgroundColor: context.pg.panel,
-    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-    builder: (_) => Padding(
-      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-      child: ListenableBuilder(
-        listenable: controller,
-        builder: (context, _) => _TransferSheet(controller: controller),
-      ),
-    ),
-  );
-}
+Future<void> showTransferSheet(BuildContext context, PlaygroundController controller) =>
+    showPlaygroundSheet(context, controller, (_) => _TransferSheet(controller: controller));
 
 class _TransferSheet extends StatelessWidget {
   const _TransferSheet({required this.controller});
@@ -33,6 +19,12 @@ class _TransferSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = controller;
     final pg = context.pg;
+    // The call is over: close the sheet, as the Conference sheet does.
+    if (c.status != PhoneStatus.inCall) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (context.mounted && ModalRoute.of(context)?.isCurrent == true) Navigator.of(context).pop();
+      });
+    }
     final busy = c.transferStatus == TransferStatus.submitting;
     final zeroConfig = c.authMode == VobizAuthMode.zeroConfig;
     final filled = c.transferTarget == TransferTarget.user
@@ -45,13 +37,7 @@ class _TransferSheet extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          Center(
-            child: Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(color: pg.border, borderRadius: BorderRadius.circular(2)),
-            ),
-          ),
+          const SheetHandle(),
           const SizedBox(height: 14),
           Row(children: <Widget>[
             Icon(Icons.phone_forwarded, color: pg.accent, size: 20),
@@ -103,7 +89,9 @@ class _TransferSheet extends StatelessWidget {
               placeholder: '9876543210',
             )
           else
-            TextField(
+            TextFormField(
+              key: const Key('transferUser'),
+              initialValue: c.transferUser,
               autocorrect: false,
               onChanged: (v) => c.update(() => c.transferUser = v),
               style: const TextStyle(fontFamily: 'monospace'),

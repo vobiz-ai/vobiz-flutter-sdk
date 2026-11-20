@@ -58,7 +58,9 @@ class _IdentityPanelState extends State<IdentityPanel> {
 
   Future<void> _editWebhook() async {
     final c = widget.controller;
-    final field = TextEditingController(text: c.webhookUrl);
+    // No controller to dispose: the dialog's field still rebuilds while it
+    // animates out, after showDialog has returned.
+    var text = c.webhookUrl;
     final result = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
@@ -75,11 +77,13 @@ class _IdentityPanelState extends State<IdentityPanel> {
               style: TextStyle(fontSize: 12, height: 1.4, color: context.pg.muted),
             ),
             const SizedBox(height: 12),
-            TextField(
-              controller: field,
+            TextFormField(
+              key: const Key('webhookField'),
+              initialValue: text,
               autofocus: true,
               keyboardType: TextInputType.url,
               decoration: const InputDecoration(hintText: 'https://abc.ngrok-free.app'),
+              onChanged: (v) => text = v,
             ),
           ],
         ),
@@ -91,13 +95,12 @@ class _IdentityPanelState extends State<IdentityPanel> {
           TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
           FilledButton(
             style: FilledButton.styleFrom(minimumSize: const Size(80, 40)),
-            onPressed: () => Navigator.of(context).pop(field.text.trim()),
+            onPressed: () => Navigator.of(context).pop(text.trim()),
             child: const Text('Save'),
           ),
         ],
       ),
     );
-    field.dispose();
     if (result != null && result.isNotEmpty) c.update(() => c.webhookUrl = result);
   }
 
@@ -224,8 +227,9 @@ class _IdentityPanelState extends State<IdentityPanel> {
             trailing: InfoTip(
                 title: 'Auth Token',
                 message: 'On your Vobiz Console Dashboard, next to the Auth ID. It is not your '
-                    'login password. It is sent once to the webhook server to set up your '
-                    'endpoint, and kept only in memory for transfers.')),
+                    'login password. It is sent to the webhook server at each sign-in and each '
+                    'transfer. With Remember me on, it is also saved in this phone\'s secure storage '
+                    'until you sign out.')),
         TextField(
           key: const Key('authToken'),
           controller: _authToken,

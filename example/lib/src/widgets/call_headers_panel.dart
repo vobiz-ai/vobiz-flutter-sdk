@@ -35,27 +35,12 @@ class _CallHeadersPanelState extends State<CallHeadersPanel> {
       ),
       child: Column(
         children: <Widget>[
-          InkWell(
-            borderRadius: BorderRadius.circular(18),
+          SectionHeader(
+            icon: Icons.monitor_heart_outlined,
+            title: 'CALL HEADERS',
+            open: _open,
             onTap: () => setState(() => _open = !_open),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              child: Row(
-                children: <Widget>[
-                  Icon(Icons.monitor_heart_outlined, size: 14, color: pg.accent.withValues(alpha: 0.8)),
-                  const SizedBox(width: 8),
-                  Text('CALL HEADERS',
-                      style: TextStyle(
-                          fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
-                  if (records.isNotEmpty) ...<Widget>[
-                    const SizedBox(width: 8),
-                    Chip2('${records.length}', color: pg.accent),
-                  ],
-                  const Spacer(),
-                  Icon(_open ? Icons.expand_less : Icons.expand_more, size: 18, color: pg.faint),
-                ],
-              ),
-            ),
+            chips: <Widget>[if (records.isNotEmpty) Chip2('${records.length}', color: pg.accent)],
           ),
           if (_open)
             Padding(

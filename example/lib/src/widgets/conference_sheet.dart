@@ -8,22 +8,8 @@ import 'phone_number_field.dart';
 
 /// Opens the conference panel for the connected call: add people, see who
 /// is in, mute, hold or remove them, or end it for everyone.
-Future<void> showConferenceSheet(BuildContext context, PlaygroundController controller) {
-  return showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    useSafeArea: true,
-    backgroundColor: context.pg.panel,
-    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-    builder: (_) => Padding(
-      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-      child: ListenableBuilder(
-        listenable: controller,
-        builder: (context, _) => _ConferenceSheet(controller: controller),
-      ),
-    ),
-  );
-}
+Future<void> showConferenceSheet(BuildContext context, PlaygroundController controller) =>
+    showPlaygroundSheet(context, controller, (_) => _ConferenceSheet(controller: controller));
 
 class _ConferenceSheet extends StatelessWidget {
   const _ConferenceSheet({required this.controller});
@@ -53,13 +39,7 @@ class _ConferenceSheet extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          Center(
-            child: Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(color: pg.border, borderRadius: BorderRadius.circular(2)),
-            ),
-          ),
+          const SheetHandle(),
           const SizedBox(height: 14),
           Row(children: <Widget>[
             Icon(Icons.groups, color: pg.accent, size: 20),
@@ -117,8 +97,9 @@ class _ConferenceSheet extends StatelessWidget {
                 placeholder: '9876543210',
               )
             else
-              TextField(
+              TextFormField(
                 key: Key('conferenceUser-${c.conferenceAdds}'),
+                initialValue: c.conferenceUser,
                 autocorrect: false,
                 onChanged: (v) => c.update(() => c.conferenceUser = v),
                 style: const TextStyle(fontFamily: 'monospace'),
