@@ -137,15 +137,16 @@ class VobizPushDevices {
   /// The headers that authenticate each request. Called for every request.
   final FutureOr<Map<String, String>> Function() authHeaders;
 
-  /// How long to wait for Vobiz.
+  /// How long to wait for the server at [baseUrl].
   final Duration timeout;
 
   final http.Client _http;
   final bool _ownsHttp;
 
   /// `POST <pathPrefix>/register`. Throws [VobizException]
-  /// ([VobizErrorCode.pushDeviceFailed]) when Vobiz refuses it, cannot be
-  /// reached, or has not answered in full within [timeout].
+  /// ([VobizErrorCode.pushDeviceFailed]) when the server at [baseUrl] (your
+  /// backend, or Vobiz) refuses it, cannot be reached, or has not answered in
+  /// full within [timeout].
   Future<void> register(VobizPushDevice device) async {
     if (device.deviceId.trim().isEmpty || device.pushToken.trim().isEmpty) {
       throw ArgumentError('A device id and a push token are required');
@@ -158,8 +159,9 @@ class VobizPushDevices {
   }
 
   /// `DELETE <pathPrefix>/logout`: stop pushing to [deviceId]. Throws
-  /// [VobizException] ([VobizErrorCode.pushDeviceFailed]) when Vobiz refuses
-  /// it, cannot be reached, or has not answered in full within [timeout].
+  /// [VobizException] ([VobizErrorCode.pushDeviceFailed]) when the server at
+  /// [baseUrl] (your backend, or Vobiz) refuses it, cannot be reached, or has
+  /// not answered in full within [timeout].
   Future<void> logout(String deviceId) async {
     if (deviceId.trim().isEmpty) throw ArgumentError('A device id is required');
     await _send('DELETE', 'logout', <String, String>{'device_id': deviceId});
@@ -185,22 +187,23 @@ class VobizPushDevices {
       response = await _http.send(request).then(http.Response.fromStream).timeout(timeout);
     } on TimeoutException catch (e) {
       throw VobizException(VobizErrorCode.pushDeviceFailed,
-          'Vobiz did not answer $method $url within ${timeout.inSeconds} s',
+          '$method $url did not answer within ${timeout.inSeconds} s',
           cause: e);
     } catch (e) {
-      throw VobizException(VobizErrorCode.pushDeviceFailed, 'Could not reach Vobiz for $url: $e',
+      throw VobizException(VobizErrorCode.pushDeviceFailed, 'Could not reach $url: $e',
           cause: e);
     }
     if (response.statusCode >= 200 && response.statusCode < 300) return;
     throw VobizException(
       VobizErrorCode.pushDeviceFailed,
-      'Vobiz refused $method $url (HTTP ${response.statusCode})'
+      '$method $url was refused (HTTP ${response.statusCode})'
           '${_reason(response.body)}',
       statusCode: response.statusCode,
     );
   }
 
-  /// Vobiz's own reason (`message`, `error` or `detail`), when it gave one.
+  /// The server's own reason (`message`, `error` or `detail`), when it gave
+  /// one.
   static String _reason(String body) {
     try {
       final json = jsonDecode(body);
