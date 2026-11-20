@@ -267,6 +267,8 @@ export function createBridge(options = {}) {
       numbers,
       createdAt: Date.now(),
       bridged: false,
+      // The SIP user among `targets` whose leg answered, once Vobiz says.
+      answeredBy: null,
       finished: null,
       // Every endpoint rung is already on a call this server connected.
       lineBusy: targets.length > 0 && targets.every((user) => onCall(user)),
@@ -329,6 +331,9 @@ export function createBridge(options = {}) {
           const by = endpointUsername(params.DialBLegTo || '');
           log('ok', `Call ${short(call.id)}: answered${by ? ` by ${by}` : ''}`);
           call.bridged = true;
+          // Only a user this call rang counts: a phone number, or a name in a
+          // form this server did not write, leaves every target allowed.
+          call.answeredBy = call.targets.find((user) => sameUser(user, by)) || null;
           finish(call, 'answered');
         }
       } else if (action === 'hangup' || event === 'DialHangup') {
@@ -424,8 +429,17 @@ export function createBridge(options = {}) {
 
   /** Whether `user` is on a call this server connected and that has not ended. */
   function onCall(user) {
-    for (const c of calls.values()) if (c.bridged && !c.over && c.targets.includes(user)) return true;
+    for (const c of calls.values()) if (c.bridged && !c.over && isCallOf(c, user)) return true;
     return false;
+  }
+
+  /**
+   * Whether inbound `call` is `user`'s: the user who answered it, once Vobiz
+   * has named one of the users rung; until then, any user it rings.
+   */
+  function isCallOf(call, user) {
+    if (!user) return false;
+    return call.answeredBy ? sameUser(call.answeredBy, user) : call.targets.some((target) => sameUser(target, user));
   }
 
   // ── The app's requests ───────────────────────────────────────────────────────
@@ -928,7 +942,7 @@ export function createBridge(options = {}) {
   async function otherPartyLeg(uuid, username) {
     // An inbound call this bridge rang: its UUID is the caller's own leg.
     const own = calls.get(uuid);
-    if (own && own.targets.includes(username)) return 'aleg';
+    if (own && !own.over && isCallOf(own, username)) return 'aleg';
     let live;
     try {
       live = await vobizApi('GET', `/Call/${encodeURIComponent(uuid)}/?status=live`);
@@ -1211,8 +1225,8 @@ export function createBridge(options = {}) {
     // An inbound call this bridge rang: `uuid` is the caller's own leg and
     // the app is the leg the Dial reached.
     const own = calls.get(uuid);
-    if (own && own.bridged && !own.over && (who.operator || own.targets.includes(who.username))) {
-      return { hostLeg: 'bleg', hostUser: who.username || own.targets[0] || '', guestLabel: own.from || 'Caller' };
+    if (own && own.bridged && !own.over && (who.operator || isCallOf(own, who.username))) {
+      return { hostLeg: 'bleg', hostUser: who.username || own.answeredBy || own.targets[0] || '', guestLabel: own.from || 'Caller' };
     }
     let live;
     try {
@@ -1726,6 +1740,11 @@ function csv(value) {
 function clampInt(value, fallback, min, max) {
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+/** Whether two SIP user names are the same, ignoring case as the endpoint check does. */
+function sameUser(a, b) {
+  return Boolean(a) && Boolean(b) && String(a).toLowerCase() === String(b).toLowerCase();
 }
 
 /** `sip:play123@registrar.vobiz.ai` → `play123`. */
