@@ -69,6 +69,34 @@ test('a signed /answer is accepted; replaying the same nonce with another body i
   assert.equal(ctx.bridge.calls.has('c2'), false);
 });
 
+test('a captured V3 signature cannot be replayed as V2 with "." + nonce', async (t) => {
+  const ctx = await startBridge(RINGS_ALICE);
+  t.after(ctx.stop);
+  const first = await webhook(ctx, '/hangup', { CallUUID: 'c1' });
+  assert.equal(first.status, 200);
+  // The V2 string is url + nonce, the V3 string url + "." + nonce: one HMAC.
+  const asV2 = {
+    'X-Vobiz-Signature-V2': first.headers['X-Vobiz-Signature-V3'],
+    'X-Vobiz-Signature-V2-Nonce': `.${first.headers['X-Vobiz-Signature-V3-Nonce']}`,
+  };
+  const replay = await webhook(ctx, '/hangup', { CallUUID: 'c2' }, { sign: false, headers: asV2 });
+  assert.equal(replay.status, 403);
+  assert.ok(ctx.logs.some((l) => /replayed request/.test(l)));
+});
+
+test('a nonce is remembered for a day, and the list of seen ones stays bounded', async (t) => {
+  const ctx = await startBridge();
+  t.after(ctx.stop);
+  const seen = ctx.bridge.state.nonces;
+  for (let i = 0; i < 10005; i += 1) seen[`old-${i}`] = Date.now() + 60 * 1000 + i;
+  const r = await webhook(ctx, '/hangup', { CallUUID: 'c1' });
+  assert.equal(r.status, 200);
+  const expiry = seen[r.headers['X-Vobiz-Signature-V3-Nonce']];
+  assert.ok(expiry > Date.now() + 23 * 60 * 60 * 1000, 'still refused 23 hours from now');
+  assert.ok(Object.keys(seen).length <= 10000, `${Object.keys(seen).length} entries`);
+  assert.equal('old-0' in seen, false, 'the soonest to expire go first');
+});
+
 test('nonces survive a restart', async () => {
   const one = await startBridge();
   const r = await webhook(one, '/hangup', { CallUUID: 'none' });

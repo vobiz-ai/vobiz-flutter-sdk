@@ -96,12 +96,14 @@ export function createBridge(options = {}) {
   }
 
   /**
-   * How long a webhook nonce is remembered. Vobiz nonces are random, not
-   * time-based, and nothing in the request is timestamped, so replay
-   * protection is "never accept the same nonce twice" within this window;
-   * calls are long over by then.
+   * How long a webhook's nonces and signatures are remembered. Vobiz nonces
+   * are random, not time-based, and nothing in the request is timestamped,
+   * so replay protection is "never accept the same nonce or signature twice"
+   * within this window. At most MAX_SEEN are kept (the soonest to expire go
+   * first): the state file holds them and is written on every webhook.
    */
-  const NONCE_TTL_MS = 30 * 60 * 1000;
+  const NONCE_TTL_MS = 24 * 60 * 60 * 1000;
+  const MAX_SEEN = 10000;
   const INSTANCE = crypto.randomBytes(6).toString('hex');
 
   // ── State: the app's key, the webhook secret and seen nonces, kept across restarts ──
@@ -685,7 +687,8 @@ export function createBridge(options = {}) {
    * baseUrl + nonce (V2), where baseUrl is the URL it called without the query
    * string (docs: /concepts/validating-callbacks). The body is not signed, so
    * everything that must be trusted (the call a Dial callback is about) is in
-   * the path. A nonce is accepted once only.
+   * the path. A nonce, and a signature, is accepted once only: a V3
+   * signature for nonce N is also a valid V2 signature for nonce ".N".
    */
   function checkSignature(req, url) {
     const baseUrl = `${config.publicUrl}${url.pathname}`;
@@ -703,7 +706,14 @@ export function createBridge(options = {}) {
       sawSignature = true;
       const expected = crypto.createHmac('sha256', config.authToken).update(baseUrl + separator + nonce).digest('base64');
       if (!safeEqual(signature, expected)) continue;
-      if (!rememberNonce(nonce)) return 'nonce already used (replayed request)';
+      // Every nonce and signature the request carries, so that no part of it
+      // can be sent again in another form.
+      const parts = new Set();
+      for (const [sig, non] of checks) {
+        if (req.headers[sig]) parts.add(`sig:${req.headers[sig]}`);
+        if (req.headers[non]) parts.add(String(req.headers[non]));
+      }
+      if (!rememberSeen([...parts])) return 'nonce or signature already used (replayed request)';
       return 'ok';
     }
     return sawSignature
@@ -711,11 +721,13 @@ export function createBridge(options = {}) {
       : 'no X-Vobiz-Signature-V3 / -V2 headers (Vobiz only signs callback URLs that have credentials configured)';
   }
 
-  /** Records a nonce; false when it was seen before inside NONCE_TTL_MS. */
-  function rememberNonce(nonce) {
+  /** Records a request's nonces and signatures; false when one was seen before inside NONCE_TTL_MS. */
+  function rememberSeen(parts) {
     pruneNonces();
-    if (Object.prototype.hasOwnProperty.call(state.nonces, nonce)) return false;
-    state.nonces[nonce] = Date.now() + NONCE_TTL_MS;
+    if (parts.some((part) => Object.prototype.hasOwnProperty.call(state.nonces, part))) return false;
+    const expires = Date.now() + NONCE_TTL_MS;
+    for (const part of parts) state.nonces[part] = expires;
+    pruneNonces();
     saveState();
     return true;
   }
@@ -723,6 +735,11 @@ export function createBridge(options = {}) {
   function pruneNonces() {
     const now = Date.now();
     for (const [nonce, expires] of Object.entries(state.nonces)) if (expires < now) delete state.nonces[nonce];
+    const entries = Object.entries(state.nonces);
+    if (entries.length > MAX_SEEN) {
+      entries.sort((a, b) => a[1] - b[1]);
+      for (const [nonce] of entries.slice(0, entries.length - MAX_SEEN)) delete state.nonces[nonce];
+    }
   }
 
   /** `<call id>.<tag>`: the tag proves the bridge itself wrote this path. */
