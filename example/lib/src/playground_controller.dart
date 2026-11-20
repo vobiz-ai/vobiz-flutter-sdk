@@ -123,12 +123,20 @@ class PlaygroundController extends ChangeNotifier {
     CallScreenApi? callScreen,
     CallPlatform? platform,
     http.Client? httpClient,
-  })  : client = client ?? createPlaygroundClient(),
+    this.demoTools = kDemoTools,
+  })  : client = client ?? createPlaygroundClient(demoTools: demoTools),
         _http = httpClient,
         _secure = secureStorage ?? const FlutterSecureStorage(),
         push = push ?? PushService.unavailable('Push is not set up in this build.'),
         callScreen = callScreen ?? const CallScreenApi(),
-        platform = platform ?? CallPlatform();
+        platform = platform ?? CallPlatform(),
+        authTab = demoTools ? AuthTab.zeroConfig : AuthTab.sipDirect;
+
+  /// Whether this build has the demo and test-only tools ([kDemoTools]):
+  /// Zero-Config sign-in, typing account credentials for Vobiz push sign-up,
+  /// and "Call this phone through Vobiz". Without them nothing sends the
+  /// account's Auth ID or Auth Token anywhere.
+  final bool demoTools;
 
   final VobizClient client;
   final FlutterSecureStorage _secure;
@@ -152,7 +160,8 @@ class PlaygroundController extends ChangeNotifier {
   void Function(int tab)? onTabRequest;
 
   // ── Sign-in form ────────────────────────────────────────────────────────────
-  AuthTab authTab = AuthTab.zeroConfig;
+  /// Zero-Config only with [demoTools].
+  AuthTab authTab;
   String authId = '';
   String authToken = '';
   String sipUsername = '';
@@ -486,6 +495,7 @@ class PlaygroundController extends ChangeNotifier {
   // ── Sign in / out ───────────────────────────────────────────────────────────
 
   void setAuthTab(AuthTab tab) {
+    if (tab == AuthTab.zeroConfig && !demoTools) return;
     authTab = tab;
     notifyListeners();
   }
@@ -1425,6 +1435,7 @@ class PlaygroundController extends ChangeNotifier {
   /// Saves the account Auth ID and Auth Token used to register this phone
   /// with Vobiz push (test only), with "Remember me".
   Future<void> setPushAccount({required String authId, required String authToken}) async {
+    if (!demoTools) return;
     pushAuthId = authId.trim();
     pushAuthToken = authToken.trim();
     try {
@@ -1449,8 +1460,9 @@ class PlaygroundController extends ChangeNotifier {
   }
 
   /// The account's headers for Vobiz's API (test only): the push account
-  /// fields, else the Zero-Config ones.
+  /// fields, else the Zero-Config ones. Null without [demoTools].
   Map<String, String>? _vobizPushHeaders() {
+    if (!demoTools) return null;
     final id = pushAuthId.trim().isNotEmpty ? pushAuthId.trim() : authId.trim();
     final token = pushAuthToken.trim().isNotEmpty ? pushAuthToken.trim() : authToken.trim();
     if (id.isEmpty || token.isEmpty) return null;
@@ -1496,8 +1508,11 @@ class PlaygroundController extends ChangeNotifier {
     final viaServer = bridgeConfig != null;
     if (!viaServer && _vobizPushHeaders() == null) {
       vobizPushState = PushState.failed;
-      vobizPushDetail = 'Paste the sample server line under Sample server, so this phone signs up through '
-          'it, or enter the account Auth ID and Auth Token below (test only).';
+      vobizPushDetail = demoTools
+          ? 'Paste the sample server line under Sample server, so this phone signs up through it, or '
+              'enter the account Auth ID and Auth Token below (test only).'
+          : 'This phone signs up for Vobiz push through the sample server: paste the line it prints under '
+              'Sample server.';
       log('❌ Vobiz push: $vobizPushDetail', LogType.error);
       notifyListeners();
       return;
@@ -1561,8 +1576,8 @@ class PlaygroundController extends ChangeNotifier {
     if (!wasOn || id == null) return;
     final devices = _vobizPushDevices(user: client.sipUsername);
     if (devices == null) {
-      log('⚠️ Vobiz push: no sample server and no account Auth ID and Auth Token to remove this phone '
-          'with; it may still be pushed until Firebase replaces its token', LogType.warning);
+      log('⚠️ Vobiz push: no sample server${demoTools ? ' and no account Auth ID and Auth Token' : ''} to '
+          'remove this phone with; it may still be pushed until Firebase replaces its token', LogType.warning);
       return;
     }
     try {
@@ -1587,7 +1602,7 @@ class PlaygroundController extends ChangeNotifier {
   /// push sign-up. Vobiz keeps the registration until it expires (the SDK
   /// asks for an hour), and the call follows a moment later.
   Future<void> callThisPhoneThroughVobiz() async {
-    if (vobizCallPlacing) return;
+    if (!demoTools || vobizCallPlacing) return;
     final user = client.sipUsername;
     if (user == null || vobizPushState != PushState.ready || !client.isConnected) {
       log('Connect, and turn on "Receive calls through Vobiz push", first', LogType.error);
@@ -2159,7 +2174,7 @@ class PlaygroundController extends ChangeNotifier {
     authTab = switch (prefs.getString(_kMode)) {
       'sip' => AuthTab.sipDirect,
       'token' => AuthTab.accessToken,
-      _ => AuthTab.zeroConfig,
+      _ => demoTools ? AuthTab.zeroConfig : AuthTab.sipDirect,
     };
     webhookUrl = prefs.getString(_kWebhook) ?? SdkConfig.defaultWebhookUrl;
     tokenServerUrl = prefs.getString(_kTokenServer) ?? '';
@@ -2219,10 +2234,12 @@ class PlaygroundController extends ChangeNotifier {
   Future<void> _loadSavedCredentials() async {
     if (!rememberMe) return;
     try {
-      authId = await _secure.read(key: _kAuthId) ?? '';
-      authToken = await _secure.read(key: _kAuthToken) ?? '';
       sipUsername = await _secure.read(key: _kSipUser) ?? '';
       sipPassword = await _secure.read(key: _kSipPass) ?? '';
+      // The account's credentials are for the demo tools only.
+      if (!demoTools) return;
+      authId = await _secure.read(key: _kAuthId) ?? '';
+      authToken = await _secure.read(key: _kAuthToken) ?? '';
       pushAuthId = await _secure.read(key: _kPushAuthId) ?? '';
       pushAuthToken = await _secure.read(key: _kPushAuthToken) ?? '';
     } catch (e) {

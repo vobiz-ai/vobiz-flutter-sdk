@@ -120,7 +120,8 @@ class _PushPanelState extends State<PushPanel> {
           action: c.fullScreenAllowed == false ? c.requestCallPermissions : null),
       _check(pg, 'Remember me', c.rememberMe,
           'Lets the app sign itself in to answer when it was closed'),
-      if (c.vobizPush) ...<Widget>[
+      // Demo and test-only tools: never in a release build unless it asks for them.
+      if (c.vobizPush && c.demoTools) ...<Widget>[
         const SizedBox(height: 8),
         Text(
           'TEST ONLY: without a sample server line, signing this phone up takes the account\'s Auth ID '
@@ -192,22 +193,24 @@ class _PushPanelState extends State<PushPanel> {
                   height: 1.4,
                   color: c.vobizPushState == PushState.failed ? pg.danger : pg.muted)),
         ),
-      OutlinedButton.icon(
-        key: const Key('vobizTestCall'),
-        onPressed: c.vobizPushState == PushState.ready && c.client.isConnected && !c.vobizCallPlacing
-            ? c.callThisPhoneThroughVobiz
-            : null,
-        icon: const Icon(Icons.phone_callback_outlined, size: 16),
-        label: const Text('Call this phone through Vobiz'),
-      ),
-      Padding(
-        padding: const EdgeInsets.only(top: 4),
-        child: Text(
-          'Drops the connection without signing off, as when Android closes the app, then places a real '
-          'call: Vobiz should push this phone, and the app sign back in to take it.',
-          style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.faint),
+      if (c.demoTools) ...<Widget>[
+        OutlinedButton.icon(
+          key: const Key('vobizTestCall'),
+          onPressed: c.vobizPushState == PushState.ready && c.client.isConnected && !c.vobizCallPlacing
+              ? c.callThisPhoneThroughVobiz
+              : null,
+          icon: const Icon(Icons.phone_callback_outlined, size: 16),
+          label: const Text('Call this phone through Vobiz'),
         ),
-      ),
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            'Drops the connection without signing off, as when Android closes the app, then places a real '
+            'call: Vobiz should push this phone, and the app sign back in to take it.',
+            style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.faint),
+          ),
+        ),
+      ],
     ];
   }
 

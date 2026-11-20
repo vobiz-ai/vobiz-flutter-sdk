@@ -10,32 +10,8 @@ import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import 'package:vobiz_webrtc_example/src/call_history.dart';
 import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 import 'package:vobiz_webrtc_example/src/push/push_call.dart';
-import 'package:vobiz_webrtc_example/src/push/push_service.dart';
 
 import 'support/fakes.dart';
-
-/// Firebase, as a test sees it: set up, with one token and no pushes of its own.
-class _FakePush extends PushService {
-  _FakePush() : super.unavailable('fake');
-
-  @override
-  bool get available => true;
-
-  @override
-  Future<String?> token() async => 'fcm-token-1';
-
-  @override
-  Stream<String> get tokenRefresh => const Stream<String>.empty();
-
-  @override
-  Stream<PushCall> get foregroundCalls => const Stream<PushCall>.empty();
-
-  @override
-  Future<bool?> requestNotificationPermission() async => true;
-
-  @override
-  Future<bool?> notificationsAllowed() async => true;
-}
 
 /// A call to a closed app through Vobiz's own push: its registrar holds the
 /// call, pushes, and sends the held INVITE to the REGISTER that claims it.
@@ -261,7 +237,7 @@ void main() {
         client: client,
         callScreen: FakeCallScreen(),
         platform: FakeCallPlatform(),
-        push: _FakePush(),
+        push: FakePush(),
         httpClient: MockClient((request) async {
           requests.add(request);
           return reply(request);
@@ -355,7 +331,7 @@ void main() {
         client: client,
         callScreen: FakeCallScreen(),
         platform: platform,
-        push: _FakePush(),
+        push: FakePush(),
         httpClient: web,
       );
       await controller.init();
@@ -451,7 +427,7 @@ void main() {
       expect(controller.vobizCallFrom, '14155551234');
       expect(controller.vobizCallAnswerUrl, 'https://example.com/answer');
       final again = PlaygroundController(
-          client: FakeClient(), callScreen: FakeCallScreen(), platform: FakeCallPlatform(), push: _FakePush());
+          client: FakeClient(), callScreen: FakeCallScreen(), platform: FakeCallPlatform(), push: FakePush());
       addTearDown(again.dispose);
       await again.init();
       expect(again.vobizCallFrom, '14155551234');

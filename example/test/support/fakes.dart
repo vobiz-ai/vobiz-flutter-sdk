@@ -4,6 +4,8 @@ import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import 'package:vobiz_webrtc_example/src/push/call_platform.dart';
 import 'package:vobiz_webrtc_example/src/push/call_screen.dart';
+import 'package:vobiz_webrtc_example/src/push/push_call.dart';
+import 'package:vobiz_webrtc_example/src/push/push_service.dart';
 
 /// A VobizClient that never opens a socket: tests drive its events and read
 /// back what the app asked of it.
@@ -281,4 +283,32 @@ class FakeCallPlatform extends CallPlatform {
   @override
   Future<void> showMissedCall({required String id, required String caller}) async =>
       requests.add('missed:$id');
+}
+
+/// Firebase, as a test sees it: set up, with one token, and token refreshes
+/// the test sends through [refreshes].
+class FakePush extends PushService {
+  FakePush() : super.unavailable('fake');
+
+  /// What [token] returns.
+  String? pushToken = 'fcm-token-1';
+  final StreamController<String> refreshes = StreamController<String>.broadcast();
+
+  @override
+  bool get available => true;
+
+  @override
+  Future<String?> token() async => pushToken;
+
+  @override
+  Stream<String> get tokenRefresh => refreshes.stream;
+
+  @override
+  Stream<PushCall> get foregroundCalls => const Stream<PushCall>.empty();
+
+  @override
+  Future<bool?> requestNotificationPermission() async => true;
+
+  @override
+  Future<bool?> notificationsAllowed() async => true;
 }

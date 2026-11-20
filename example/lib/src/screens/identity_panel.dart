@@ -128,7 +128,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
                 const SizedBox(height: 18),
                 PushPanel(controller: c),
                 const SizedBox(height: 28),
-                _faq(pg),
+                _faq(c, pg),
               ],
             ),
           ),
@@ -150,7 +150,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
         ),
         child: Row(
           children: <Widget>[
-            _tab('Zero-Config Setup', Icons.code, zero, () => c.setAuthTab(AuthTab.zeroConfig), pg),
+            if (c.demoTools) _tab('Zero-Config Setup', Icons.code, zero, () => c.setAuthTab(AuthTab.zeroConfig), pg),
             _tab('SIP Direct', Icons.call_outlined, c.authTab == AuthTab.sipDirect,
                 () => c.setAuthTab(AuthTab.sipDirect), pg),
             _tab('Access token', Icons.key_outlined, token, () => c.setAuthTab(AuthTab.accessToken), pg),
@@ -310,7 +310,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
         const SizedBox(height: 8),
         Text(
           'An endpoint from Vobiz Console → Voice → Endpoints. Nothing is provisioned, and no '
-          'account credentials reach this device. Transfer needs Zero-Config.',
+          'account credentials reach this device.${c.demoTools ? ' Transfer needs Zero-Config.' : ''}',
           style: TextStyle(fontSize: 11, height: 1.4, color: pg.faint),
         ),
       ],
@@ -471,7 +471,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
     );
   }
 
-  Widget _faq(PlaygroundColors pg) {
+  Widget _faq(PlaygroundController c, PlaygroundColors pg) {
     Widget qa(String q, String a) => Padding(
           padding: const EdgeInsets.only(bottom: 14),
           child: Column(
@@ -493,13 +493,15 @@ class _IdentityPanelState extends State<IdentityPanel> {
               style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
         ]),
         const SizedBox(height: 12),
-        qa('Where do I find my credentials?',
-            'Auth ID and Auth Token are both on your Vobiz Console Dashboard. The Auth Token is not your login password.'),
+        if (c.demoTools)
+          qa('Where do I find my credentials?',
+              'Auth ID and Auth Token are both on your Vobiz Console Dashboard. The Auth Token is not your login password.'),
         qa('Why do I need a Caller ID?',
             'Carriers require an E.164 CLI to bridge calls to mobile or landlines. Use a number purchased from Vobiz or your assigned trial number.'),
-        qa('What does Zero-Config Setup create?',
-            'An application named "Vobiz WebRTC Playground" and an endpoint aliased "Vobiz WebRTC Playground Endpoint" on your account — '
-            'the same ones the web Playground uses, so signing in here gives that endpoint a new password.'),
+        if (c.demoTools)
+          qa('What does Zero-Config Setup create?',
+              'An application named "Vobiz WebRTC Playground" and an endpoint aliased "Vobiz WebRTC Playground Endpoint" on your account — '
+              'the same ones the web Playground uses, so signing in here gives that endpoint a new password.'),
         qa('What is access-token sign-in?',
             'Your server mints a short-lived JWT with POST /api/v1/Account/{auth_id}/JWT/Token/ and the '
             'app signs in with it as <sub>_<Auth ID>. The token\'s "app" picks the application whose '

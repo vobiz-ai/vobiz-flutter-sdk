@@ -73,8 +73,11 @@ class _TransferSheet extends StatelessWidget {
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Text(
-                'Transfer needs API credentials. Disconnect and sign in with Zero-Config Setup '
-                '(Auth ID and Auth Token) to use it.',
+                c.demoTools
+                    ? 'Transfer needs API credentials. Disconnect and sign in with Zero-Config Setup '
+                        '(Auth ID and Auth Token) to use it.'
+                    : 'Transfer needs the account\'s API credentials, which only the demo build takes '
+                        '(Zero-Config Setup).',
                 style: TextStyle(fontSize: 12, color: pg.warning),
               ),
             ),
