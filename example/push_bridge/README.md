@@ -152,7 +152,7 @@ shorter Dial gives up first.
 | `SIP_HEADER_STYLE` | `suffix` | How the call reference is written in `<User sipHeaders>`; Vobiz's docs show both `RefX-VH=` and `Ref=` |
 | `JWT_SUB` | `flutter-app` | Access tokens: the user id (`sub`) `POST /token` mints for when the app sends none. The app registers as `<sub>_<VOBIZ_AUTH_ID>` |
 | `JWT_ALLOWED_SUBS` | — | Access tokens: the other subs `/token` may mint, comma separated; any other is refused (403). Empty: any sub |
-| `JWT_TTL_SECONDS` | `3600` | Access tokens: lifetime, clamped to 180–86400 (the platform's limits). The SDK renews 60 s before expiry |
+| `JWT_TTL_SECONDS` | `3600` | Access tokens: lifetime, clamped to 180–86400 (the platform's limits). It counts from the token's start time, which is set a minute in the past (so a registrar whose clock is behind accepts it): a new token has this many seconds less one minute left. The SDK renews 60 s before expiry |
 | `JWT_APP_ID` | — | Access tokens: the application whose Answer URL handles the app's outbound calls (the `app` claim). Without it, the account's default application, and the registrar may refuse the token (10001). This server's own application only rings phones, so point this at the one your outbound calls use (the Playground application, for example) |
 | `LOST_BEEP_SECONDS` | `3` | Connection watch: seconds without an "alive" report from the app before the other party hears the connection-lost beep. Clamped to 2–10 |
 | `LOST_HANGUP_SECONDS` | `15` | Connection watch: seconds without a report before the server ends the call (the SDK gives up at 12 s, but an offline phone's hangup cannot reach Vobiz). Clamped to 5–300; `0` never ends it |
