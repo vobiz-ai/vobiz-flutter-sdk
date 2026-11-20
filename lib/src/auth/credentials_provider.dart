@@ -2,9 +2,13 @@ import 'dart:async';
 
 import '../core/vobiz_client.dart';
 import '../errors/vobiz_exception.dart';
+import '../events/call_event.dart';
 import '../events/connection_event.dart';
 import '../events/error_event.dart';
+import '../models/auth/auth_mode.dart';
 import '../models/auth/credential_config.dart';
+import '../state/call_state.dart';
+import '../state/connection_state.dart';
 import '../state/registration_state.dart';
 
 /// Why the SDK is asking the app's [VobizCredentialsProvider] for SIP
@@ -41,15 +45,23 @@ extension VobizClientCredentialsProvider on VobizClient {
   /// Signs in with SIP credentials from [provider], and keeps them working:
   /// when the registrar refuses them, the provider is asked again with
   /// [VobizCredentialsRequest.rejected] and the client re-registers, up to
-  /// [maxRefreshes] times in a row before giving up.
+  /// [maxRefreshes] times in a row before giving up. Re-registering opens a
+  /// new connection, so when the refusal comes during a call the session
+  /// waits for that call to end first (the call keeps its connection
+  /// meanwhile).
   ///
   /// Completes once the REGISTER has been sent (like
   /// [VobizClient.connectWithCredentials]); watch
   /// [VobizClient.connectionEvents] for the registrar's answer.
   ///
-  /// Throws [VobizCredentialsException] when the provider fails. Dispose the
-  /// returned session (or call [VobizClient.disconnect] and dispose it) when
-  /// the user signs out.
+  /// Throws [VobizCredentialsException] when the provider fails; nothing is
+  /// left running then. When the socket cannot be opened, the client's error
+  /// is thrown unless the client retries the connection by itself
+  /// (`SdkConfig.autoReconnect`): then the session is returned, and the
+  /// failure is reported on [VobizClient.connectionEvents] and
+  /// [VobizClient.errorEvents] (`connect_failed`). Dispose the returned
+  /// session (or call [VobizClient.disconnect] and dispose it) when the user
+  /// signs out.
   Future<VobizCredentialsSession> connectWithCredentialsProvider(
     VobizCredentialsProvider provider, {
     int maxRefreshes = 1,
@@ -90,17 +102,25 @@ class VobizCredentialsSession {
   bool _busy = false;
   bool _disposed = false;
 
+  /// Waits for the call in progress to end before re-registering.
+  StreamSubscription<CallEvent>? _callEnd;
+
   /// Failures the session could not recover from: the provider threw, or the
   /// registrar kept refusing fresh credentials.
   Stream<VobizException> get failures => _failures.stream;
 
   /// Asks the provider for fresh credentials and re-registers with them.
+  ///
+  /// Re-registering opens a new connection: a call in progress is ended.
+  /// Call it between calls.
   Future<void> refresh() => _connect(VobizCredentialsRequest.refresh);
 
   /// Stops watching the client. Does not disconnect it.
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    await _callEnd?.cancel();
+    _callEnd = null;
     await _errorSub.cancel();
     await _connectionSub.cancel();
     await _failures.close();
@@ -123,7 +143,22 @@ class VobizCredentialsSession {
         throw const VobizCredentialsException(
             'The credentials provider returned an empty SIP username or password');
       }
-      await client.connectWithCredentials(credentials);
+      // Signed out (or signed in another way) while the provider answered.
+      if (_disposed ||
+          (request == VobizCredentialsRequest.rejected &&
+              client.authMode != VobizAuthMode.sipDirect)) {
+        return;
+      }
+      try {
+        await client.connectWithCredentials(credentials);
+      } catch (_) {
+        // The client keeps the sign-in and retries the connection by itself
+        // (SdkConfig.autoReconnect): the session stays to answer refusals.
+        final retrying = client.authMode == VobizAuthMode.sipDirect &&
+            client.sipUsername == credentials.username &&
+            client.connectionState == ConnectionStateStatus.reconnecting;
+        if (!retrying) rethrow;
+      }
     } finally {
       _busy = false;
     }
@@ -136,8 +171,10 @@ class VobizCredentialsSession {
   }
 
   void _onError(ErrorEvent event) {
-    if (_disposed || _busy) return;
+    if (_disposed || _busy || _callEnd != null) return;
     if (event.code != VobizErrorCode.registrationFailed) return;
+    // Signed in another way without disposing this session.
+    if (client.authMode != VobizAuthMode.sipDirect) return;
     if (_consecutiveRefreshes >= maxRefreshes) {
       _fail(VobizRegistrationException(
           'The registrar refused the credentials, also after asking the '
@@ -145,6 +182,23 @@ class VobizCredentialsSession {
       return;
     }
     _consecutiveRefreshes++;
+    if (client.currentCallId == null) {
+      _reconnect();
+      return;
+    }
+    // Signing in again opens a new connection, which would end the call. The
+    // call keeps the current one after a refusal: re-register once it ends.
+    _callEnd = client.callEvents.listen((CallEvent call) {
+      if (call.state != CallStateStatus.ended && call.state != CallStateStatus.failed) return;
+      if (client.currentCallId != null) return;
+      unawaited(_callEnd?.cancel());
+      _callEnd = null;
+      if (_disposed || client.authMode != VobizAuthMode.sipDirect) return;
+      _reconnect();
+    });
+  }
+
+  void _reconnect() {
     _connect(VobizCredentialsRequest.rejected).catchError((Object e) {
       _fail(e is VobizException
           ? e

@@ -2,7 +2,6 @@
 // token in X-Vobiz-Jwt instead of a password, sends it on its INVITEs, reports
 // the registrar's 10001-10010 reasons, and renews it before it expires.
 // ignore_for_file: implementation_imports
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -14,54 +13,7 @@ import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
 import 'call_harness.dart';
-
-/// A token shaped like the ones `POST /Account/{auth_id}/JWT/Token/` mints.
-/// The signature is not checked on the device, so any will do here.
-String jwt(Map<String, Object?> claims) {
-  String part(Object value) =>
-      base64Url.encode(utf8.encode(jsonEncode(value))).replaceAll('=', '');
-  return '${part(<String, String>{'alg': 'HS256', 'typ': 'JWT', 'cty': 'auris;v=1'})}'
-      '.${part(claims)}.c2lnbmF0dXJl';
-}
-
-int _epoch(DateTime t) => t.millisecondsSinceEpoch ~/ 1000;
-
-String token({
-  String? sub = 'agent42',
-  String iss = 'MA_TESTACCT',
-  Duration lifetime = const Duration(hours: 1),
-  bool? outgoing = true,
-  bool? incoming = true,
-  String? app = '12345678901234567',
-  DateTime? from,
-  String? nonce,
-}) {
-  final start = from ?? DateTime.now();
-  return jwt(<String, Object?>{
-    'iss': iss,
-    if (sub != null) 'sub': sub,
-    'nbf': _epoch(start),
-    'exp': _epoch(start.add(lifetime)),
-    if (app != null) 'app': app,
-    'per': <String, Object?>{
-      'voice': <String, Object?>{
-        if (incoming != null) 'incoming_allow': incoming,
-        if (outgoing != null) 'outgoing_allow': outgoing,
-      },
-    },
-    if (nonce != null) 'jti': nonce,
-  });
-}
-
-String? header(String message, String name) {
-  for (final line in message.split('\r\n')) {
-    final i = line.indexOf(':');
-    if (i > 0 && line.substring(0, i).trim().toLowerCase() == name.toLowerCase()) {
-      return line.substring(i + 1).trim();
-    }
-  }
-  return null;
-}
+import 'services_auth_support.dart';
 
 /// A loopback SIP-over-WebSocket registrar that validates access tokens the
 /// way Vobiz's does: a REGISTER whose X-Vobiz-Jwt is in [accepted] gets 200
@@ -107,7 +59,7 @@ class _TokenRegistrar {
             final exp = DateTime.now().add(const Duration(minutes: 59));
             ws.add(echo('200 OK', <String>[
               'Expires: 600',
-              'X-vobiz-Jwt: expires=3540;epoch-exp=${_epoch(exp)}',
+              'X-vobiz-Jwt: expires=3540;epoch-exp=${epochSeconds(exp)}',
             ]));
           } else {
             ws.add(echo('401 Unauthorized', <String>[
@@ -134,49 +86,6 @@ class _TokenRegistrar {
 Future<void> _until(bool Function() condition) async {
   for (var i = 0; i < 300 && !condition(); i++) {
     await Future<void>.delayed(const Duration(milliseconds: 10));
-  }
-}
-
-/// The SIP layer without a socket: REGISTERs are answered 200 OK on the next
-/// microtask, so the provider session can run under fake timers.
-class _InstantRegistrar extends SIPService {
-  _InstantRegistrar() : super(wsUrl: 'wss://example.invalid', sipServer: sipServer) {
-    debugOnSend = (message) {
-      sent.add(message);
-      if (!message.startsWith('REGISTER ')) return;
-      final presented = header(message, 'X-Vobiz-Jwt');
-      final notYet = presented != null && (notYetValidOnce.remove(presented));
-      final ok = presented != null && !refused.contains(presented) && !notYet;
-      scheduleMicrotask(() => debugReceive(<String>[
-            ok ? 'SIP/2.0 200 OK' : 'SIP/2.0 401 Unauthorized',
-            'Via: ${header(message, 'Via')}',
-            'From: ${header(message, 'From')}',
-            'To: ${header(message, 'To')};tag=reg',
-            'Call-ID: ${header(message, 'Call-ID')}',
-            'CSeq: ${header(message, 'CSeq')}',
-            if (ok) 'Expires: 600' else 'X-vobiz-Jwt-Error-Code: ${notYet ? 10005 : 10006}',
-            'Content-Length: 0',
-            '',
-            '',
-          ].join('\r\n')));
-    };
-  }
-
-  final List<String> sent = <String>[];
-  final Set<String> refused = <String>{};
-
-  /// Tokens refused once as not valid yet (10005), as by a registrar whose
-  /// clock is a little behind the one that minted them.
-  final Set<String> notYetValidOnce = <String>{};
-
-  List<String> get registerTokens => <String>[
-        for (final m in sent)
-          if (m.startsWith('REGISTER ')) header(m, 'X-Vobiz-Jwt') ?? '',
-      ];
-
-  @override
-  Future<void> connect() async {
-    connectionState.value = SipConnectionState.connected;
   }
 }
 
@@ -216,7 +125,7 @@ void main() {
     });
 
     test('refuses anything that is not a Vobiz token with INVALID_ACCESS_TOKEN', () {
-      final now = _epoch(DateTime.now());
+      final now = epochSeconds(DateTime.now());
       final bad = <String>[
         'not-a-jwt',
         'a.b',
@@ -447,7 +356,7 @@ void main() {
         final start = DateTime.fromMillisecondsSinceEpoch(
             DateTime.now().millisecondsSinceEpoch ~/ 1000 * 1000);
         VobizAccessTokenSession.now = () => start.add(async.elapsed);
-        final sip = _InstantRegistrar();
+        final sip = InstantRegistrar();
         final client = VobizClient.withServices(sip: sip, peer: FakePeer());
         final tokens = <String>[
           token(from: start, lifetime: const Duration(minutes: 10), nonce: '1'),
@@ -486,7 +395,7 @@ void main() {
       fakeAsync((async) {
         final start = DateTime.now();
         VobizAccessTokenSession.now = () => start.add(async.elapsed);
-        final client = VobizClient.withServices(sip: _InstantRegistrar(), peer: FakePeer());
+        final client = VobizClient.withServices(sip: InstantRegistrar(), peer: FakePeer());
         late VobizAccessTokenSession session;
         client
             .connectWithAccessTokenProvider(
@@ -502,7 +411,7 @@ void main() {
 
     test('a refused token makes the session ask again (rejected) and register', () {
       fakeAsync((async) {
-        final sip = _InstantRegistrar();
+        final sip = InstantRegistrar();
         final stale = token(nonce: 'stale');
         final fresh = token(nonce: 'fresh');
         sip.refused.add(stale);
@@ -531,7 +440,7 @@ void main() {
 
     test('a token "not valid yet" (10005) is presented again 3 s later, without a new one', () {
       fakeAsync((async) {
-        final sip = _InstantRegistrar();
+        final sip = InstantRegistrar();
         final t = token(nonce: 'early');
         sip.notYetValidOnce.add(t);
         final client = VobizClient.withServices(sip: sip, peer: FakePeer());
@@ -559,7 +468,7 @@ void main() {
 
     test('gives up after maxRefreshes and reports the registrar\'s reason', () {
       fakeAsync((async) {
-        final sip = _InstantRegistrar();
+        final sip = InstantRegistrar();
         final stale = token(nonce: 'stale');
         sip.refused.add(stale);
         final client = VobizClient.withServices(sip: sip, peer: FakePeer());
@@ -581,7 +490,7 @@ void main() {
     });
 
     test('a provider that throws fails the sign-in with VobizAccessTokenException', () async {
-      final client = VobizClient.withServices(sip: _InstantRegistrar(), peer: FakePeer());
+      final client = VobizClient.withServices(sip: InstantRegistrar(), peer: FakePeer());
       await expectLater(
         client.connectWithAccessTokenProvider((_) async => throw StateError('backend down')),
         throwsA(isA<VobizAccessTokenException>()
