@@ -99,7 +99,7 @@ class PeerService {
     });
   }
 
-  final IceConfig iceConfig;
+  IceConfig iceConfig;
   final MediaConstraints mediaConstraints;
   final Logger _logger;
   final PeerConnectionFactory _createPeer;

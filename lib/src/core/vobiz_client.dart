@@ -37,6 +37,7 @@ import '../state/registration_state.dart';
 import '../utils/logger.dart';
 import '../utils/sip_text.dart';
 import '../utils/stream_extensions.dart';
+import '../webrtc/ice_config.dart';
 import '../webrtc/peer_service.dart';
 import 'sdk_config.dart';
 import 'sip_headers.dart';
@@ -306,6 +307,11 @@ class VobizClient {
   /// headsets work on Android 12+.
   AudioRouteController get audioRoutes => _peer.audioRoutes;
 
+  /// Replaces the STUN and TURN servers (fresh TURN credentials, say). Applies
+  /// from the next call; a call in progress keeps the servers it started
+  /// with.
+  void updateIceConfig(IceConfig config) => _peer.iceConfig = config;
+
   /// Turns the screen off at the ear while a call is on the earpiece. The SDK
   /// has no platform code, so the app supplies the switch; see
   /// [ProximityController]. Does nothing by default.
@@ -408,6 +414,7 @@ class VobizClient {
     if (!_config.unsafeDemoZeroConfig) {
       throw const VobizDemoModeRequiredException('Zero-Config Setup');
     }
+    _checkHttpsForAccountCredentials();
 
     _closeExistingConnection();
     final epoch = _signInEpoch;
@@ -778,7 +785,7 @@ class VobizClient {
   /// registrar holds it and pushes the devices registered for this SIP user
   /// ([VobizPushDevices]). For testing that path; a sign-out leaves it true.
   Future<void> disconnect({bool unregister = true}) async {
-    _signInEpoch++;
+    final epoch = ++_signInEpoch;
     _supervisor.stop();
     _reconnectWhenCallEnds = false;
     _stopWatchingLifecycle();
@@ -792,6 +799,8 @@ class VobizClient {
     // Unregisters (REGISTER Expires: 0, at most ~2 s) before the socket
     // closes, unless asked not to.
     await _sip.disconnect(unregister: unregister);
+    // A newer sign-in during that wait has set its own.
+    if (epoch == _signInEpoch) _sip.forgetCredentials();
     await _peer.disposeAllCalls();
     _callId = null;
     _callState = CallStateStatus.idle;
@@ -1131,6 +1140,7 @@ class VobizClient {
       throw StateError(
           'Transfer needs Zero-Config Setup (Auth ID and Auth Token), not SIP Direct');
     }
+    _checkHttpsForAccountCredentials();
     final uuid = _callUuid ?? _sip.callUuid;
     if (uuid == null) {
       throw StateError('Vobiz has not reported a CallUUID for this call yet');
@@ -1191,11 +1201,19 @@ class VobizClient {
   /// Waits for the recording of the call with [callUuid] (usually
   /// [lastCallUuid]) to be reported, polling like the web Playground: every
   /// [interval], up to [attempts] times. Returns null if it never arrives.
+  ///
+  /// Throws [VobizException] ([VobizErrorCode.recordingsFailed]) at once,
+  /// without polling, when [backendUrl] is the shared demo server and demo
+  /// mode is off: that list is never read then.
   Future<VobizRecording?> waitForRecording(
     String callUuid, {
     Duration interval = const Duration(milliseconds: 2500),
     int attempts = 12,
   }) async {
+    if (WebhookServerApi.isDemoServer(backendUrl) && !_config.unsafeDemoZeroConfig) {
+      // Refused before any request is made: this throws the explanation.
+      await _api.recordings(webhookUrl: backendUrl);
+    }
     for (var i = 0; i < attempts; i++) {
       await Future<void>.delayed(interval);
       try {
@@ -1675,6 +1693,17 @@ class VobizClient {
     }
   }
 
+  /// The account Auth ID and Auth Token go to [backendUrl] only over HTTPS,
+  /// or to this device itself (a local server, or an emulator's host).
+  void _checkHttpsForAccountCredentials() {
+    final uri = Uri.tryParse(WebhookServerApi.normalizeBase(backendUrl));
+    const local = <String>{'localhost', '127.0.0.1', '::1', '[::1]', '10.0.2.2'};
+    if (uri == null || (uri.scheme != 'https' && !(uri.scheme == 'http' && local.contains(uri.host)))) {
+      throw ArgumentError.value(backendUrl, 'backendUrl',
+          'must be https: it receives the account Auth ID and Auth Token');
+    }
+  }
+
   /// The Playground server answers a bad Auth ID / Auth Token with a generic
   /// "Could not resolve Application ID", which says nothing useful.
   VobizException _explainSetupFailure(VobizException e) {
@@ -1958,6 +1987,9 @@ class VobizClient {
   /// With signalling lost too, the reconnect's REGISTER restarts ICE.
   void _restartIceForLostMedia(String callId) {
     if (_callId != callId || _mediaRestartTried || _signalingLost || !isConnected) return;
+    // A hold or resume is renegotiating: leave the one restart for the next
+    // report of the loss.
+    if (_reInviteInProgress) return;
     _mediaRestartTried = true;
     unawaited(_restartIce('the call lost its audio while signalling is up'));
   }

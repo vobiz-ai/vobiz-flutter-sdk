@@ -950,13 +950,31 @@ class SIPService {
   /// [SipConnectSuperseded] when [disconnect] or another [connect] replaced
   /// it before its handshake finished: that socket is closed, and the state
   /// is left to whatever replaced it.
+  ///
+  /// A socket still open from before is closed first. Throws [ArgumentError]
+  /// in a release build for a cleartext `ws:` URL to anything but this
+  /// device ([refusesCleartext]): the REGISTER carries the digest answer or
+  /// the access token.
   Future<void> connect() async {
+    final uri = Uri.parse(wsUrl);
+    if (refusesCleartext(uri)) {
+      throw ArgumentError.value(wsUrl, 'wsUrl', 'must be wss: in a release build');
+    }
+    if (uri.scheme == 'ws' && !_isLoopback(uri.host)) {
+      _logger.warn('SIP over cleartext ws: to ${uri.host}; a release build refuses it');
+    }
+    final previous = _socket;
+    if (previous != null) {
+      _socket = null;
+      _dropRegistersSentOn(previous);
+      _closeQuietly(previous);
+    }
     _manualDisconnect = false;
     _connectionState.value = SipConnectionState.connecting;
     WebSocketChannel? socket;
     try {
       socket = IOWebSocketChannel.connect(
-        Uri.parse(wsUrl),
+        uri,
         protocols: const <String>['sip'],
         pingInterval: keepAlive.pingInterval,
         connectTimeout: const Duration(seconds: 20),
@@ -986,6 +1004,16 @@ class SIPService {
     _listenToSocket(socket);
   }
 
+  /// Whether [connect] refuses [uri]: a cleartext `ws:` URL to another
+  /// host, in a release build ([release]). Debug builds allow it, for a
+  /// registrar on the LAN while developing.
+  @visibleForTesting
+  static bool refusesCleartext(Uri uri, {bool release = kReleaseMode}) =>
+      release && uri.scheme == 'ws' && !_isLoopback(uri.host);
+
+  static bool _isLoopback(String host) =>
+      host == 'localhost' || host == '127.0.0.1' || host == '::1' || host == '[::1]';
+
   void register(String username, String password) {
     _username = username;
     _password = password;
@@ -1000,6 +1028,8 @@ class SIPService {
     _username = username;
     _password = null;
     _accessToken = accessToken;
+    // What the registrar said about the last token is not about this one.
+    _accessTokenExpiresIn = null;
     _startRegistration();
   }
 
@@ -1008,7 +1038,23 @@ class SIPService {
   void updateAccessToken(String accessToken) {
     if (_password != null) return;
     _accessToken = accessToken;
+    _accessTokenExpiresIn = null;
   }
+
+  /// Drops the user name, password and access token, after a sign-out has
+  /// finished with them (its unregistration, a call's BYE). The next sign-in
+  /// sets them again.
+  void forgetCredentials() {
+    _username = null;
+    _password = null;
+    _accessToken = null;
+    _accessTokenExpiresIn = null;
+    _accessTokenError = null;
+  }
+
+  /// Whether a user name with a password or access token is held.
+  @visibleForTesting
+  bool get debugHasCredentials => _hasCredentials;
 
   /// The registrar's reason for its last refusal of the access token (10001
   /// to 10010, from `X-vobiz-Jwt-Error-Code`), until the next REGISTER is
@@ -1016,7 +1062,8 @@ class SIPService {
   int? get accessTokenError => _accessTokenError;
 
   /// From the registrar's last 200 OK (`X-vobiz-Jwt: expires=<s>;epoch-exp=<t>`):
-  /// seconds the token had left by the server's clock.
+  /// seconds the token had left by the server's clock. Null until a 200 OK
+  /// for the current token says so.
   int? get accessTokenExpiresIn => _accessTokenExpiresIn;
 
   /// Whether the registration failure just reported to [onRegistrationFailed]
