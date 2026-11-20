@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -67,9 +68,23 @@ void main() {
       expect(PushBridgeConfig.parse('ftp://host#key=abc'), isNull);
     });
 
-    test('allows plain http for a server on the local network', () {
+    test('allows plain http for a server on the local network, outside release builds only', () {
+      expect(kAllowHttp, isTrue, reason: 'tests run as a debug build');
       final config = PushBridgeConfig.parse('http://10.0.2.2:8787#key=abc')!;
       expect(config.isHttps, isFalse);
+      expect(PushBridgeConfig.parse('http://10.0.2.2:8787#key=abc', allowHttp: false), isNull);
+      expect(PushBridgeConfig.parse('https://abc.trycloudflare.com#key=abc', allowHttp: false), isNotNull);
+    });
+
+    test('a release build refuses an http server line, and says why', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      FlutterSecureStorage.setMockInitialValues(<String, String>{});
+      final controller = PlaygroundController(allowHttp: false);
+      addTearDown(controller.dispose);
+      expect(await controller.setPushServer('http://192.168.1.20:8787#key=abc'), contains('https://'));
+      expect(controller.pushServer, isEmpty);
+      expect(await controller.setPushServer('https://abc.trycloudflare.com#key=abc'), isNull);
+      expect(controller.bridgeConfig, isNotNull);
     });
   });
 
@@ -141,7 +156,10 @@ void main() {
   });
 
   group('Identity panel', () {
-    setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
+    setUp(() {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    });
 
     void usePhoneScreen(WidgetTester tester) {
       tester.view.physicalSize = const Size(1236, 2745);

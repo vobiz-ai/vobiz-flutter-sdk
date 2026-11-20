@@ -124,6 +124,7 @@ class PlaygroundController extends ChangeNotifier {
     CallPlatform? platform,
     http.Client? httpClient,
     this.demoTools = kDemoTools,
+    this.allowHttp = kAllowHttp,
   })  : client = client ?? createPlaygroundClient(demoTools: demoTools),
         _http = httpClient,
         _secure = secureStorage ?? const FlutterSecureStorage(),
@@ -137,6 +138,10 @@ class PlaygroundController extends ChangeNotifier {
   /// and "Call this phone through Vobiz". Without them nothing sends the
   /// account's Auth ID or Auth Token anywhere.
   final bool demoTools;
+
+  /// Whether a plain http:// sample server or token server is accepted
+  /// ([kAllowHttp]: not in release builds).
+  final bool allowHttp;
 
   final VobizClient client;
   final FlutterSecureStorage _secure;
@@ -335,7 +340,7 @@ class PlaygroundController extends ChangeNotifier {
   /// its active calls); each call is taken once.
   final Set<String> _takenCalls = <String>{};
 
-  PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer);
+  PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer, allowHttp: allowHttp);
 
   // ── Incoming calls (Vobiz push) ─────────────────────────────────────────────
   /// Sign this phone up with Vobiz's push service after signing in. A call
@@ -544,9 +549,10 @@ class PlaygroundController extends ChangeNotifier {
     }
     if (token && tokenServerUrl.trim().isNotEmpty) {
       final url = Uri.tryParse(tokenServerUrl.trim());
-      if (url == null || url.host.isEmpty || (url.scheme != 'https' && url.scheme != 'http')) {
+      if (url == null || url.host.isEmpty || !(url.scheme == 'https' || (allowHttp && url.scheme == 'http'))) {
         missingFields = <String>{'tokenServer'};
-        return _connectFailed('The token server must be an http(s) URL, such as https://<your server>/token');
+        return _connectFailed('The token server must be an ${allowHttp ? 'http(s)' : 'https'} URL, such as '
+            'https://<your server>/token');
       }
     }
 
@@ -1099,8 +1105,10 @@ class PlaygroundController extends ChangeNotifier {
   /// null.
   Future<String?> setPushServer(String value) async {
     final text = value.trim();
-    if (text.isNotEmpty && PushBridgeConfig.parse(text) == null) {
-      return 'Paste the whole line the server printed: https://…#key=…';
+    if (text.isNotEmpty && PushBridgeConfig.parse(text, allowHttp: allowHttp) == null) {
+      return PushBridgeConfig.parse(text, allowHttp: true) != null
+          ? 'This build takes an https:// server line only: https://…#key=…'
+          : 'Paste the whole line the server printed: https://…#key=…';
     }
     pushServer = text;
     try {

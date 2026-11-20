@@ -107,6 +107,40 @@ void main() {
     controller.dispose();
   });
 
+  test('a plain http token server is refused in a release build, not in a debug one', () async {
+    final requests = <http.Request>[];
+    final release = PlaygroundController(
+      client: client,
+      callScreen: FakeCallScreen(),
+      platform: FakeCallPlatform(),
+      httpClient: MockClient((request) async {
+        requests.add(request);
+        return http.Response(jsonEncode(<String, String>{'token': jwt()}), 200);
+      }),
+      allowHttp: false,
+    );
+    await release.init();
+    release.setAuthTab(AuthTab.accessToken);
+    release.tokenServerUrl = 'http://192.168.1.20:8080/token';
+    await release.connect();
+    expect(release.connectError, contains('https URL'));
+    expect(release.missingFields, contains('tokenServer'));
+    expect(requests, isEmpty, reason: 'nothing is fetched in clear text');
+    release.dispose();
+
+    final debug = make(MockClient((request) async {
+      requests.add(request);
+      return http.Response(jsonEncode(<String, String>{'token': jwt()}), 200);
+    }));
+    await debug.init();
+    debug.setAuthTab(AuthTab.accessToken);
+    debug.tokenServerUrl = 'http://192.168.1.20:8080/token';
+    await debug.connect();
+    expect(debug.connectError, isNull);
+    expect(requests.single.url.scheme, 'http');
+    debug.dispose();
+  });
+
   test('a token server that refuses shows an access token error', () async {
     final controller = make(MockClient((_) async => http.Response('nope', 401)));
     await controller.init();
