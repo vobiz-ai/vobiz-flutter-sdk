@@ -281,6 +281,9 @@ class FakeCallPlatform extends CallPlatform {
   Future<void> stopCallService() async => requests.add('stop');
 
   @override
+  Future<void> leaveLockScreen() async => requests.add('leaveLockScreen');
+
+  @override
   Future<void> showMissedCall({required String id, required String caller}) async =>
       requests.add('missed:$id');
 }

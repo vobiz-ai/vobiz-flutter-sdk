@@ -56,8 +56,13 @@ class CallPlatform {
   Future<void> startCallService({required String caller, required bool outbound}) =>
       _invoke<void>('startCallService', <String, Object>{'caller': caller, 'outbound': outbound});
 
-  /// Stops the foreground service: the call is over.
+  /// Stops the foreground service: the call is over. An app that Accept
+  /// opened over the lock screen goes back behind it.
   Future<void> stopCallService() => _invoke<void>('stopCallService');
+
+  /// An accepted call screen led to no call: an app that Accept opened over
+  /// the lock screen goes back behind it, unless a call is running.
+  Future<void> leaveLockScreen() => _invoke<void>('leaveLockScreen');
 
   /// Posts a "Missed call" notification. One per [id]; a second post for
   /// the same call replaces the first.

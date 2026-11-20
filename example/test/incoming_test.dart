@@ -164,6 +164,22 @@ void main() {
       expect(client.actions, isNot(contains('acceptCall')));
       expect(screen.ended, contains('ref-1'), reason: 'the stray screen is taken down');
       expect(controller.showIncoming, isTrue, reason: 'the real call still rings');
+      expect(platform.requests, contains('leaveLockScreen'), reason: 'Accept opened the app over the lock screen');
+    });
+
+    test('the app leaves the lock screen when the call accepted there ends', () async {
+      await start();
+      await signIn();
+      client.ring();
+      await pumpEventQueue();
+      screen.controller.add(ck.CallEventActionCallAccept(sipScreen('sip-sip-1')));
+      await pumpEventQueue();
+      client.emit(CallStateStatus.active);
+      await pumpEventQueue();
+      expect(platform.requests, isNot(contains('stop')));
+      client.emit(CallStateStatus.ended);
+      await pumpEventQueue();
+      expect(platform.requests.last, 'stop', reason: 'stopCallService also takes the app off the lock screen');
     });
   });
 

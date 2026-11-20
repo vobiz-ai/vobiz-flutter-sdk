@@ -1205,6 +1205,7 @@ class PlaygroundController extends ChangeNotifier {
         if (!ringingHere) {
           log('📵 Accept on a call screen whose call is not ringing here: closed it', LogType.warning);
           await _closeCallScreen(callKitParams.id);
+          unawaited(platform.leaveLockScreen());
           return;
         }
         _callScreenId = callKitParams.id;
@@ -1683,6 +1684,7 @@ class PlaygroundController extends ChangeNotifier {
       final expires = pushed.expiresAt;
       if (!pushed.isVobiz || (expires != null && DateTime.now().isAfter(expires.add(const Duration(seconds: 30))))) {
         await _closeCallScreen(active.id);
+        unawaited(platform.leaveLockScreen());
         continue;
       }
       await _acceptVobizHeldCall(pushed, active.id);
