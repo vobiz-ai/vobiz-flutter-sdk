@@ -23,6 +23,17 @@ class FakeClient implements VobizClient {
   /// Sign-in completes and registers at once.
   bool registerOnConnect = true;
 
+  /// When set, the next Zero-Config or SIP Direct sign-in throws it (and
+  /// clears it), as the SDK does when its first socket attempt fails.
+  Object? failConnect;
+
+  void _throwIfFailing() {
+    final fail = failConnect;
+    if (fail == null) return;
+    failConnect = null;
+    throw fail;
+  }
+
   bool connected = false;
   CallStateStatus state = CallStateStatus.idle;
   Map<String, String> headers = const <String, String>{};
@@ -68,6 +79,11 @@ class FakeClient implements VobizClient {
   /// Every token passed to [connectWithAccessToken] / [updateAccessToken].
   final List<String> tokens = <String>[];
 
+  /// The SDK's token session reads it to time its refresh; the fake has no
+  /// registrar to say.
+  @override
+  Duration? get accessTokenTimeLeft => null;
+
   @override
   Future<void> connectWithAccessToken(String token) async {
     actions.add('connectWithAccessToken');
@@ -101,6 +117,7 @@ class FakeClient implements VobizClient {
   @override
   Future<ZeroConfigSession> connectWithAuthToken({required String authId, required String authToken}) async {
     actions.add('connectWithAuthToken');
+    _throwIfFailing();
     final gate = setupGate;
     if (gate != null) await gate.future;
     mode = VobizAuthMode.zeroConfig;
@@ -111,6 +128,7 @@ class FakeClient implements VobizClient {
   @override
   Future<void> connectWithCredentials(CredentialConfig config) async {
     actions.add('connectWithCredentials');
+    _throwIfFailing();
     mode = VobizAuthMode.sipDirect;
     _register(config.username);
   }
@@ -253,8 +271,11 @@ class FakeCallScreen extends CallScreenApi {
   @override
   Future<List<ck.CallKitParams>> active() async => List<ck.CallKitParams>.of(screens);
 
+  /// What [canUseFullScreen] answers.
+  bool? fullScreen;
+
   @override
-  Future<bool?> canUseFullScreen() async => null;
+  Future<bool?> canUseFullScreen() async => fullScreen;
 }
 
 /// The Android side (call service, missed-call notifications), recorded.

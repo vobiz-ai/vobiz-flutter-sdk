@@ -1826,6 +1826,7 @@ class PlaygroundController extends ChangeNotifier {
       // Signed out meanwhile: a late registration must not sign back in.
       if (status == PhoneStatus.offline && statusText == 'Disconnected') return;
       _loginTimeout?.cancel();
+      final wasReconnecting = _reconnecting;
       _reconnecting = false;
       connectError = null;
       missingFields = <String>{};
@@ -1833,9 +1834,12 @@ class PlaygroundController extends ChangeNotifier {
           status != PhoneStatus.inCall &&
           status != PhoneStatus.ringing;
       if (wasConnecting) {
-        log('Registered successfully as ${client.sipUsername ?? connectedAs}', LogType.success);
+        log(wasReconnecting
+            ? 'Reconnected: registered again as ${client.sipUsername ?? connectedAs}'
+            : 'Registered successfully as ${client.sipUsername ?? connectedAs}', LogType.success);
         _setStatus(PhoneStatus.online, 'Registered');
-        onTabRequest?.call(1);
+        // A reconnect leaves the user where they are.
+        if (!wasReconnecting) onTabRequest?.call(1);
         _registerWithVobizPush();
       }
       return;
@@ -1851,15 +1855,35 @@ class PlaygroundController extends ChangeNotifier {
       _setStatus(PhoneStatus.error, 'Auth Failed');
       return;
     }
+    // The socket dropped while idle. The SDK reconnects by itself (the
+    // Playground keeps autoReconnect on) and reports `reconnecting`; it ends
+    // in `registered`, or in a `reconnect_failed` error when it gives up
+    // (_onError). Without autoReconnect it reports `disconnected`, and nothing
+    // follows unless the sign-in timeout ends it.
     final message = e.message ?? '';
-    if (e.connectionState == ConnectionStateStatus.disconnected &&
-        message.startsWith('Socket error') &&
-        status == PhoneStatus.online) {
+    final reconnecting = e.connectionState == ConnectionStateStatus.reconnecting;
+    final dropped = e.connectionState == ConnectionStateStatus.disconnected && message.startsWith('Socket error');
+    if ((reconnecting || dropped) && status == PhoneStatus.online) {
       log('Connection lost — reconnecting ($message)', LogType.warning);
       _reconnecting = true;
       _setStatus(PhoneStatus.connecting, 'Reconnecting...');
-      _startLoginTimeout();
+      if (dropped) _startLoginTimeout();
     }
+  }
+
+  /// The SDK stopped reconnecting: the phone is offline until the user
+  /// connects again (or the app comes back to the foreground, or the network
+  /// changes, which make the SDK try again).
+  void _onReconnectGaveUp(String message) {
+    if (status != PhoneStatus.connecting && status != PhoneStatus.online) {
+      log('⚠️ reconnect_failed: $message', LogType.warning);
+      return;
+    }
+    _loginTimeout?.cancel();
+    _reconnecting = false;
+    connectError = 'Connection lost: $message. Connect again.';
+    log(connectError!, LogType.error);
+    _setStatus(PhoneStatus.error, 'Connection lost');
   }
 
   void _onCall(CallEvent e) {
@@ -2005,6 +2029,7 @@ class PlaygroundController extends ChangeNotifier {
   }
 
   void _onError(ErrorEvent e) {
+    if (e.code == 'reconnect_failed') return _onReconnectGaveUp(e.message);
     // Call failures and setup failures are already reported, with more detail.
     const shown = <String>{
       'call_failed', 'setup_failed', 'registration_failed', 'transfer_failed',
@@ -2107,7 +2132,8 @@ class PlaygroundController extends ChangeNotifier {
       // end's BYE arrived as it dropped, or an outgoing call was still
       // ringing). Leave the call screen and show the reconnect: registering
       // again (_onConnection) leaves a call screen alone, but shows
-      // Registered from here.
+      // Registered from here. Still signed in: Disconnect stays reachable.
+      _reconnecting = true;
       _setStatus(PhoneStatus.connecting, 'Reconnecting...');
     } else {
       notifyListeners();
