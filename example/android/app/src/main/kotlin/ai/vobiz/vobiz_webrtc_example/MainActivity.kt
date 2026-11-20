@@ -35,6 +35,16 @@ class MainActivity : FlutterActivity() {
      */
     override fun provideFlutterEngine(context: Context): FlutterEngine = CallEngine.obtain(context)
 
+    // This activity is exported. FlutterActivity reads its engine choices from
+    // the launch intent's extras (cached_engine_id, cached_engine_group_id,
+    // destroy_engine_with_activity); no intent may pick another engine or have
+    // the call engine destroyed with the activity.
+    override fun getCachedEngineId(): String? = null
+
+    override fun getCachedEngineGroupId(): String? = null
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
     /** Accept on the incoming-call screen: the plugin opens the app with this action. */
     private fun isCallAccept(intent: Intent?): Boolean = intent?.action == CallkitConstants.ACTION_CALL_ACCEPT
 
