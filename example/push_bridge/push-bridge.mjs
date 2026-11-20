@@ -74,6 +74,9 @@ export function createBridge(options = {}) {
     jwtSub: (env.JWT_SUB || 'flutter-app').trim(),
     jwtTtlSeconds: clampInt(env.JWT_TTL_SECONDS, 3600, 180, 86400),
     jwtAppId: (env.JWT_APP_ID || '').trim(),
+    // The other subs /token may mint (besides JWT_SUB). Empty: any sub, for
+    // anyone with the bridge key.
+    jwtAllowedSubs: String(env.JWT_ALLOWED_SUBS || '').split(',').map((s) => s.trim()).filter((s) => SUB_RE.test(s)),
     callerIdMode: (env.CALLER_ID_MODE || 'number').trim().toLowerCase(),
     headerStyle: (env.SIP_HEADER_STYLE || 'suffix').trim().toLowerCase(),
     alwaysRing: csv(env.ALWAYS_RING),
@@ -464,8 +467,9 @@ export function createBridge(options = {}) {
    * in with it (the SDK's connectWithAccessTokenProvider) as
    * "<sub>_<auth id>", and the token renews itself through this route before
    * it expires. Anyone with the bridge key may ask; `sub` comes from the body
-   * or ?sub=, else JWT_SUB. Same reply shape as the Vobiz WebRTC demo's
-   * /token.
+   * or ?sub=, else JWT_SUB. With JWT_ALLOWED_SUBS set, only those subs and
+   * JWT_SUB are minted; without it, any sub is (a key holder can then sign in
+   * as any user). Same reply shape as the Vobiz WebRTC demo's /token.
    */
   async function onToken(req, res, url) {
     if (!appCaller(req, res)) return;
@@ -473,6 +477,10 @@ export function createBridge(options = {}) {
     const body = await readJson(req);
     const sub = String(body.sub || url.searchParams.get('sub') || config.jwtSub).trim();
     if (!SUB_RE.test(sub)) return sendJson(res, 400, { error: 'sub must be 1 to 50 letters, digits, _ or -' });
+    if (config.jwtAllowedSubs.length && sub !== config.jwtSub && !config.jwtAllowedSubs.includes(sub)) {
+      log('!!', `Refused an access token for ${sub}: not in JWT_ALLOWED_SUBS`);
+      return sendJson(res, 403, { error: `This server does not mint tokens for ${sub}` });
+    }
     // nbf a minute in the past: a registrar whose clock is a second behind
     // this one refuses a token whose nbf has not come yet (10005). The
     // platform's 180 s to 24 h limits apply to exp - nbf.
@@ -836,6 +844,11 @@ export function createBridge(options = {}) {
       log('!!', 'ROUTES and ALWAYS_RING are empty: inbound calls ring nobody. Set ROUTES=<your number>=<SIP user> in .env.');
     }
     log('..', `Inbound calls ring for ${config.ringSeconds} s`);
+    if (config.jwtAllowedSubs.length) {
+      log('ok', `Access tokens: only for ${[config.jwtSub, ...config.jwtAllowedSubs].join(', ')}`);
+    } else {
+      log('!!', 'Access tokens: /token mints a token for any sub to anyone with the bridge key. Set JWT_ALLOWED_SUBS to limit it.');
+    }
 
     console.log('');
     if (keyIsNew) {
