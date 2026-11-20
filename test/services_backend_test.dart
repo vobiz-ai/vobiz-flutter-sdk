@@ -62,7 +62,7 @@ void main() {
       expect(sent, hasLength(4));
     });
 
-    test('a client in demo mode reports the refusal as a failed setup', () async {
+    test('a client in demo mode refuses an http backendUrl before anything is sent', () async {
       var requests = 0;
       final client = VobizClient(
         config: const SdkConfig(
@@ -72,14 +72,10 @@ void main() {
           return http.Response('{}', 200);
         }),
       );
-      final errors = <ErrorEvent>[];
-      client.errorEvents.listen(errors.add);
       await expectLater(client.connectWithAuthToken(authId: 'MA_TEST0001', authToken: 'token-1'),
-          throwsA(isA<VobizException>().having((e) => e.code, 'code', 'setup_failed')));
+          throwsA(isA<ArgumentError>().having((e) => e.name, 'name', 'backendUrl')));
       expect(requests, 0);
-      expect(client.connectionState, ConnectionStateStatus.failed);
-      await Future<void>.delayed(Duration.zero);
-      expect(errors.map((e) => e.code), contains('setup_failed'));
+      expect(client.isConnected, isFalse);
       await client.dispose();
     });
   });

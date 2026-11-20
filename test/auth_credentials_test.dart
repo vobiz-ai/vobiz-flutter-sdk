@@ -288,7 +288,7 @@ void main() {
       final client = VobizClient(config: SdkConfig(wsUrl: registrar.wsUrl, autoReconnect: false));
       // ignore: deprecated_member_use_from_same_package
       await client.connect(const TokenConfig(token: 't', displayName: 'u'));
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       expect(registrar.attempts, <String>['u']);
       expect(client.authMode, VobizAuthMode.sipDirect);
       await client.dispose();
