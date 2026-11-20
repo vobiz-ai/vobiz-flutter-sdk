@@ -728,7 +728,13 @@ export function createBridge(options = {}) {
     const expires = Date.now() + NONCE_TTL_MS;
     for (const part of parts) state.nonces[part] = expires;
     pruneNonces();
-    saveState();
+    try {
+      saveState();
+    } catch (error) {
+      // The request is genuine and is remembered in memory, so the call goes
+      // on; only a restart would forget it.
+      log('!!', `Could not save ${config.stateFile}: ${error.message}`);
+    }
     return true;
   }
 

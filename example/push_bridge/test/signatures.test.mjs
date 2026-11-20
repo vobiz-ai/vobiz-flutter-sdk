@@ -1,6 +1,8 @@
 // #12: webhooks fail closed, are checked against the documented V3/V2
 // scheme, cannot be replayed, and a Dial callback's call id is signed.
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import { createBridge } from '../push-bridge.mjs';
 import { AUTH_TOKEN, PUBLIC_URL, answerCall, signV3, startBridge, webhook } from './helpers.mjs';
@@ -95,6 +97,20 @@ test('a nonce is remembered for a day, and the list of seen ones stays bounded',
   assert.ok(expiry > Date.now() + 23 * 60 * 60 * 1000, 'still refused 23 hours from now');
   assert.ok(Object.keys(seen).length <= 10000, `${Object.keys(seen).length} entries`);
   assert.equal('old-0' in seen, false, 'the soonest to expire go first');
+});
+
+test('a state file that cannot be written does not fail the call, and the nonce is still refused', async (t) => {
+  const ctx = await startBridge(RINGS_ALICE);
+  t.after(ctx.stop);
+  // Every later write of the state file fails (gone folder; on Windows also a
+  // file another program holds open).
+  fs.rmSync(path.dirname(ctx.stateFile), { recursive: true, force: true });
+  const r = await webhook(ctx, '/answer', { CallUUID: 'c1', From: '+919800000001', To: '+918000000000' });
+  assert.equal(r.status, 200);
+  assert.match(r.text, /<Dial /, 'the caller is rung, not told that something went wrong');
+  assert.ok(ctx.logs.some((l) => /^!! Could not save .*bridge-state\.json/.test(l)));
+  const replay = await webhook(ctx, '/answer', { CallUUID: 'c2' }, { sign: false, headers: r.headers });
+  assert.equal(replay.status, 403, 'remembered in memory');
 });
 
 test('nonces survive a restart', async () => {
