@@ -270,6 +270,34 @@ test('an inbound call the bridge rang: the app is the B-leg and hosts', async ()
   }
 });
 
+test('two adds at once for one call share one room: the call is moved once', async () => {
+  const fake = vobiz();
+  const ctx = await startBridge({
+    env: { VOBIZ_NUMBER: CALLER_ID },
+    // Vobiz's answer about the live call takes a while, as over a network.
+    apiHandler: async (method, pathname, body) => {
+      if (method === 'GET') await sleep(50);
+      return fake(method, pathname, body);
+    },
+  });
+  try {
+    const alice = appAuth('alice');
+    const [one, two] = await Promise.all([
+      postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice),
+      postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919822222222' }, alice),
+    ]);
+    assert.equal(one.status, 200, one.text);
+    assert.equal(two.status, 200, two.text);
+    assert.equal(one.json.room, two.json.room, 'one room');
+    assert.equal(calls(ctx, 'POST', `/Call/${CALL}/`).length, 1, 'both sides of the call moved once');
+    assert.equal(calls(ctx, 'POST', '/Call/').length, 2, 'both people dialled');
+    const state = (await postJson(ctx, '/conference/state', { call_uuid: CALL }, alice)).json;
+    assert.deepEqual(state.participants.map((p) => p.role), ['host', 'guest', 'added', 'added']);
+  } finally {
+    await ctx.stop();
+  }
+});
+
 test('room webhooks must be signed and their paths written by the bridge', async () => {
   const c = await startConference();
   try {

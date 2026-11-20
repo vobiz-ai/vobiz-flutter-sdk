@@ -1105,6 +1105,8 @@ export function createBridge(options = {}) {
   /** Conference rooms by name, and the room of every CallUUID in one. Memory only. */
   const rooms = new Map();
   const roomOfCall = new Map();
+  /** Rooms being opened, by the CallUUID they are for (see onConferenceAdd). */
+  const roomOpenings = new Map();
   /** Vobiz's account cap on conference members (max_conf_members). */
   const MAX_CONF_MEMBERS = 20;
   /** A leg on its way into the room that has not entered after this long is gone. */
@@ -1129,20 +1131,23 @@ export function createBridge(options = {}) {
       return sendJson(res, 400, { error: 'caller_id must be one of your Vobiz numbers in E.164 (VOBIZ_NUMBER is the default)' });
     }
 
+    // Another add for this call may be opening its room: wait for it, so the
+    // call is moved into one room only.
+    while (roomOpenings.has(uuid)) await roomOpenings.get(uuid).catch(() => {});
     let room = roomForCall(uuid);
     if (room && !mayControl(room, who)) return sendJson(res, 403, { error: 'Not a conference of this SIP user' });
     if (room?.over) room = null;
     if (!room) {
-      const legs = await conferenceLegs(uuid, who, body);
-      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this SIP user' });
-      room = openRoom(uuid, legs);
+      const opening = openConference(uuid, who, body);
+      roomOpenings.set(uuid, opening);
+      let opened;
       try {
-        await moveIntoRoom(room);
-      } catch (error) {
-        log('!!', `Conference ${room.name}: Vobiz did not move call ${short(uuid)} into it: ${error.message}`);
-        forgetRoom(room);
-        return sendJson(res, 502, { error: 'Vobiz did not move the call into a conference' });
+        opened = await opening;
+      } finally {
+        if (roomOpenings.get(uuid) === opening) roomOpenings.delete(uuid);
       }
+      if (!opened.room) return sendJson(res, opened.status, { error: opened.error });
+      room = opened.room;
     }
     if (room.members.filter((m) => PRESENT.has(m.status)).length >= MAX_CONF_MEMBERS) {
       return sendJson(res, 409, { error: `A conference holds at most ${MAX_CONF_MEMBERS} people`, conference: publicRoom(room) });
@@ -1270,6 +1275,21 @@ export function createBridge(options = {}) {
       hostUser: hostLeg === 'aleg' ? from : to,
       guestLabel: displayNumber(hostLeg === 'aleg' ? live.to : live.from) || 'Caller',
     };
+  }
+
+  /** Opens a room for call `uuid` and moves both sides into it: { room }, or { status, error }. */
+  async function openConference(uuid, who, body) {
+    const legs = await conferenceLegs(uuid, who, body);
+    if (!legs) return { status: 403, error: 'Not a live call of this SIP user' };
+    const room = openRoom(uuid, legs);
+    try {
+      await moveIntoRoom(room);
+    } catch (error) {
+      log('!!', `Conference ${room.name}: Vobiz did not move call ${short(uuid)} into it: ${error.message}`);
+      forgetRoom(room);
+      return { status: 502, error: 'Vobiz did not move the call into a conference' };
+    }
+    return { room };
   }
 
   function openRoom(uuid, legs) {
