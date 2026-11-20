@@ -49,6 +49,11 @@ class CallPlatform {
     ];
   }
 
+  /// The app's package name (its Android application id), or null where
+  /// there is no Android side. Vobiz pushes with the Firebase credential
+  /// saved for it in the Vobiz Console.
+  Future<String?> packageName() => _invoke<String>('packageName');
+
   /// Starts the foreground service for a call that is now ringing out,
   /// connecting or connected. Call it while the app is visible or right
   /// after the user's tap: Android 14 refuses a microphone service started

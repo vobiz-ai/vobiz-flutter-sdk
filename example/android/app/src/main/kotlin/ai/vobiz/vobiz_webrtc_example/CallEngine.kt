@@ -29,8 +29,8 @@ import io.flutter.plugin.common.MethodChannel
  * handlers).
  *
  * The method channel `ai.vobiz.example/call` (Dart: CallPlatform):
- *  - Dart -> Android: ready, startCallService, stopCallService, leaveLockScreen,
- *    showMissedCall
+ *  - Dart -> Android: ready, packageName, startCallService, stopCallService,
+ *    leaveLockScreen, showMissedCall
  *  - Android -> Dart: push(data), hangUp()
  */
 object CallEngine {
@@ -108,6 +108,7 @@ object CallEngine {
                     pending.clear()
                     result.success(queued)
                 }
+                "packageName" -> result.success(context.packageName)
                 "startCallService" -> {
                     CallService.start(
                         context,

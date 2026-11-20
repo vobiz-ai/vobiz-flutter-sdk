@@ -219,6 +219,7 @@ void main() {
 
   group('Vobiz push sign-up through the sample server', () {
     late FakeClient client;
+    late FakeCallPlatform platform;
     late PlaygroundController controller;
     late List<http.Request> requests;
     late http.Response Function(http.Request request) reply;
@@ -231,12 +232,13 @@ void main() {
         'vobiz_push_server': server,
       });
       client = FakeClient();
+      platform = FakeCallPlatform();
       requests = <http.Request>[];
       reply = (_) => http.Response('{"message":"ok"}', 200);
       controller = PlaygroundController(
         client: client,
         callScreen: FakeCallScreen(),
-        platform: FakeCallPlatform(),
+        platform: platform,
         push: FakePush(),
         httpClient: MockClient((request) async {
           requests.add(request);
@@ -268,6 +270,14 @@ void main() {
       expect(body['app_bundle_id'], 'ai.vobiz.vobiz_webrtc_example');
       expect(body['device_id'], startsWith('vobiz-example-'));
       expect(body.containsKey('auth_id'), isFalse, reason: 'the server sets its own account');
+    });
+
+    test('sends the application id Android runs the app as', () async {
+      await start();
+      platform.appId = 'com.example.renamed';
+      await controller.setVobizPush(true);
+      await pumpEventQueue();
+      expect((jsonDecode(requests.single.body) as Map<String, Object?>)['app_bundle_id'], 'com.example.renamed');
     });
 
     test('a server reached under a path keeps that path', () async {

@@ -376,9 +376,6 @@ class PlaygroundController extends ChangeNotifier {
   /// This install's id with Vobiz push, made once and kept.
   String? _pushDeviceId;
 
-  /// The app's package name: Vobiz pushes with the Firebase key saved for it.
-  static const String appBundleId = 'ai.vobiz.vobiz_webrtc_example';
-
   /// Calls Vobiz pushed, still ringing, by the push's call id (the SIP
   /// Call-ID of the held INVITE).
   final Map<String, PushCall> _ringingPushes = <String, PushCall>{};
@@ -1535,9 +1532,14 @@ class PlaygroundController extends ChangeNotifier {
     vobizPushState = PushState.registering;
     notifyListeners();
     final token = await push.token();
-    if (token == null) {
+    // The application id Android runs this app as: Vobiz pushes with the
+    // Firebase credential saved for it.
+    final bundleId = await platform.packageName();
+    if (token == null || bundleId == null || bundleId.isEmpty) {
       vobizPushState = PushState.failed;
-      vobizPushDetail = 'Firebase gave no push token (no network, or Google Play services missing).';
+      vobizPushDetail = token == null
+          ? 'Firebase gave no push token (no network, or Google Play services missing).'
+          : 'Could not read this app\'s package name from Android.';
       log('❌ Vobiz push: $vobizPushDetail', LogType.error);
       notifyListeners();
       return;
@@ -1554,7 +1556,7 @@ class PlaygroundController extends ChangeNotifier {
         deviceId: await _installId(),
         pushToken: token,
         sipUsername: user,
-        appBundleId: appBundleId,
+        appBundleId: bundleId,
         appVersion: 'example',
         sdkVersion: VobizClient.sdkVersion,
       );

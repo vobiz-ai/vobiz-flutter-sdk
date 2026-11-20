@@ -273,6 +273,12 @@ class FakeCallPlatform extends CallPlatform {
   @override
   Future<List<Map<String, String>>> ready() async => const <Map<String, String>>[];
 
+  /// What [packageName] returns: the application id in build.gradle.kts.
+  String? appId = 'ai.vobiz.vobiz_webrtc_example';
+
+  @override
+  Future<String?> packageName() async => appId;
+
   @override
   Future<void> startCallService({required String caller, required bool outbound}) async =>
       requests.add('start:$caller');
