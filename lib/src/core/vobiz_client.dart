@@ -35,6 +35,7 @@ import '../state/call_state.dart';
 import '../state/connection_state.dart';
 import '../state/registration_state.dart';
 import '../utils/logger.dart';
+import '../utils/sip_text.dart';
 import '../utils/stream_extensions.dart';
 import '../webrtc/peer_service.dart';
 import 'sdk_config.dart';
@@ -404,6 +405,10 @@ class VobizClient {
         authId: id,
         authToken: token,
       );
+      if (!_isSipUsername(session.sipUsername)) {
+        throw const VobizException(VobizErrorCode.setupFailed,
+            'The webhook server returned a SIP username that cannot be used');
+      }
     } on VobizException catch (e) {
       final explained = _explainSetupFailure(e);
       // Signed out, or in again, meanwhile: that sign-in owns the state.
@@ -434,14 +439,16 @@ class VobizClient {
       'for a JWT.')
   Future<void> connect(Object credentials) async {
     if (credentials is CredentialConfig) {
+      _checkSipUsername(credentials.username);
       _beginSipDirect();
       await _connectWithCredentials(credentials.username, credentials.password);
       return;
     }
     if (credentials is TokenConfig) {
+      final username = credentials.displayName ?? 'token-user';
+      _checkSipUsername(username);
       _beginSipDirect();
-      await _connectWithCredentials(
-          credentials.displayName ?? 'token-user', credentials.token);
+      await _connectWithCredentials(username, credentials.token);
       return;
     }
     throw ArgumentError(
@@ -450,7 +457,12 @@ class VobizClient {
 
   /// SIP Direct: sign in as an existing endpoint with its SIP username and
   /// password (Vobiz Console → Voice → Endpoints).
+  ///
+  /// Throws [ArgumentError], before touching the current connection, when
+  /// the username is empty or holds a space, a line break or any of
+  /// `< > " @`.
   Future<void> connectWithCredentials(CredentialConfig config) {
+    _checkSipUsername(config.username);
     _beginSipDirect();
     return _connectWithCredentials(config.username, config.password);
   }
@@ -479,6 +491,7 @@ class VobizClient {
   /// [VobizAccessTokenException] carrying the registrar's reason.
   Future<void> connectWithAccessToken(String accessToken) async {
     final token = VobizAccessToken.parse(accessToken);
+    _checkAccessTokenText(token);
     _closeExistingConnection();
     _authMode = VobizAuthMode.accessToken;
     _authId = null;
@@ -504,6 +517,7 @@ class VobizClient {
       throw StateError('Not signed in with an access token: call connectWithAccessToken first');
     }
     final next = VobizAccessToken.parse(accessToken);
+    _checkAccessTokenText(next);
     if (next.accountId != current.accountId || next.subject != current.subject) {
       throw ArgumentError.value(next.sipUsername, 'accessToken',
           'is for another user than ${current.sipUsername}; sign in with connectWithAccessToken to switch');
@@ -553,11 +567,17 @@ class VobizClient {
   /// [pushCallUpdates] reports each step, and `expired` when no INVITE came
   /// by the push's expiry: take the call screen down then.
   ///
-  /// Returns false and does nothing for a push that has expired. A repeat of
-  /// the push being handled returns true and does nothing more.
+  /// Returns false and does nothing for a push that has expired, or whose
+  /// hold reference cannot go into a REGISTER (an empty value, or a control
+  /// character). A repeat of the push being handled returns true and does
+  /// nothing more.
   bool handleIncomingPush(VobizIncomingPush push) {
     final hold = push.hold;
     if (push.isExpired()) return false;
+    if (hold.registerHeaders.values.any((v) => v.isEmpty || hasControlCharacter(v))) {
+      _logger.warn('Ignored the push for ${push.callId}: its hold reference cannot go into a REGISTER');
+      return false;
+    }
     final current = _pushed;
     if (current != null && current.push.callId == push.callId) return true;
     _forgetPushedCall();
@@ -771,7 +791,9 @@ class VobizClient {
   ///   it is what gets the call to the webhook.
   ///
   /// Throws [ArgumentError] naming every invalid header before anything is
-  /// dialled, where the web SDK would silently drop it.
+  /// dialled, where the web SDK would silently drop it, and for a
+  /// [destination] with a space, a line break or any of `" < > @ ; : ? ,`
+  /// (it goes into the INVITE's Request-URI and To as it is).
   Future<String> makeCall(
     String destination, {
     String? callerId,
@@ -797,6 +819,10 @@ class VobizClient {
     }
     final target = destination.trim();
     if (target.isEmpty) throw ArgumentError('A destination is required');
+    if (_unsafeInDestination.hasMatch(target)) {
+      throw ArgumentError.value(destination, 'destination',
+          'must be a phone number or a SIP username, with no spaces, line breaks or any of " < > @ ; : ? ,');
+    }
     final outgoing = buildCallHeaders(
       headers: headers,
       callerId: callerId,
@@ -884,6 +910,42 @@ class VobizClient {
   }
 
   static final RegExp _callerIdPattern = RegExp(r'^\+?\d{7,15}$');
+
+  /// What cannot be in the user part of the INVITE's Request-URI and To: a
+  /// space or control character (CR LF would add header lines), or a
+  /// character that ends the user part or the URI.
+  static final RegExp _unsafeInDestination = RegExp(r'[\s\x00-\x1f\x7f"<>@;:?,]');
+
+  /// What cannot be in a SIP username, which goes into From, To and the
+  /// digest answer: a space or control character, or `< > " @`. Endpoint
+  /// names with any other character sign in as they are.
+  static final RegExp _unsafeInSipUsername = RegExp(r'[\s\x00-\x1f\x7f<>"@]');
+
+  static bool _isSipUsername(String username) =>
+      username.isNotEmpty && !_unsafeInSipUsername.hasMatch(username);
+
+  static void _checkSipUsername(String username) {
+    if (!_isSipUsername(username)) {
+      throw ArgumentError.value(username, 'username',
+          'must be a SIP username, with no spaces, line breaks or any of < > " @');
+    }
+  }
+
+  /// A JWT is base64url text in three dot-separated parts; anything else in
+  /// it would go into the `X-Vobiz-Jwt` header line as it is.
+  static void _checkAccessTokenText(VobizAccessToken token) {
+    if (!RegExp(r'^[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+$').hasMatch(token.token)) {
+      throw const VobizAccessTokenException(
+          'Invalid access token: only base64url text and dots can go into the X-Vobiz-Jwt header',
+          tokenError: VobizAccessTokenException.invalidToken);
+    }
+    if (!_isSipUsername(token.sipUsername)) {
+      throw const VobizAccessTokenException(
+          'Invalid access token: its sub and iss do not make a SIP username (no spaces, line '
+          'breaks or any of < > " @)',
+          tokenError: VobizAccessTokenException.invalidToken);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Inbound call
@@ -990,6 +1052,10 @@ class VobizClient {
     String? callerId,
     Map<String, String> sipHeaders = const <String, String>{},
   }) async {
+    final cli = callerId?.trim() ?? '';
+    if (cli.isNotEmpty && !_callerIdPattern.hasMatch(cli)) {
+      throw ArgumentError('Caller ID must be a phone number in E.164 format, such as +919876543210');
+    }
     if (_callState != CallStateStatus.active) {
       throw StateError('Transfer is only available once the call is answered');
     }
@@ -1032,7 +1098,7 @@ class VobizClient {
         leg: leg,
         number: phone.isEmpty ? null : phone,
         sipUser: user.isEmpty ? null : user,
-        callerId: callerId?.trim(),
+        callerId: cli.isEmpty ? null : cli,
         sipHeaders: xml.value,
       );
       return '${reply['message'] ?? 'Transfer accepted'}';

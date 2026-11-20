@@ -11,6 +11,7 @@ import '../core/sip_headers.dart';
 import '../errors/vobiz_exception.dart';
 import '../network/keep_alive.dart';
 import '../utils/logger.dart';
+import '../utils/sip_text.dart';
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -64,7 +65,12 @@ class SipMessage {
 
   bool get isRequest => !firstLine.startsWith('SIP/');
   String get method => firstLine.split(' ').first;
-  int get statusCode => int.tryParse(firstLine.split(' ')[1]) ?? 0;
+
+  /// The response's status code; 0 when the status line has none.
+  int get statusCode {
+    final parts = firstLine.split(' ');
+    return parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0;
+  }
 
   String? header(String name) {
     final key = name.toLowerCase();
@@ -1050,8 +1056,16 @@ class SIPService {
   /// REGISTER: the sign-in's ([register], [registerWithAccessToken]), a
   /// reconnect's, or another right after the one in flight is answered. Only
   /// that one REGISTER carries them; refreshes after it do not.
+  ///
+  /// Headers that cannot go on a header line as they are (a name that is not
+  /// a SIP token, a control character in a name or value) are refused: this
+  /// returns false and nothing is sent or kept.
   bool claimHeldCall(Map<String, String> headers) {
     if (headers.isEmpty) return false;
+    if (!headers.entries.every((h) => _headerToken.hasMatch(h.key) && !hasControlCharacter(h.value))) {
+      _logger.warn('Not claiming the held call: its hold reference cannot go into a SIP header');
+      return false;
+    }
     final registered = _connectionState.value == SipConnectionState.connected &&
         _registrationState.value == SipRegistrationState.registered;
     final inFlight = _transactions.values.any((tx) => tx.method == 'REGISTER');
@@ -1126,8 +1140,17 @@ class SIPService {
     _reservationTimer = Timer(outgoingReservation, _releaseReservation);
   }
 
+  /// Sends the INVITE for a new outbound call to [toUser]. Throws
+  /// [ArgumentError], sending nothing, when [toUser] or a header in
+  /// [extraHeaders] could not go into the message as it is.
   void call(String toUser, String sdp,
       {Map<String, String> extraHeaders = const <String, String>{}}) {
+    if (toUser.isEmpty || hasControlCharacter(toUser)) {
+      throw ArgumentError.value(toUser, 'toUser', 'cannot go into a SIP Request-URI');
+    }
+    if (!extraHeaders.entries.every((h) => _headerToken.hasMatch(h.key) && !hasControlCharacter(h.value))) {
+      throw ArgumentError.value(extraHeaders.keys.join(', '), 'extraHeaders', 'cannot all go into SIP headers');
+    }
     _releaseReservation();
     // An inbound INVITE that arrived while this call was being prepared was
     // never shown to the app. Give its caller a final answer now rather than
@@ -1841,11 +1864,14 @@ class SIPService {
 
     socket.stream.listen(
       (raw) {
+        // A binary frame carries the message as bytes: the WebSocket module
+        // sends one when the text is not valid UTF-8 (a Latin-1 caller name).
+        final text = raw is List<int> ? utf8.decode(raw, allowMalformed: true) : raw.toString();
         if (isCurrent()) {
-          _handleMessage(raw.toString());
+          _handleMessage(text);
         } else if (identical(socket, _closingSocket)) {
           // Unregistering: only the answers to our own requests matter.
-          _handleMessage(raw.toString(), responsesOnly: true);
+          _handleMessage(text, responsesOnly: true);
         }
       },
       onError: (Object e) {
@@ -1884,7 +1910,17 @@ class SIPService {
       return;
     }
     _logger.info('SIP << ${_summarize(raw)}');
-    final msg = SipParser.parse(raw);
+    final SipMessage msg;
+    try {
+      msg = SipParser.parse(raw);
+    } catch (e) {
+      _logger.warn('Dropped a SIP message that could not be read: $e');
+      return;
+    }
+    if (!msg.isRequest && (msg.statusCode < 100 || msg.statusCode > 699)) {
+      _logger.warn('Dropped a response with no valid status code: ${_summarize(raw)}');
+      return;
+    }
     if (msg.isRequest) {
       if (!responsesOnly) _handleRequest(msg);
     } else {
@@ -2708,8 +2744,9 @@ class SIPService {
   static String? _topBranch(SipMessage msg) {
     final vias = msg.headerValues('Via');
     if (vias.isEmpty) return null;
-    final top = SipParser.splitAddressList(vias.first).first;
-    return RegExp(r'branch=([^;,\s]+)', caseSensitive: false).firstMatch(top)?.group(1);
+    final top = SipParser.splitAddressList(vias.first);
+    if (top.isEmpty) return null;
+    return RegExp(r'branch=([^;,\s]+)', caseSensitive: false).firstMatch(top.first)?.group(1);
   }
 
   int _extractCSeqNumber(String? header) =>
@@ -2726,6 +2763,11 @@ class SIPService {
     return parts.length > 2 ? parts.sublist(2).join(' ') : 'Unknown error';
   }
 
+  /// Who is calling: from each of P-Asserted-Identity, Remote-Party-ID,
+  /// From and Contact in turn, a phone number that is the whole user part of
+  /// its URI (`sip:`, `sips:` or `tel:`) or the whole quoted display name,
+  /// else that header's SIP user when it is not this client's own. Digits
+  /// elsewhere in a header (inside a user name, a tag) are not a number.
   String _extractCallerId(SipMessage msg) {
     final candidates = <String>[
       msg.header('P-Asserted-Identity') ?? '',
@@ -2734,13 +2776,20 @@ class SIPService {
       msg.header('Contact') ?? '',
     ];
     for (final h in candidates) {
-      final phone = RegExp(r'\+?\d{8,15}').firstMatch(h)?.group(0);
-      if (phone != null) return phone;
+      final uriUser = RegExp(r'(?:sips?|tel):([^@;>\s]+)', caseSensitive: false).firstMatch(h)?.group(1);
+      if (uriUser != null && _phoneNumber.hasMatch(uriUser)) return uriUser;
+      final displayName = RegExp(r'^\s*"([^"]*)"').firstMatch(h)?.group(1)?.trim();
+      if (displayName != null && _phoneNumber.hasMatch(displayName)) return displayName;
       final user = _extractUser(h);
       if (user != 'Unknown' && user != _username) return user;
     }
     return _extractUser(msg.header('From') ?? '');
   }
+
+  static final RegExp _phoneNumber = RegExp(r'^\+?\d{8,15}$');
+
+  /// A SIP header name (RFC 3261 25.1 `token`).
+  static final RegExp _headerToken = RegExp(r"^[A-Za-z0-9\-.!%*_+`'~]+$");
 
   String _summarize(String msg) {
     final first = msg.split(RegExp(r'\r?\n')).first.trim();

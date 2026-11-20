@@ -1,3 +1,5 @@
+import '../utils/sip_text.dart';
+
 /// What became of a call push handed to `VobizClient.handleIncomingPush`.
 enum VobizPushCallStatus {
   /// The REGISTER that claims the held call is on its way, or waits for the
@@ -50,12 +52,13 @@ class VobizPushHold {
   });
 
   /// Reads the hold reference from a push's data map. Null unless `index`,
-  /// `label` and `registrar` are all there.
+  /// `label` and `registrar` are all there, and none holds a control
+  /// character: each goes into a REGISTER header line as it is.
   static VobizPushHold? tryParse(Map<String, Object?> data) {
     final index = '${data['index'] ?? ''}'.trim();
     final label = '${data['label'] ?? ''}'.trim();
     final registrar = '${data['registrar'] ?? ''}'.trim();
-    if (index.isEmpty || label.isEmpty || registrar.isEmpty) return null;
+    if (<String>[index, label, registrar].any((v) => v.isEmpty || hasControlCharacter(v))) return null;
     return VobizPushHold(index: index, label: label, registrar: registrar);
   }
 
