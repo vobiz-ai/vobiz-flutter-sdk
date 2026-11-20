@@ -22,7 +22,7 @@ class SectionLabel extends StatelessWidget {
                 style: TextStyle(
                     fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
           ),
-          if (trailing != null) trailing!,
+          ?trailing,
         ],
       ),
     );

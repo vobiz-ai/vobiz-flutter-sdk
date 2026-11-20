@@ -85,7 +85,7 @@ class PushBridgeApi {
   /// is given). [reason] is the SDK's (`sign_in`, `expiring`, `rejected`,
   /// `refresh`).
   Future<String> accessToken({String? sub, required String reason}) async {
-    final json = await _post('/token', <String, Object?>{'reason': reason, if (sub != null) 'sub': sub});
+    final json = await _post('/token', <String, Object?>{'reason': reason, 'sub': ?sub});
     final token = json['token'];
     if (token is! String || token.isEmpty) {
       throw PushBridgeException('The sample server returned no token');
