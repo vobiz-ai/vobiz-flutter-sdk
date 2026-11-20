@@ -57,26 +57,40 @@ class CallQualityAnalyzer {
   double? _lastReceived;
 
   /// Reads one stats report. Returns null when it has no inbound audio yet.
+  ///
+  /// The round-trip time is the candidate pair's that carries the audio, as
+  /// the `transport` report names it (`selectedCandidatePairId`). Without
+  /// that name, a nominated or succeeded pair's; and the RTCP measure of the
+  /// audio stream (`remote-inbound-rtp`) when no pair has one.
   CallQualitySample? add(List<StatsReport> reports) {
-    double? rttMs;
     double? jitterMs;
     double? lost;
     double? received;
     String? codecId;
     final codecs = <String, String>{};
+    String? selectedPairId;
+    final pairRttMs = <String, double>{};
+    double? workingPairRttMs;
+    double? streamRttMs;
 
     for (final StatsReport report in reports) {
       final Map<dynamic, dynamic> v = report.values;
       switch (report.type) {
+        case 'transport':
+          final Object? id = v['selectedCandidatePairId'];
+          if (id != null && '$id'.isNotEmpty) selectedPairId = '$id';
+          break;
         case 'candidate-pair':
-          final bool selected =
-              v['nominated'] == true || '${v['state']}' == 'succeeded';
           final double? rtt = _asDouble(v['currentRoundTripTime']);
-          if (selected && rtt != null && rtt > 0) rttMs = rtt * 1000;
+          if (rtt == null || rtt <= 0) break;
+          pairRttMs[report.id] = rtt * 1000;
+          if (v['nominated'] == true || '${v['state']}' == 'succeeded') {
+            workingPairRttMs = rtt * 1000;
+          }
           break;
         case 'remote-inbound-rtp':
           final double? rtt = _asDouble(v['roundTripTime']);
-          if (rtt != null && rtt > 0) rttMs ??= rtt * 1000;
+          if (rtt != null && rtt > 0) streamRttMs ??= rtt * 1000;
           break;
         case 'inbound-rtp':
           if ('${v['kind'] ?? v['mediaType']}' != 'audio') break;
@@ -92,6 +106,11 @@ class CallQualityAnalyzer {
           break;
       }
     }
+    // Another pair (a backup path, say) can also be nominated or succeeded:
+    // its time says nothing about the audio's.
+    final double? rttMs = selectedPairId != null
+        ? pairRttMs[selectedPairId] ?? streamRttMs
+        : workingPairRttMs ?? streamRttMs;
     if (received == null && jitterMs == null && rttMs == null) return null;
 
     double? lossPercent;

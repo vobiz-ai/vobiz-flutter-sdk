@@ -116,6 +116,16 @@ class FakePeer extends RTCPeerConnection {
   Completer<void>? addTrackGate;
   bool failRemote = false;
 
+  /// Every remote description asked for, applied or not.
+  final List<RTCSessionDescription> remoteAttempts = <RTCSessionDescription>[];
+
+  /// Thrown by [createOffer] when set.
+  Object? createOfferError;
+
+  /// When set, [getLocalDescription] answers this many more times, then
+  /// throws.
+  int? localReadsLeft;
+
   RTCSessionDescription? get local => localSet.isEmpty ? null : localSet.last;
 
   @override
@@ -125,6 +135,8 @@ class FakePeer extends RTCPeerConnection {
   @override
   Future<RTCSessionDescription> createOffer(
       [Map<String, dynamic>? constraints]) async {
+    final error = createOfferError;
+    if (error != null) throw error;
     final direction = transceivers_.isEmpty
         ? 'sendrecv'
         : <TransceiverDirection, String>{
@@ -145,9 +157,18 @@ class FakePeer extends RTCPeerConnection {
   Future<void> setLocalDescription(RTCSessionDescription description) async =>
       localSet.add(description);
   @override
-  Future<RTCSessionDescription?> getLocalDescription() async => local;
+  Future<RTCSessionDescription?> getLocalDescription() async {
+    final left = localReadsLeft;
+    if (left != null) {
+      if (left <= 0) throw Exception('getLocalDescription failed');
+      localReadsLeft = left - 1;
+    }
+    return local;
+  }
+
   @override
   Future<void> setRemoteDescription(RTCSessionDescription description) async {
+    remoteAttempts.add(description);
     if (failRemote) throw Exception('setRemoteDescription failed');
     remoteSet.add(description);
   }
@@ -198,7 +219,12 @@ class FakeAudioBackend implements AudioDeviceBackend {
   }
 
   @override
-  void listenForDeviceChanges(void Function() onChange) => this.onChange = onChange;
+  void Function() listenForDeviceChanges(void Function() onChange) {
+    this.onChange = onChange;
+    return () {
+      if (identical(this.onChange, onChange)) this.onChange = null;
+    };
+  }
 }
 
 class FakeProximity extends ProximityController {

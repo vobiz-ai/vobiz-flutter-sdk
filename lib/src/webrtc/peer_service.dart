@@ -52,6 +52,13 @@ class _PeerCallState {
   /// On hold: the track is silenced whatever [muted] says.
   bool held = false;
 
+  /// While a [PeerService.beginHold] offer waits for its answer: the hold
+  /// state to go back to if it fails. Null when no hold offer is pending.
+  bool? heldBeforeOffer;
+
+  /// A [PeerService.beginIceRestart] offer waits for its answer.
+  bool iceRestartPending = false;
+
   /// The last remote SDP applied (offer, answer or provisional answer).
   String? remoteSdp;
 
@@ -99,6 +106,9 @@ class PeerService {
     });
   }
 
+  /// The ICE servers and policy. Read when a call's peer connection is
+  /// created, so a new value (fresh TURN credentials) applies from the next
+  /// call on.
   IceConfig iceConfig;
   final MediaConstraints mediaConstraints;
   final Logger _logger;
@@ -446,23 +456,34 @@ class PeerService {
   /// Answers a session change the far end offered mid-call (a re-INVITE or
   /// UPDATE with new SDP, such as the far end putting us on hold): applies
   /// the offer and returns the local answer's SDP. Returns null, leaving the
-  /// session as it was, when it cannot be applied.
+  /// session as it was, when it cannot be applied, and while this side's own
+  /// hold or ICE-restart offer waits for its answer (applying the far end's
+  /// offer would throw ours away).
   Future<String?> answerSessionOffer(String offerSdp) async {
     final String? callId = _activeCallId;
     final _PeerCallState? state = _activeState;
     final RTCPeerConnection? peer = state?.peerConnection;
     if (callId == null || state == null || peer == null) return null;
+    if (state.heldBeforeOffer != null || state.iceRestartPending) {
+      _logger.warn('Session change for $callId refused: our own offer is pending');
+      return null;
+    }
+    var offerApplied = false;
     try {
       await setRemoteDescription(RTCSessionDescription(offerSdp, 'offer'));
+      offerApplied = true;
       await createAnswer();
       final RTCSessionDescription? local = await peer.getLocalDescription();
       if (!_isLive(callId, state)) return null;
       return local?.sdp;
     } catch (e) {
       _logger.warn('Could not answer the session change for $callId: $e');
-      try {
-        await peer.setRemoteDescription(RTCSessionDescription('', 'rollback'));
-      } catch (_) {}
+      // Undo only the offer applied here.
+      if (offerApplied) {
+        try {
+          await peer.setRemoteDescription(RTCSessionDescription('', 'rollback'));
+        } catch (_) {}
+      }
       return null;
     }
   }
@@ -526,28 +547,43 @@ class PeerService {
   /// (or restores) the microphone, sets the audio direction to `sendonly`
   /// (or `sendrecv`) and returns the new local offer's SDP for a re-INVITE.
   /// Finish with [completeHold] when the 200 OK arrives, or [abortHold].
+  ///
+  /// When building the offer fails, the microphone, the direction and the
+  /// hold state are put back before the error is rethrown; [abortHold] then
+  /// has nothing left to undo.
   Future<String> beginHold(bool hold) async {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
     final RTCPeerConnection peer = _requirePeerForState(state, callId);
     final String direction = hold ? 'sendonly' : 'sendrecv';
 
+    state.heldBeforeOffer = state.held;
     state.held = hold;
     _applyTrackEnabled(state);
 
-    final bool viaTransceiver = await _setDirection(
-        peer, hold ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
-    RTCSessionDescription offer = await peer.createOffer(<String, dynamic>{});
-    if (!viaTransceiver || SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
-      offer = RTCSessionDescription(
-          SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
+    var offerApplied = false;
+    try {
+      final bool viaTransceiver = await _setDirection(
+          peer, hold ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
+      RTCSessionDescription offer = await peer.createOffer(<String, dynamic>{});
+      if (!viaTransceiver || SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
+        offer = RTCSessionDescription(
+            SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
+      }
+      offer = _withPreferredCodecs(offer);
+      _requireLive(callId, state);
+      await peer.setLocalDescription(offer);
+      offerApplied = true;
+      final RTCSessionDescription? local = await peer.getLocalDescription();
+      _emitMediaMessage(callId, state, hold ? 'Hold offer created' : 'Resume offer created');
+      return local?.sdp ?? offer.sdp ?? '';
+    } catch (_) {
+      // Not left silent (or live) while the call's state says otherwise.
+      if (_isLive(callId, state)) {
+        await _undoHold(callId, peer, state, rollBack: offerApplied);
+      }
+      rethrow;
     }
-    offer = _withPreferredCodecs(offer);
-    _requireLive(callId, state);
-    await peer.setLocalDescription(offer);
-    final RTCSessionDescription? local = await peer.getLocalDescription();
-    _emitMediaMessage(callId, state, hold ? 'Hold offer created' : 'Resume offer created');
-    return local?.sdp ?? offer.sdp ?? '';
   }
 
   /// Applies the far end's answer to a [beginHold] offer.
@@ -555,26 +591,42 @@ class PeerService {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
     await setRemoteDescription(RTCSessionDescription(answerSdp, 'answer'));
+    state.heldBeforeOffer = null;
     _callMediaEvents.addIfOpen(HoldChangedEvent(callId: callId, held: state.held));
     _updateProximity();
   }
 
   /// Undoes a [beginHold] the far end refused: rolls the offer back and puts
-  /// the microphone and direction back as they were.
+  /// the microphone and direction back as they were. Does nothing when no
+  /// hold offer is pending.
   Future<void> abortHold() async {
     final String? callId = _activeCallId;
     final _PeerCallState? state = _activeState;
     final RTCPeerConnection? peer = state?.peerConnection;
     if (callId == null || state == null || peer == null) return;
-    state.held = !state.held;
+    await _undoHold(callId, peer, state, rollBack: true);
+  }
+
+  Future<void> _undoHold(
+    String callId,
+    RTCPeerConnection peer,
+    _PeerCallState state, {
+    required bool rollBack,
+  }) async {
+    final bool? before = state.heldBeforeOffer;
+    if (before == null) return;
+    state.heldBeforeOffer = null;
+    state.held = before;
     _applyTrackEnabled(state);
-    try {
-      await peer.setLocalDescription(RTCSessionDescription('', 'rollback'));
-    } catch (e) {
-      _logger.warn('Could not roll back the hold offer for $callId: $e');
+    if (rollBack) {
+      try {
+        await peer.setLocalDescription(RTCSessionDescription('', 'rollback'));
+      } catch (e) {
+        _logger.warn('Could not roll back the hold offer for $callId: $e');
+      }
     }
-    await _setDirection(peer,
-        state.held ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
+    await _setDirection(
+        peer, before ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
   }
 
   // -------------------------------------------------------------------------
@@ -587,7 +639,9 @@ class PeerService {
   /// come back without fresh ICE credentials and candidates. Keeps the hold
   /// direction. Waits for gathering as for the first offer and returns the
   /// new offer's SDP for a re-INVITE. Finish with [completeIceRestart] when
-  /// the 200 OK arrives, or [abortIceRestart].
+  /// the 200 OK arrives, or [abortIceRestart]. When building the offer
+  /// fails, an offer already applied is rolled back before the error is
+  /// rethrown.
   Future<String> beginIceRestart({bool Function()? cancelled}) async {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
@@ -599,29 +653,39 @@ class PeerService {
     // ones gathered on the network that is gone.
     state.gatheringComplete = false;
     state.candidateTypes.clear();
+    state.iceRestartPending = true;
+    var offerApplied = false;
     try {
-      await peer.restartIce();
-    } catch (e) {
-      // createOffer's iceRestart option below asks for the same thing.
-      _logger.warn('restartIce failed for $callId: $e');
+      try {
+        await peer.restartIce();
+      } catch (e) {
+        // createOffer's iceRestart option below asks for the same thing.
+        _logger.warn('restartIce failed for $callId: $e');
+      }
+      RTCSessionDescription offer =
+          await peer.createOffer(<String, dynamic>{'iceRestart': true});
+      if (SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
+        offer = RTCSessionDescription(
+            SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
+      }
+      offer = _withPreferredCodecs(offer);
+      _requireLive(callId, state);
+      await peer.setLocalDescription(offer);
+      offerApplied = true;
+      await waitForIceGathering(callId, cancelled: cancelled);
+      final RTCSessionDescription? local = await peer.getLocalDescription();
+      final String sdp = local?.sdp ?? offer.sdp ?? '';
+      if (oldUfrag != null && _iceUfrag(sdp) == oldUfrag) {
+        _logger.warn('ICE restart offer for $callId kept the old ICE credentials');
+      }
+      _emitMediaMessage(callId, state, 'ICE restart offer created');
+      return sdp;
+    } catch (_) {
+      if (_isLive(callId, state)) {
+        await _undoIceRestart(callId, peer, state, rollBack: offerApplied);
+      }
+      rethrow;
     }
-    RTCSessionDescription offer =
-        await peer.createOffer(<String, dynamic>{'iceRestart': true});
-    if (SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
-      offer = RTCSessionDescription(
-          SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
-    }
-    offer = _withPreferredCodecs(offer);
-    _requireLive(callId, state);
-    await peer.setLocalDescription(offer);
-    await waitForIceGathering(callId, cancelled: cancelled);
-    final RTCSessionDescription? local = await peer.getLocalDescription();
-    final String sdp = local?.sdp ?? offer.sdp ?? '';
-    if (oldUfrag != null && _iceUfrag(sdp) == oldUfrag) {
-      _logger.warn('ICE restart offer for $callId kept the old ICE credentials');
-    }
-    _emitMediaMessage(callId, state, 'ICE restart offer created');
-    return sdp;
   }
 
   /// Applies the far end's answer to a [beginIceRestart] offer. ICE then
@@ -631,14 +695,29 @@ class PeerService {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
     await setRemoteDescription(RTCSessionDescription(answerSdp, 'answer'));
+    state.iceRestartPending = false;
     _emitMediaMessage(callId, state, 'ICE restart answered');
   }
 
-  /// Rolls back a [beginIceRestart] offer the far end refused.
+  /// Rolls back a [beginIceRestart] offer the far end refused. Does nothing
+  /// when no ICE-restart offer is pending.
   Future<void> abortIceRestart() async {
     final String? callId = _activeCallId;
-    final RTCPeerConnection? peer = _activeState?.peerConnection;
-    if (callId == null || peer == null) return;
+    final _PeerCallState? state = _activeState;
+    final RTCPeerConnection? peer = state?.peerConnection;
+    if (callId == null || state == null || peer == null) return;
+    await _undoIceRestart(callId, peer, state, rollBack: true);
+  }
+
+  Future<void> _undoIceRestart(
+    String callId,
+    RTCPeerConnection peer,
+    _PeerCallState state, {
+    required bool rollBack,
+  }) async {
+    if (!state.iceRestartPending) return;
+    state.iceRestartPending = false;
+    if (!rollBack) return;
     try {
       await peer.setLocalDescription(RTCSessionDescription('', 'rollback'));
     } catch (e) {
