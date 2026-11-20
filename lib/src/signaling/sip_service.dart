@@ -493,8 +493,14 @@ class SipBuilder {
   }
 
   static String _branch() =>
-      Random().nextInt(0x7fffffff).toRadixString(16).padLeft(8, '0');
+      sipRandom.nextInt(0x7fffffff).toRadixString(16).padLeft(8, '0');
 }
+
+/// Where branches, tags, Call-IDs, the Contact user and the digest cnonce
+/// come from: unpredictable, as RFC 3261 19.3 and 8.1.1.4 ask, so they
+/// cannot be guessed from earlier ones.
+@visibleForTesting
+final Random sipRandom = Random.secure();
 
 // ---------------------------------------------------------------------------
 // SIP Digest Auth
@@ -552,7 +558,7 @@ class SipDigestAuth {
       md5.convert(utf8.encode(input)).toString();
 
   static String _rand() =>
-      List.generate(8, (_) => Random().nextInt(16).toRadixString(16)).join();
+      List.generate(16, (_) => sipRandom.nextInt(16).toRadixString(16)).join();
 
   static String? _extract(String header, String key) =>
       RegExp('\\b$key\\s*=\\s*"([^"]*)"', caseSensitive: false).firstMatch(header)?.group(1);
@@ -2893,7 +2899,7 @@ class SIPService {
 
   static String _rand(int length) {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    final rand = Random();
+    final rand = sipRandom;
     return List<String>.generate(
       length,
       (_) => chars[rand.nextInt(chars.length)],

@@ -4,6 +4,7 @@
 // messages, odd caller IDs) is read without throwing out of the listener.
 // ignore_for_file: implementation_imports
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
@@ -137,6 +138,18 @@ void main() {
     expect(() => s.call('1', 'v=0', extraHeaders: const <String, String>{'X-VH-A': 'b\r\nX: y'}),
         throwsArgumentError);
     expect(sent, isEmpty);
+  });
+
+  test('the digest cnonce is 16 hex digits from the secure random source', () {
+    final header = SipDigestAuth.buildAuthHeader(
+      wwwAuthenticate: 'Digest realm="registrar.vobiz.ai", nonce="n1", qop="auth"',
+      method: 'REGISTER',
+      uri: 'sip:registrar.vobiz.ai',
+      username: 'play1',
+      password: 'secret',
+    )!;
+    expect(RegExp(r'cnonce="([0-9a-f]+)"').firstMatch(header)!.group(1), hasLength(16));
+    expect(sipRandom.runtimeType, isNot(Random().runtimeType));
   });
 
   test('transferCall refuses a caller ID that is not a phone number', () {

@@ -787,9 +787,9 @@ class VobizClient {
   ///
   /// [unregister] false closes the connection without a REGISTER
   /// `Expires: 0`, as when Android kills the app: Vobiz keeps this phone's
-  /// registration until its keep-alive finds the socket gone (a few
-  /// seconds), and a call in that time takes Vobiz's push-to-wake path: the
-  /// registrar holds it and pushes the devices registered for this SIP user
+  /// registration until it expires (the SDK asks for an hour), and a call
+  /// in that time takes Vobiz's push-to-wake path: the registrar holds it
+  /// and pushes the devices registered for this SIP user
   /// ([VobizPushDevices]). For testing that path; a sign-out leaves it true.
   Future<void> disconnect({bool unregister = true}) async {
     final epoch = ++_signInEpoch;
