@@ -94,6 +94,22 @@ void main() {
     controller.dispose();
   });
 
+  test('a user id the sample server will not mint for (403) is shown at sign-in', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{'vobiz_push_server': 'https://bridge.example#key=k1'});
+    final controller = make(MockClient((_) async =>
+        http.Response(jsonEncode(<String, String>{'error': 'agent99 is not in JWT_ALLOWED_SUBS'}), 403)));
+    await controller.init();
+    controller.setAuthTab(AuthTab.accessToken);
+    controller.tokenUser = 'agent99';
+
+    await controller.connect();
+
+    expect(controller.connectError, startsWith('Access token error:'));
+    expect(controller.connectError, contains('agent99 is not in JWT_ALLOWED_SUBS'));
+    expect(client.actions, isNot(contains('connectWithAccessToken')));
+    controller.dispose();
+  });
+
   test('without a token server or a sample server it says so, and signs nothing in', () async {
     final controller = make(MockClient((_) async => http.Response('{}', 500)));
     await controller.init();

@@ -697,20 +697,40 @@ class PlaygroundController extends ChangeNotifier {
     await client.disconnect();
   }
 
-  /// Signs out, and forgets the saved Auth Token and SIP password: after a
-  /// sign-out nothing on this device can sign in as this account again.
-  Future<void> disconnect() async {
+  /// The sign-out in progress, so a second Disconnect joins it.
+  Future<void>? _disconnecting;
+
+  /// Signs out on this device first (the registration, the access-token
+  /// session, every saved secret: after a sign-out nothing on this device
+  /// can sign in as this account again), then takes the phone off Vobiz
+  /// push. A second call while one runs joins it.
+  Future<void> disconnect() {
+    final running = _disconnecting;
+    if (running != null) return running;
+    final attempt = _disconnect();
+    _disconnecting = attempt;
+    return attempt.whenComplete(() {
+      if (identical(_disconnecting, attempt)) _disconnecting = null;
+    });
+  }
+
+  Future<void> _disconnect() async {
     _session++;
     _connecting = null;
     _loginTimeout?.cancel();
     _reconnecting = false;
     connectError = null;
     log('Logging out...', LogType.info);
-    // Signing out means "stop ringing this phone"; closing the app does not.
-    await _logoutFromVobizPush();
-    // Stop renewing the access token before the client lets go of it.
-    await _stopTokenSession();
-    await client.disconnect();
+    // Made now, while the SIP user (and, without a sample server, the
+    // account's credentials) are still known; sent once signed out here.
+    final pushLogout = _vobizPushLogout();
+    try {
+      // Stop renewing the access token before the client lets go of it.
+      await _stopTokenSession();
+      await client.disconnect();
+    } catch (e) {
+      log('⚠️ Sign-out: $e', LogType.warning);
+    }
     connectedAs = null;
     authToken = '';
     sipPassword = '';
@@ -718,17 +738,40 @@ class PlaygroundController extends ChangeNotifier {
     _stopCallService();
     _resetCallState(registered: false);
     _setStatus(PhoneStatus.offline, 'Disconnected');
+    // Signing out means "stop ringing this phone"; closing the app does not.
+    await pushLogout?.call();
   }
 
+  /// Removes every secret this app saved: the sign-in credentials, the push
+  /// account, and the sample server line (its key mints access tokens).
   Future<void> _forgetCredentials() async {
+    pushAuthToken = '';
+    pushServer = '';
+    await _deleteSaved(<String>[..._signInKeys, _kPushServer]);
+  }
+
+  /// What "Remember me" keeps in secure storage.
+  static const List<String> _signInKeys = <String>[
+    _kAuthId, _kAuthToken, _kSipUser, _kSipPass, _kPushAuthId, _kPushAuthToken,
+  ];
+
+  Future<void> _deleteSaved(List<String> keys) async {
     try {
-      for (final key in <String>[_kAuthId, _kAuthToken, _kSipUser, _kSipPass, _kPushAuthId, _kPushAuthToken]) {
+      for (final key in keys) {
         await _secure.delete(key: key);
       }
-      pushAuthToken = '';
     } catch (e) {
       log('Could not remove the saved credentials: $e', LogType.warning);
     }
+  }
+
+  /// Ticks or unticks "Remember me". Unticked, what was saved earlier is
+  /// removed at once, not at the next sign-in.
+  Future<void> setRememberMe(bool on) async {
+    rememberMe = on;
+    notifyListeners();
+    await _prefs?.setBool(_kRemember, on);
+    if (!on) await _deleteSaved(_signInKeys);
   }
 
   void _startLoginTimeout() {
@@ -1479,7 +1522,7 @@ class PlaygroundController extends ChangeNotifier {
         notifyListeners();
       }
     } else {
-      await _logoutFromVobizPush();
+      await _vobizPushLogout(force: true)?.call();
       notifyListeners();
     }
   }
@@ -1494,6 +1537,10 @@ class PlaygroundController extends ChangeNotifier {
       if (rememberMe && pushAuthId.isNotEmpty && pushAuthToken.isNotEmpty) {
         await _secure.write(key: _kPushAuthId, value: pushAuthId);
         await _secure.write(key: _kPushAuthToken, value: pushAuthToken);
+      } else {
+        // Not remembered, or a field emptied: nothing old stays behind.
+        await _secure.delete(key: _kPushAuthId);
+        await _secure.delete(key: _kPushAuthToken);
       }
     } catch (e) {
       log('Could not save the push account on this device: $e', LogType.warning);
@@ -1625,26 +1672,34 @@ class PlaygroundController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _logoutFromVobizPush() async {
+  /// Takes this phone off Vobiz push: made now (it reads the SIP user and,
+  /// without a sample server, the account's credentials), sent when called.
+  /// Null when there is nothing to remove. With [force] it is also made when
+  /// this run of the app has not signed the phone up (the switch turned off
+  /// after a restart, before signing in); a phone never signed up has no
+  /// install id, so nothing is sent for it.
+  Future<void> Function()? _vobizPushLogout({bool force = false}) {
     final id = _pushDeviceId ?? _prefs?.getString(_kPushInstallId);
     final wasOn = vobizPushState != PushState.off;
     vobizPushState = PushState.off;
     vobizPushDetail = '';
-    if (!wasOn || id == null) return;
+    if ((!wasOn && !force) || id == null) return null;
     final devices = _vobizPushDevices(user: client.sipUsername);
     if (devices == null) {
       log('⚠️ Vobiz push: no sample server${demoTools ? ' and no account Auth ID and Auth Token' : ''} to '
           'remove this phone with; it may still be pushed until Firebase replaces its token', LogType.warning);
-      return;
+      return null;
     }
-    try {
-      await devices.logout(id);
-      log('📴 Vobiz push: this phone is no longer pushed for calls', LogType.info);
-    } on VobizException catch (e) {
-      log('⚠️ Vobiz push: ${e.message}', LogType.warning);
-    } finally {
-      devices.close();
-    }
+    return () async {
+      try {
+        await devices.logout(id);
+        log('📴 Vobiz push: this phone is no longer pushed for calls', LogType.info);
+      } on VobizException catch (e) {
+        log('⚠️ Vobiz push: ${e.message}', LogType.warning);
+      } finally {
+        devices.close();
+      }
+    };
   }
 
   /// A real call to this phone's SIP user through Vobiz's Call API, to try the
@@ -1884,8 +1939,13 @@ class PlaygroundController extends ChangeNotifier {
             ? 'Reconnected: registered again as ${client.sipUsername ?? connectedAs}'
             : 'Registered successfully as ${client.sipUsername ?? connectedAs}', LogType.success);
         _setStatus(PhoneStatus.online, 'Registered');
-        // A reconnect leaves the user where they are.
-        if (!wasReconnecting) onTabRequest?.call(1);
+        if (!wasReconnecting) {
+          // A reconnect leaves the user where they are.
+          onTabRequest?.call(1);
+          // Also a sign-in whose first attempt threw but that the SDK then
+          // completed by itself, which skipped the save in _connect.
+          unawaited(_saveCredentials());
+        }
         _registerWithVobizPush();
       }
       return;
@@ -2353,13 +2413,8 @@ class PlaygroundController extends ChangeNotifier {
     await prefs?.setString(_kTokenServer, tokenServerUrl.trim());
     await prefs?.setString(_kTokenUser, tokenUser.trim());
     if (callerId.isNotEmpty) await prefs?.setString(_kCallerId, callerId);
+    if (!rememberMe) return _deleteSaved(_signInKeys);
     try {
-      if (!rememberMe) {
-        for (final key in <String>[_kAuthId, _kAuthToken, _kSipUser, _kSipPass]) {
-          await _secure.delete(key: key);
-        }
-        return;
-      }
       if (authTab == AuthTab.zeroConfig) {
         await _secure.write(key: _kAuthId, value: authId.trim());
         await _secure.write(key: _kAuthToken, value: authToken.trim());

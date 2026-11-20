@@ -320,10 +320,10 @@ class _IdentityPanelState extends State<IdentityPanel> {
           Checkbox(
             key: const Key('rememberMe'),
             value: c.rememberMe,
-            onChanged: (v) => c.update(() => c.rememberMe = v ?? false),
+            onChanged: (v) => c.setRememberMe(v ?? false),
           ),
           GestureDetector(
-            onTap: () => c.update(() => c.rememberMe = !c.rememberMe),
+            onTap: () => c.setRememberMe(!c.rememberMe),
             child: Text('Remember me', style: TextStyle(fontSize: 12, color: pg.muted)),
           ),
         ],
