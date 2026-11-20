@@ -233,6 +233,10 @@ class VobizClient {
   CallDirection? _direction;
   String? _callUuid;
   String? _lastCallUuid;
+
+  // The current call's SIP Call-ID, kept here for its failed and ended
+  // events: the SIP layer forgets it before it reports the end.
+  String? _sipCallId;
   Map<String, String> _callHeaders = const <String, String>{};
 
   // Event streams
@@ -348,6 +352,8 @@ class VobizClient {
       state: _callState,
       callUuid: _callUuid,
       headers: _callHeaders,
+      muted: isMuted,
+      speakerEnabled: isSpeakerOn,
     );
   }
 
@@ -846,15 +852,17 @@ class VobizClient {
       await _peer.initialize(callId);
       final offer = await _peer.createOffer();
       await _waitForIceGathering(callId);
-      // Hung up while the call was being prepared: send nothing.
+      final local = await _peer.peerConnection?.getLocalDescription();
+      // Hung up while the call was being prepared: send nothing. Checked
+      // after the last await, so nothing can slip in before the INVITE.
       if (_callId != callId) {
         _logger.info('Call $callId ended before it was placed');
         await _peer.disposeCall(callId);
         return callId;
       }
-      final local = await _peer.peerConnection?.getLocalDescription();
       final sdp = local?.sdp ?? offer.sdp ?? '';
       _sip.call(target, sdp, extraHeaders: outgoing);
+      _sipCallId = _sip.activeSipCallId;
       _callState = CallStateStatus.ringing;
       _emitCallEvent(callId, CallStateStatus.ringing, 'Invite sent');
       _startCallSetupTimer(callId);
@@ -951,9 +959,13 @@ class VobizClient {
   // Inbound call
   // ---------------------------------------------------------------------------
 
+  /// Answers the ringing call. Does nothing when no call is ringing, or when
+  /// [callId] is given and is not the ringing call's (a late tap on an older
+  /// call's screen).
   Future<void> acceptCall([String? callId]) async {
-    final id = callId ?? _callId;
+    final id = _callId;
     if (id == null || _callState != CallStateStatus.incoming) return;
+    if (callId != null && callId != id) return;
     await _answerInvite(id);
   }
 
@@ -979,10 +991,18 @@ class VobizClient {
   /// Mutes the microphone on the current call. Asked while the call is still
   /// connecting, it applies as soon as the microphone opens; it survives
   /// hold and resume. A new call starts unmuted. Each change is a
-  /// [MuteChangedEvent].
-  Future<void> mute([String? callId]) => _peer.setMuted(true);
+  /// [MuteChangedEvent]. Does nothing when [callId] is given and is not the
+  /// current call's.
+  Future<void> mute([String? callId]) async {
+    if (callId != null && callId != _callId) return;
+    await _peer.setMuted(true);
+  }
 
-  Future<void> unmute([String? callId]) => _peer.setMuted(false);
+  /// Unmutes the microphone; see [mute].
+  Future<void> unmute([String? callId]) async {
+    if (callId != null && callId != _callId) return;
+    await _peer.setMuted(false);
+  }
 
   /// Whether the current call's microphone is muted. False between calls.
   bool get isMuted => _peer.isMuted;
@@ -1157,7 +1177,8 @@ class VobizClient {
   ///
   /// Throws [StateError] without a connected call, and [VobizException]
   /// (`hold_failed`) when the far end refuses; the call then carries on as
-  /// it was.
+  /// it was, unless the refusal is a 481 (the far end no longer has the
+  /// call), which ends the call.
   Future<void> hold([String? callId]) async {
     final id = _requireCurrentCall(callId);
     if (_callState != CallStateStatus.active) {
@@ -1217,16 +1238,28 @@ class VobizClient {
     }
     _reInviteInProgress = true;
     try {
-      final offer = await _peer.beginHold(hold);
       try {
+        // Inside the try: building the offer can fail too (the far end's own
+        // re-INVITE is being answered), and the microphone must come back.
+        final offer = await _peer.beginHold(hold);
         final answer = await _sip.reInvite(offer);
         if (_callId != id) return;
         await _peer.completeHold(answer);
       } catch (e) {
         if (_callId != id) return; // the call ended meanwhile
-        await _peer.abortHold();
         final code = hold ? 'hold_failed' : 'resume_failed';
-        final message = 'Could not ${hold ? 'hold' : 'resume'} the call: $e';
+        final gone = e is SipRequestFailed && e.statusCode == 481;
+        if (gone) {
+          // Vobiz no longer has this call (its BYE was lost): end it here
+          // too, with no BYE, which would only be refused (RFC 3261
+          // 12.2.1.2).
+          _sip.abandonCall();
+        } else {
+          await _peer.abortHold();
+        }
+        final message = gone
+            ? 'Could not ${hold ? 'hold' : 'resume'} the call: it no longer exists'
+            : 'Could not ${hold ? 'hold' : 'resume'} the call: $e';
         _emitError(code, message, e);
         throw VobizException(code, message,
             statusCode: e is SipRequestFailed ? e.statusCode : null);
@@ -1423,6 +1456,7 @@ class VobizClient {
       _pendingInboundSdp = sdp;
       _direction = CallDirection.inbound;
       _callUuid = _sip.callUuid;
+      _sipCallId = _sip.activeSipCallId;
       _callHeaders = Map<String, String>.unmodifiable(headers);
       _callState = CallStateStatus.incoming;
       _emitCallEvent(callId, CallStateStatus.incoming, callerId);
@@ -2004,6 +2038,7 @@ class VobizClient {
     _activeCallDestination = null;
     _direction = null;
     _callUuid = null;
+    _sipCallId = null;
     _callHeaders = const <String, String>{};
     _callState = CallStateStatus.idle;
     _interruptions.reset();
@@ -2032,7 +2067,7 @@ class VobizClient {
       headers: _callHeaders,
       sipCode: sipCode,
       reason: reason,
-      sipCallId: _sip.activeSipCallId,
+      sipCallId: _sipCallId,
     ));
   }
 

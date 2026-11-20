@@ -1694,6 +1694,13 @@ class SIPService {
             }
           }
         }
+        if (code == 481 && dialog.callId == _activeCallId) {
+          // The far end no longer has this call (its BYE was lost): end it
+          // here too (RFC 3261 12.2.1.2).
+          _logger.warn('DTMF INFO answered 481: the call no longer exists; ending it');
+          abandonCall();
+          return;
+        }
         if (code >= 300) {
           _logger.warn('DTMF INFO refused: $code ${_reasonPhrase(msg)}');
         }
@@ -1775,6 +1782,22 @@ class SIPService {
           if (!completer.isCompleted) completer.complete(msg.body);
           return;
         }
+        // 300-699: the re-INVITE's own transaction ACKs it, on its branch,
+        // Request-URI, CSeq and routes (RFC 3261 17.1.1.3), before any retry.
+        _send(
+          SipBuilder.ack(
+            requestUri: dialog.remoteTarget,
+            fromUser: username,
+            toHeader: msg.header('To') ?? dialog.remoteParty,
+            sipServer: sipServer,
+            localTag: _localTag,
+            callId: dialog.callId,
+            cseq: cseq,
+            branch: branch,
+            routes: dialog.routes,
+          ),
+          socket: tx.socket,
+        );
         if (code == 401 || code == 407) {
           final challenge = _challenge(msg);
           if (_password != null && challenge.isNotEmpty && auth.allow(challenge)) {
@@ -1995,6 +2018,13 @@ class SIPService {
 
     if (incomingCallId != null && incomingCallId == _activeCallId) {
       _handleInviteInDialog(msg);
+      return;
+    }
+    // A To tag means a request inside a dialog, here one this client no
+    // longer has (a re-INVITE that crossed its BYE, say). It must not ring
+    // as a new call (RFC 3261 12.2.2).
+    if (_hasToTag(msg)) {
+      _send(SipBuilder.response(request: msg, code: 481, reason: 'Call/Transaction Does Not Exist'));
       return;
     }
     if (_outgoingReserved || _activeCallId != null || _pendingInvite != null) {
@@ -2727,6 +2757,13 @@ class SIPService {
     if (reInvite != null && !reInvite.isCompleted) {
       reInvite.completeError(SipRequestFailed('The call ended', null));
     }
+  }
+
+  /// Whether [msg]'s To carries a tag: read after the URI, so a `tag=` inside
+  /// it does not count.
+  static bool _hasToTag(SipMessage msg) {
+    final to = msg.header('To') ?? '';
+    return RegExp(r';\s*tag\s*=', caseSensitive: false).hasMatch(to.substring(to.lastIndexOf('>') + 1));
   }
 
   /// Whether [msg] belongs to the current call. A CANCEL or BYE for some

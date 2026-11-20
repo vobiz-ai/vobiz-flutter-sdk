@@ -13,6 +13,8 @@ class CallSession {
     this.state = CallStateStatus.idle,
     this.callUuid,
     Map<String, String> headers = const <String, String>{},
+    this.muted = false,
+    this.speakerEnabled = false,
   }) : headers = Map<String, String>.unmodifiable(headers);
 
   final String callId;
@@ -24,10 +26,16 @@ class CallSession {
 
   /// Custom `X-VH-` headers sent (outbound) or received (inbound) on the call.
   final Map<String, String> headers;
-  CallStateStatus state;
-  bool muted = false;
-  bool speakerEnabled = false;
+  final CallStateStatus state;
 
+  /// Whether the microphone was muted (`VobizClient.isMuted`).
+  final bool muted;
+
+  /// Whether the audio was on the loudspeaker (`VobizClient.isSpeakerOn`).
+  final bool speakerEnabled;
+
+  /// What the UI can offer. DTMF needs a connected call: `sendDtmf` refuses
+  /// it while the call is still connecting or ringing.
   CallActions get actions {
     switch (state) {
       case CallStateStatus.incoming:
@@ -37,7 +45,6 @@ class CallSession {
         return const CallActions(
           canHangup: true,
           canMute: true,
-          canSendDtmf: true,
         );
       case CallStateStatus.active:
         return const CallActions(

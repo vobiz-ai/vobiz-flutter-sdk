@@ -86,6 +86,26 @@ class FakePeer extends PeerService {
   @override
   Future<void> abortIceRestart() async => iceRestarts.add('abort');
 
+  /// The hold steps the client took: 'begin:hold', 'begin:resume',
+  /// 'complete', 'abort'. Set [beginHoldError] to make building the offer
+  /// fail.
+  final List<String> holds = <String>[];
+  Object? beginHoldError;
+
+  @override
+  Future<String> beginHold(bool hold) async {
+    holds.add('begin:${hold ? 'hold' : 'resume'}');
+    final error = beginHoldError;
+    if (error != null) throw error;
+    return 'v=0\r\na=${hold ? 'sendonly' : 'sendrecv'}\r\n';
+  }
+
+  @override
+  Future<void> completeHold(String answerSdp) async => holds.add('complete');
+
+  @override
+  Future<void> abortHold() async => holds.add('abort');
+
   @override
   Future<void> disposeCall(String callId) async => _pc = null;
 
