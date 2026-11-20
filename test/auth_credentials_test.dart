@@ -171,7 +171,6 @@ void main() {
       expect(jsonDecode(seen.body), <String, String>{'reason': 'rejected'});
       expect(creds.username, 'agent42');
       expect(creds.password, 'pw-1');
-      expect(creds.displayName, 'Asha');
     });
 
     test('a refusal or an incomplete reply is a VobizCredentialsException', () async {

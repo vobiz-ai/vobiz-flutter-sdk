@@ -196,8 +196,6 @@ class CallQualityLevelTracker {
   CallQualityLevel? _candidate;
   int _count = 0;
 
-  CallQualityLevel get level => _level;
-
   /// Returns true when [next] changes the reported level.
   bool add(CallQualityLevel next) {
     if (next == _level) {

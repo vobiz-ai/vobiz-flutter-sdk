@@ -193,6 +193,4 @@ class WebhookServerApi {
     if (text.isNotEmpty && text.length < 400 && !text.startsWith('<')) return text;
     return 'The webhook server answered HTTP ${response.statusCode}';
   }
-
-  void close() => _client.close();
 }

@@ -43,7 +43,6 @@ class _PeerCallState {
   MediaStream? localStream;
   MediaStream? remoteStream;
   bool localAudioAttached = false;
-  bool remoteDescriptionApplied = false;
   bool disposed = false;
 
   /// The user's mute choice. Applies to the track whenever it exists.
@@ -73,15 +72,13 @@ class _PeerCallState {
   final CallQualityAnalyzer qualityAnalyzer = CallQualityAnalyzer();
   final CallQualityLevelTracker levelTracker = CallQualityLevelTracker();
   final CallQualityAnalyzer pollAnalyzer = CallQualityAnalyzer();
-
-  final List<RTCIceCandidate> pendingRemoteCandidates = <RTCIceCandidate>[];
 }
 
-/// Handles `flutter_webrtc` peer-connection work, supporting multiple
-/// simultaneous call legs (e.g. for hold + add-call conference scenarios).
+/// Handles `flutter_webrtc` peer-connection work: the WebRTC resources of
+/// each call leg, keyed by its call id.
 ///
-/// Each call is identified by its [callId]. Operations that do not receive an
-/// explicit [callId] operate on the "active" call tracked by [_activeCallId].
+/// Operations that do not take a call id act on the "active" call: the leg
+/// created last ([_activeCallId]).
 @internal
 class PeerService {
   PeerService({
@@ -138,8 +135,6 @@ class PeerService {
       StreamController<MediaEvent>.broadcast();
   final StreamController<CallMediaEvent> _callMediaEvents =
       StreamController<CallMediaEvent>.broadcast();
-  final StreamController<RTCIceCandidate> _iceCandidates =
-      StreamController<RTCIceCandidate>.broadcast();
 
   /// Per-call state keyed by callId.
   final Map<String, _PeerCallState> _callStates = <String, _PeerCallState>{};
@@ -158,20 +153,9 @@ class PeerService {
   /// Typed updates: mute, hold, early media, route, quality.
   Stream<CallMediaEvent> get callMediaEvents => _callMediaEvents.stream;
 
-  /// Emits local ICE candidates so signaling can forward them to the far end.
-  Stream<RTCIceCandidate> get iceCandidates => _iceCandidates.stream;
-
   /// Current peer connection for the active call.
   RTCPeerConnection? get peerConnection =>
       _activeCallId == null ? null : _callStates[_activeCallId]?.peerConnection;
-
-  /// Current local media stream for the active call.
-  MediaStream? get localStream =>
-      _activeCallId == null ? null : _callStates[_activeCallId]?.localStream;
-
-  /// Current remote media stream for the active call.
-  MediaStream? get remoteStream =>
-      _activeCallId == null ? null : _callStates[_activeCallId]?.remoteStream;
 
   /// Whether the active call's microphone is muted by the user. False when
   /// there is no call.
@@ -247,14 +231,6 @@ class PeerService {
   Future<void> initialize(String callId) async {
     await createPeerConnection(callId);
     await attachLocalAudioStream(callId);
-  }
-
-  /// Switches which call is treated as "active" for operations without an
-  /// explicit [callId]. Does nothing if [callId] has no state entry.
-  void setActiveCall(String callId) {
-    if (_callStates.containsKey(callId)) {
-      _activeCallId = callId;
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -356,37 +332,6 @@ class PeerService {
     return answer;
   }
 
-  /// Creates an offer for the active call after ensuring local audio is ready.
-  Future<RTCSessionDescription> createOfferExchange() async {
-    final String callId = _requireActiveCallId();
-    final _PeerCallState state = _requireState(callId);
-
-    if (state.peerConnection == null) {
-      throw StateError('Peer connection has not been created for $callId');
-    }
-    if (!state.localAudioAttached) {
-      await attachLocalAudioStream(callId);
-    }
-    return createOffer();
-  }
-
-  /// Accepts a remote offer and produces a local answer for the active call.
-  Future<RTCSessionDescription> handleRemoteOffer(
-    RTCSessionDescription offer,
-  ) async {
-    final String callId = _requireActiveCallId();
-    final _PeerCallState state = _requireState(callId);
-
-    if (state.peerConnection == null) {
-      throw StateError('Peer connection has not been created for $callId');
-    }
-    if (!state.localAudioAttached) {
-      await attachLocalAudioStream(callId);
-    }
-    await setRemoteDescription(offer);
-    return createAnswer();
-  }
-
   /// Applies a remote answer to complete an outbound offer/answer exchange.
   Future<void> handleRemoteAnswer(RTCSessionDescription answer) async {
     await setRemoteDescription(answer);
@@ -404,9 +349,7 @@ class PeerService {
 
     await _requirePeerForState(state, callId).setRemoteDescription(description);
     _requireLive(callId, state);
-    state.remoteDescriptionApplied = true;
     state.remoteSdp = description.sdp;
-    await _flushPendingRemoteCandidates(callId, state);
     _emitMediaMessage(callId, state, 'Remote description applied');
   }
 
@@ -432,8 +375,6 @@ class PeerService {
     final bool first = state.provisionalSdp == null;
     state.provisionalSdp = sdp;
     state.remoteSdp = sdp;
-    state.remoteDescriptionApplied = true;
-    await _flushPendingRemoteCandidates(callId, state);
     _emitMediaMessage(callId, state, 'Early media applied');
     if (first) _callMediaEvents.addIfOpen(EarlyMediaEvent(callId: callId));
     return true;
@@ -486,21 +427,6 @@ class PeerService {
       }
       return null;
     }
-  }
-
-  /// Adds a remote ICE candidate to the active call.
-  Future<void> addIceCandidate(RTCIceCandidate candidate) async {
-    final String callId = _requireActiveCallId();
-    final _PeerCallState state = _requireState(callId);
-
-    if (!state.remoteDescriptionApplied) {
-      state.pendingRemoteCandidates.add(candidate);
-      _emitMediaMessage(callId, state, 'Remote ICE candidate queued');
-      return;
-    }
-
-    await _requirePeerForState(state, callId).addCandidate(candidate);
-    _emitMediaMessage(callId, state, 'Remote ICE candidate added');
   }
 
   /// Waits until the offer or answer can carry a candidate the media server
@@ -852,16 +778,6 @@ class PeerService {
   // Disposal
   // -------------------------------------------------------------------------
 
-  /// Disposes the active call's peer connection and removes its state entry.
-  ///
-  /// Other call legs are unaffected. After disposal [_activeCallId] is cleared.
-  Future<void> disposeCurrentCall() async {
-    final String? callId = _activeCallId;
-    if (callId != null) {
-      await disposeCall(callId);
-    }
-  }
-
   /// Disposes a specific call leg by [callId].
   Future<void> disposeCall(String callId) async {
     final _PeerCallState? state = _callStates.remove(callId);
@@ -890,7 +806,6 @@ class PeerService {
     await disposeAllCalls();
     await _routeSubscription.cancel();
     await audioRoutes.dispose();
-    await _iceCandidates.close();
     await _mediaEvents.close();
     await _callMediaEvents.close();
   }
@@ -922,7 +837,6 @@ class PeerService {
       final RegExpMatch? type =
           RegExp(r' typ (\w+)').firstMatch(candidate.candidate ?? '');
       if (type != null) state.candidateTypes.add(type.group(1)!);
-      _iceCandidates.addIfOpen(candidate);
       _mediaEvents.addIfOpen(
         MediaEvent(
           callId: callId,
@@ -977,24 +891,6 @@ class PeerService {
     });
   }
 
-  Future<void> _flushPendingRemoteCandidates(
-    String callId,
-    _PeerCallState state,
-  ) async {
-    if (!state.remoteDescriptionApplied ||
-        state.pendingRemoteCandidates.isEmpty) {
-      return;
-    }
-
-    final RTCPeerConnection peer = _requirePeerForState(state, callId);
-    for (final RTCIceCandidate candidate
-        in List<RTCIceCandidate>.from(state.pendingRemoteCandidates)) {
-      await peer.addCandidate(candidate);
-    }
-    state.pendingRemoteCandidates.clear();
-    _emitMediaMessage(callId, state, 'Queued remote ICE candidates applied');
-  }
-
   /// Releases everything a call holds. `close()` alone leaves the native
   /// PeerConnection (and on Android flutter_webrtc's audio switch: call
   /// mode, audio focus, speaker/Bluetooth route) alive until the app dies;
@@ -1024,8 +920,6 @@ class PeerService {
     if (peerConnection != null) await _releasePeer(peerConnection);
 
     state.localAudioAttached = false;
-    state.remoteDescriptionApplied = false;
-    state.pendingRemoteCandidates.clear();
 
     _updateProximity();
     if (wasMuted) {

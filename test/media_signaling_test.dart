@@ -45,14 +45,6 @@ void main() {
       expect(h.peer.remoteSet.last.sdp, audioSdp);
     });
 
-    test('remote candidates queued before the 183 are applied with it', () async {
-      final h = MediaHarness();
-      await h.service.initialize('c1');
-      await h.service.addIceCandidate(RTCIceCandidate('candidate:1', '0', 0));
-      await h.service.applyProvisionalAnswer(audioSdp);
-      expect(h.peer.addedCandidates, hasLength(1));
-    });
-
     test('an unusable 183 SDP leaves the call alone', () async {
       final h = MediaHarness();
       await h.service.initialize('c1');

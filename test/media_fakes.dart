@@ -107,7 +107,6 @@ class FakePeer extends RTCPeerConnection {
   final List<RTCSessionDescription> localSet = <RTCSessionDescription>[];
   final List<RTCSessionDescription> remoteSet = <RTCSessionDescription>[];
   final List<MediaStreamTrack> addedTracks = <MediaStreamTrack>[];
-  final List<RTCIceCandidate> addedCandidates = <RTCIceCandidate>[];
   List<FakeTransceiver> transceivers_ = <FakeTransceiver>[FakeTransceiver()];
   List<StatsReport> stats = <StatsReport>[];
   /// Already carries a srflx candidate, as a gathered offer would.
@@ -173,9 +172,6 @@ class FakePeer extends RTCPeerConnection {
     remoteSet.add(description);
   }
 
-  @override
-  Future<void> addCandidate(RTCIceCandidate candidate) async =>
-      addedCandidates.add(candidate);
   @override
   Future<RTCRtpSender> addTrack(MediaStreamTrack track,
       [MediaStream? stream]) async {

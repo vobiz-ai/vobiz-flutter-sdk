@@ -15,12 +15,13 @@ import '../models/auth/credential_config.dart';
 /// token there), and expects:
 ///
 /// ```json
-/// {"sip_username": "agent42", "sip_password": "...", "display_name": "Asha"}
+/// {"sip_username": "agent42", "sip_password": "..."}
 /// ```
 ///
-/// `display_name` is optional. Anything else in the reply is ignored. See
-/// CREDENTIALS.md for a reference backend that creates one Vobiz endpoint per
-/// user and never rotates its password on sign-in.
+/// Anything else in the reply (a `display_name`, say) is ignored: the SDK
+/// signs in with the username and password only. See CREDENTIALS.md for a
+/// reference backend that creates one Vobiz endpoint per user and never
+/// rotates its password on sign-in.
 ///
 /// ```dart
 /// final provider = VobizBackendCredentialsProvider(
@@ -92,12 +93,7 @@ class VobizBackendCredentialsProvider {
       throw const VobizCredentialsException(
           'Your backend\'s reply has no sip_username or sip_password');
     }
-    final name = decoded['display_name'];
-    return CredentialConfig(
-      username: username,
-      password: password,
-      displayName: name is String && name.trim().isNotEmpty ? name.trim() : null,
-    );
+    return CredentialConfig(username: username, password: password);
   }
 
   /// The `reason` value sent for [request].
