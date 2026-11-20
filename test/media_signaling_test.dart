@@ -109,6 +109,7 @@ void main() {
       await h.service.createOffer();
       await h.service.applyRemoteAnswer(audioSdp);
       expect(await h.service.insertDtmf('12#'), isTrue);
+      expect(h.peer.fakeSenders.single.dtmf.sent, <String>['12#/100/70']);
     });
 
     test('declines (for the INFO fallback) when it was not', () async {
@@ -118,6 +119,7 @@ void main() {
       await h.service.applyRemoteAnswer(
           audioSdp.replaceAll(RegExp(r'a=rtpmap:126 telephone-event/8000\r\n'), ''));
       expect(await h.service.insertDtmf('1'), isFalse);
+      expect(h.peer.fakeSenders.single.dtmf.sent, isEmpty);
     });
 
     test('declines with no call', () async {

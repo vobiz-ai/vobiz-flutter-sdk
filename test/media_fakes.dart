@@ -53,12 +53,13 @@ class FakeStream extends MediaStream {
 }
 
 class FakeDtmfSender extends RTCDTMFSender {
+  /// Each insertDTMF call as `tones/duration/interToneGap`.
   final List<String> sent = <String>[];
 
   @override
   Future<void> insertDTMF(String tones,
           {int duration = 100, int interToneGap = 70}) async =>
-      sent.add(tones);
+      sent.add('$tones/$duration/$interToneGap');
   @override
   Future<bool> canInsertDtmf() async => true;
 }
@@ -107,6 +108,12 @@ class FakePeer extends RTCPeerConnection {
   final List<RTCSessionDescription> localSet = <RTCSessionDescription>[];
   final List<RTCSessionDescription> remoteSet = <RTCSessionDescription>[];
   final List<MediaStreamTrack> addedTracks = <MediaStreamTrack>[];
+
+  /// The sender of each added track, as [getSenders] returns them.
+  final List<FakeSender> fakeSenders = <FakeSender>[];
+
+  /// Shared with the harness's audio backend, to check the order of steps.
+  List<String>? log;
   List<FakeTransceiver> transceivers_ = <FakeTransceiver>[FakeTransceiver()];
   List<StatsReport> stats = <StatsReport>[];
   /// Already carries a srflx candidate, as a gathered offer would.
@@ -130,7 +137,11 @@ class FakePeer extends RTCPeerConnection {
   @override
   Future<void> close() async => closed = true;
   @override
-  Future<void> dispose() async => disposed = true;
+  Future<void> dispose() async {
+    disposed = true;
+    log?.add('peer:dispose');
+  }
+
   @override
   Future<RTCSessionDescription> createOffer(
       [Map<String, dynamic>? constraints]) async {
@@ -176,13 +187,14 @@ class FakePeer extends RTCPeerConnection {
   Future<RTCRtpSender> addTrack(MediaStreamTrack track,
       [MediaStream? stream]) async {
     addedTracks.add(track);
+    final sender = FakeSender(track);
+    fakeSenders.add(sender);
     await addTrackGate?.future;
-    return FakeSender(track);
+    return sender;
   }
 
   @override
-  Future<List<RTCRtpSender>> getSenders() async =>
-      <RTCRtpSender>[for (final t in addedTracks) FakeSender(t)];
+  Future<List<RTCRtpSender>> getSenders() async => List<RTCRtpSender>.of(fakeSenders);
   @override
   Future<List<RTCRtpTransceiver>> getTransceivers() async => transceivers_;
   @override
@@ -200,6 +212,9 @@ class FakeAudioBackend implements AudioDeviceBackend {
   final List<String> calls = <String>[];
   void Function()? onChange;
 
+  /// Shared with the harness's peers, to check the order of steps.
+  List<String>? log;
+
   /// What the platform would play on: true = loudspeaker preferred.
   bool speakerPreferred = false;
 
@@ -212,6 +227,7 @@ class FakeAudioBackend implements AudioDeviceBackend {
   Future<void> setSpeakerphoneOn(bool enabled) async {
     speakerPreferred = enabled;
     calls.add('speaker:$enabled');
+    log?.add('speaker:$enabled');
   }
 
   @override
@@ -239,6 +255,7 @@ class MediaHarness {
     MediaConstraints mediaConstraints = const MediaConstraints(),
     this.gumGate,
   }) {
+    backend.log = log;
     service = PeerService(
       iceConfig: iceConfig,
       mediaConstraints: mediaConstraints,
@@ -247,7 +264,7 @@ class MediaHarness {
       qualityInterval: Duration.zero,
       peerConnectionFactory: (config, constraints) async {
         configs.add(config);
-        final peer = FakePeer();
+        final peer = FakePeer()..log = log;
         peers.add(peer);
         await peerGate?.future;
         return peer;
@@ -267,6 +284,9 @@ class MediaHarness {
   final List<FakePeer> peers = <FakePeer>[];
   final List<FakeStream> streams = <FakeStream>[];
   final List<Map<String, dynamic>> configs = <Map<String, dynamic>>[];
+
+  /// The audio backend's and the peers' steps, in order.
+  final List<String> log = <String>[];
   Completer<void>? gumGate;
   Completer<void>? peerGate;
 
