@@ -77,6 +77,7 @@ class VobizClient {
     http.Client? httpClient,
     Duration setupTimeout = _defaultSetupTimeout,
     Duration networkLossGrace = _defaultNetworkLossGrace,
+    Duration mediaRestartDelay = _defaultMediaRestartDelay,
     ConnectivityMonitor? connectivityMonitor,
     AppLifecycleMonitor lifecycleMonitor = const NoAppLifecycleMonitor(),
   }) : this._(
@@ -89,6 +90,7 @@ class VobizClient {
           peer: peer,
           setupTimeout: setupTimeout,
           networkLossGrace: networkLossGrace,
+          mediaRestartDelay: mediaRestartDelay,
         );
 
   VobizClient._({
@@ -99,6 +101,7 @@ class VobizClient {
     PeerService? peer,
     Duration setupTimeout = _defaultSetupTimeout,
     Duration networkLossGrace = _defaultNetworkLossGrace,
+    Duration mediaRestartDelay = _defaultMediaRestartDelay,
     ConnectivityMonitor? connectivityMonitor,
     AppLifecycleMonitor? lifecycleMonitor,
   })  : _config = config,
@@ -121,6 +124,7 @@ class VobizClient {
         _ownsHttp = httpClient == null,
         _setupTimeout = setupTimeout,
         _networkLossGrace = networkLossGrace,
+        _mediaRestartDelay = mediaRestartDelay,
         backendUrl = config.backendUrl {
     _api = WebhookServerApi(
         client: _http, allowAccountCredentials: config.unsafeDemoZeroConfig);
@@ -156,6 +160,11 @@ class VobizClient {
   /// (ICE failed/disconnected) before it is ended as `network_lost`.
   static const Duration _defaultNetworkLossGrace = Duration(seconds: 12);
 
+  /// How long ICE may stay disconnected, with signalling up, before the
+  /// call's audio is moved with an ICE restart. A short disconnection often
+  /// heals by itself; a failed one never does, and is restarted at once.
+  static const Duration _defaultMediaRestartDelay = Duration(seconds: 3);
+
   final SdkConfig _config;
   final Logger _logger;
   final SIPService _sip;
@@ -165,6 +174,7 @@ class VobizClient {
   late final WebhookServerApi _api;
   final Duration _setupTimeout;
   final Duration _networkLossGrace;
+  final Duration _mediaRestartDelay;
   late final ConnectionSupervisor _supervisor;
   final AppLifecycleMonitor _lifecycle;
   StreamSubscription<bool>? _lifecycleSub;
@@ -228,6 +238,11 @@ class VobizClient {
   Timer? _networkLossTimer;
   bool _signalingLost = false;
   bool _mediaLost = false;
+
+  // Lost media with signalling up: one ICE restart per loss, after
+  // [_mediaRestartDelay] for a disconnection, at once for a failure.
+  Timer? _mediaRestartTimer;
+  bool _mediaRestartTried = false;
 
   // The current call's details
   CallDirection? _direction;
@@ -1495,11 +1510,21 @@ class VobizClient {
           if (_callState == CallStateStatus.active ||
               _callState == CallStateStatus.held) {
             _startNetworkLossTimer(callId);
+            if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+              _restartIceForLostMedia(callId);
+            } else {
+              _mediaRestartTimer ??= Timer(_mediaRestartDelay, () {
+                _mediaRestartTimer = null;
+                if (_mediaLost) _restartIceForLostMedia(callId);
+              });
+            }
           }
           break;
         case RTCIceConnectionState.RTCIceConnectionStateConnected:
         case RTCIceConnectionState.RTCIceConnectionStateCompleted:
           _mediaLost = false;
+          _mediaRestartTried = false;
+          _cancelMediaRestartTimer();
           _checkNetworkRecovered();
           break;
         default:
@@ -1650,6 +1675,12 @@ class VobizClient {
   /// with the password or the current access token.
   Future<void> _reconnectOnce() async {
     if (!_hasSignIn) return;
+    // The socket is replaced even when nothing reported it dead (the network
+    // came back, reconnect(), the app returned to the foreground): treat a
+    // call's signalling as lost. A call still being set up ends (its INVITE
+    // transaction goes with the socket); a connected one gets the grace
+    // period, and its ICE restart once registered tells Vobiz where it is.
+    _onSignalingLost();
     // Keep a connected call's dialog: once registered again it can still
     // be hung up, and the far end's BYE still matches it.
     // Not a sign-out: no unregistration, the REGISTER below replaces it.
@@ -1735,7 +1766,8 @@ class VobizClient {
   /// The network changed during a call. The signalling socket is left alone
   /// (replacing it would drop the dialog). When the socket died with the
   /// old network, the reconnect's REGISTER triggers the ICE restart
-  /// ([_restartIce]); a socket that survived keeps its media path too.
+  /// ([_restartIce]); when it survived but the audio did not, ICE reports
+  /// the loss and [_restartIceForLostMedia] moves it.
   void _onNetworkHandover(NetworkStatus from, NetworkStatus to) {
     _logger.warn('Network changed during a call: $from -> $to');
   }
@@ -1835,8 +1867,9 @@ class VobizClient {
   // Private — network loss during a call
   // ---------------------------------------------------------------------------
 
-  /// The socket dropped. A connected call's media may well still be flowing,
-  /// so it gets [_networkLossGrace] to reconnect and re-register. A call
+  /// The socket dropped, or is being replaced. A connected call's media may
+  /// well still be flowing, so it gets [_networkLossGrace] to reconnect and
+  /// re-register. A call
   /// still being set up cannot be completed over a new connection (its
   /// INVITE transaction belonged to the old one), so it ends now.
   void _onSignalingLost() {
@@ -1879,6 +1912,23 @@ class VobizClient {
   void _clearNetworkLossTimer() {
     _networkLossTimer?.cancel();
     _networkLossTimer = null;
+  }
+
+  void _cancelMediaRestartTimer() {
+    _mediaRestartTimer?.cancel();
+    _mediaRestartTimer = null;
+  }
+
+  /// The call's audio is gone (ICE failed, or disconnected for
+  /// [_mediaRestartDelay]) while signalling is up: NAT rebinding, a lost
+  /// TURN allocation, a network change the socket survived. ICE cannot
+  /// recover from that alone, so restart it once for this loss; the
+  /// network-loss timer still ends the call if the audio does not return.
+  /// With signalling lost too, the reconnect's REGISTER restarts ICE.
+  void _restartIceForLostMedia(String callId) {
+    if (_callId != callId || _mediaRestartTried || _signalingLost || !isConnected) return;
+    _mediaRestartTried = true;
+    unawaited(_restartIce('the call lost its audio while signalling is up'));
   }
 
   /// Moves the call's audio to the network the phone has now: an ICE
@@ -2025,8 +2075,10 @@ class VobizClient {
     _callId = null;
     _clearCallSetupTimer();
     _clearNetworkLossTimer();
+    _cancelMediaRestartTimer();
     _signalingLost = false;
     _mediaLost = false;
+    _mediaRestartTried = false;
     _callUuid = _sip.callUuid ?? _callUuid;
     _callState = CallStateStatus.ended;
     _emitCallEvent(

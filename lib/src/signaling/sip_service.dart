@@ -1302,6 +1302,17 @@ class SIPService {
     _manualDisconnect = true;
 
     final socket = _socket;
+    final reInvite = _reInvite;
+    if (keepCall && reInvite != null) {
+      // Our own re-INVITE (hold, ICE restart) in flight on this socket can
+      // no longer be answered: fail it now rather than after Timer B, so the
+      // call can renegotiate on the new connection.
+      _reInvite = null;
+      _dropWhere((tx) => tx.method == 'INVITE' && tx.callId == _activeCallId && identical(tx.socket, socket));
+      if (!reInvite.isCompleted) {
+        reInvite.completeError(SipRequestFailed('The connection was replaced before the re-INVITE was answered', null));
+      }
+    }
     final wasRegistered = !keepCall &&
         unregister &&
         _registrationState.value == SipRegistrationState.registered &&

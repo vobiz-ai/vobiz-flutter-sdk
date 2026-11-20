@@ -125,6 +125,7 @@ class Harness {
   Harness({
     Duration setupTimeout = const Duration(seconds: 30),
     Duration networkLossGrace = const Duration(seconds: 12),
+    Duration mediaRestartDelay = const Duration(seconds: 3),
   }) {
     sip = SIPService(wsUrl: 'wss://example.invalid', sipServer: sipServer)
       ..debugOnSend = sent.add
@@ -135,6 +136,7 @@ class Harness {
       peer: peer,
       setupTimeout: setupTimeout,
       networkLossGrace: networkLossGrace,
+      mediaRestartDelay: mediaRestartDelay,
     );
     client.callEvents.listen(events.add);
     client.errorEvents.listen(errors.add);
@@ -248,8 +250,11 @@ class Harness {
 }
 
 /// An inbound call, answered: the client is active and the 200 OK is sent.
-Future<Harness> answeredCall({Duration grace = const Duration(seconds: 12)}) async {
-  final h = Harness(networkLossGrace: grace);
+Future<Harness> answeredCall({
+  Duration grace = const Duration(seconds: 12),
+  Duration mediaRestartDelay = const Duration(seconds: 3),
+}) async {
+  final h = Harness(networkLossGrace: grace, mediaRestartDelay: mediaRestartDelay);
   h.invite('in-1');
   await h.client.acceptCall();
   expect(h.client.callState, CallStateStatus.active);
