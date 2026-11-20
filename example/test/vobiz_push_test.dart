@@ -206,6 +206,86 @@ void main() {
       });
     }
 
+    test('Decline before the INVITE: the INVITE the SDK turns away rings nothing and is not a missed call', () async {
+      await start();
+      await controller.connect();
+      await pumpEventQueue();
+      final data = vobizPush();
+      platform.pushController.add(data);
+      await pumpEventQueue();
+      screen.controller.add(decline('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      final shownBefore = List<String>.of(screen.shown);
+      // The SDK rejects the INVITE and forgets the push before the app hears
+      // of it: by then isPushedCall is false.
+      client.handledPush = null;
+      client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
+      await pumpEventQueue();
+      expect(controller.showIncoming, isFalse);
+      expect(screen.shown, shownBefore, reason: 'no second call screen');
+      client.emit(CallStateStatus.ended, callId: 'in_1', reason: 'Busy Here');
+      await pumpEventQueue();
+      expect(controller.history.records, hasLength(1));
+      expect(controller.history.byId('held-1@10.0.2.9')!.outcome, CallOutcome.declined);
+      expect(platform.requests.where((r) => r.startsWith('missed:')), isEmpty);
+    });
+
+    for (final from in <String>['the app', 'the ongoing-call notification']) {
+      test('Hang up from $from while an accepted held call is still arriving turns it away', () async {
+        await start();
+        final data = vobizPush();
+        platform.pushController.add(data);
+        await pumpEventQueue();
+        screen.controller.add(accept('held-1@10.0.2.9', data));
+        await pumpEventQueue();
+        expect(client.actions, contains('reportAccepted:held-1@10.0.2.9'));
+        client.actions.clear();
+        if (from == 'the app') {
+          await controller.hangup();
+        } else {
+          screen.controller.add(ck.CallEventActionCallEnded(
+              ck.CallKitParams(id: 'held-1@10.0.2.9', extra: PushCall.fromData(data)!.toExtra())));
+        }
+        await pumpEventQueue();
+        expect(client.actions, contains('reportDeclined:held-1@10.0.2.9'));
+        expect(screen.ended, contains('held-1@10.0.2.9'));
+        expect(platform.requests.last, 'stop');
+        expect(controller.history.byId('held-1@10.0.2.9')!.outcome, CallOutcome.declined);
+        // The INVITE comes during the sign-in; the SDK turns it away.
+        client.handledPush = null;
+        client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
+        await pumpEventQueue();
+        expect(controller.showIncoming, isFalse);
+        expect(client.actions, isNot(contains('acceptCall')));
+      });
+    }
+
+    test('a push while the SDK is reconnecting leaves the sign-in to it', () async {
+      await start();
+      await controller.connect();
+      await pumpEventQueue();
+      client.connected = false;
+      client.connection = ConnectionStateStatus.reconnecting;
+      client.actions.clear();
+      final data = vobizPush();
+      platform.pushController.add(data);
+      await pumpEventQueue();
+      screen.controller.add(accept('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      expect(client.actions, <String>['handleIncomingPush:held-1@10.0.2.9', 'reportAccepted:held-1@10.0.2.9'],
+          reason: 'the SDK reconnects with its own sign-in and carries the claim: no second sign-in');
+    });
+
+    test('the same push delivered twice (queued before Dart was ready, then live) rings once', () async {
+      await start();
+      platform.pushController.add(vobizPush());
+      platform.pushController.add(vobizPush());
+      await pumpEventQueue();
+      expect(screen.shown.where((id) => id == 'held-1@10.0.2.9'), hasLength(1));
+      expect(client.actions.where((a) => a.startsWith('handleIncomingPush')), hasLength(1));
+      expect(client.actions.where((a) => a == 'connectWithAuthToken'), hasLength(1));
+    });
+
     test('turning Vobiz push on without Firebase says so, and registers nothing', () async {
       await start();
       await controller.connect();

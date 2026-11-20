@@ -340,6 +340,12 @@ class PlaygroundController extends ChangeNotifier {
   /// its active calls); each call is taken once.
   final Set<String> _takenCalls = <String>{};
 
+  /// Calls Vobiz holds that were turned away before their INVITE arrived
+  /// (Decline, or Hang up after Accept), by the push's call id. The SDK
+  /// rejects the INVITE and forgets the push as it arrives, so the app must
+  /// know it by itself: it is not a new call to ring.
+  final Set<String> _turnedAway = <String>{};
+
   PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer, allowHttp: allowHttp);
 
   // ── Incoming calls (Vobiz push) ─────────────────────────────────────────────
@@ -830,7 +836,34 @@ class PlaygroundController extends ChangeNotifier {
 
   Future<void> hangup() async {
     log('Hanging up...', LogType.info);
+    if (_turnAwayAcceptedHeldCall()) return;
     await client.hangup();
+  }
+
+  /// Hang up after Accept on a call Vobiz holds whose INVITE has not arrived
+  /// yet: there is no call to hang up, and the SDK would answer the INVITE
+  /// when it comes. Turn it away instead. Returns whether that was the case.
+  bool _turnAwayAcceptedHeldCall() {
+    final screen = _callScreenId;
+    final pushed = screen == null ? null : _ringingPushes[screen];
+    final sdk = pushed?.sdkPush;
+    if (!_callScreenAccepted || pushed == null || sdk == null || client.callState != CallStateStatus.idle) {
+      return false;
+    }
+    log('📵 Hung up before the call from ${pushed.displayCaller} arrived: turning it away', LogType.warning);
+    _turnedAway.add(pushed.callId);
+    _ringingPushes.remove(pushed.callId);
+    client.reportCallScreenDeclined(sdk);
+    _logCall(CallRecord(
+      id: pushed.callId,
+      inbound: true,
+      party: pushed.displayCaller,
+      at: DateTime.now(),
+      outcome: CallOutcome.declined,
+    ));
+    _endCallScreen();
+    _stopCallService();
+    return true;
   }
 
   Future<void> answer() async {
@@ -1231,8 +1264,9 @@ class PlaygroundController extends ChangeNotifier {
             // Still ringing (the caller gave up): decline it; a call that was
             // never answered cannot be hung up.
             await client.rejectCall();
-          } else if (client.callState != CallStateStatus.idle) {
-            // "Hang up" on the ongoing-call notification.
+          } else if (client.callState != CallStateStatus.idle || _callScreenAccepted) {
+            // "Hang up" on the ongoing-call notification, also for an
+            // accepted call that has not arrived yet.
             await hangup();
           }
         }
@@ -1319,6 +1353,11 @@ class PlaygroundController extends ChangeNotifier {
           LogType.info);
       return;
     }
+    if (_sdkReconnecting) {
+      log('📲 Vobiz push: a call from ${call.displayCaller}. Reconnecting already: the claim rides on it',
+          LogType.info);
+      return;
+    }
     if (!_hasSavedSignIn) {
       log('📲 Call from ${call.displayCaller}. Sign in to take it (no saved sign-in).', LogType.warning);
       return;
@@ -1342,7 +1381,7 @@ class PlaygroundController extends ChangeNotifier {
     // microphone service to start.
     _startCallService(outbound: false, caller: call.displayCaller);
     client.reportCallScreenAccepted(sdk);
-    if (client.isConnected || status == PhoneStatus.connecting) {
+    if (client.isConnected || status == PhoneStatus.connecting || _sdkReconnecting) {
       if (client.callState != CallStateStatus.incoming) log('Waiting for the call Vobiz is holding...', LogType.info);
       return;
     }
@@ -1364,6 +1403,7 @@ class PlaygroundController extends ChangeNotifier {
     final sdk = call.sdkPush;
     if (sdk == null) return;
     _ringingPushes.remove(call.callId);
+    _turnedAway.add(call.callId);
     log('📵 Declined the call from ${call.displayCaller}', LogType.warning);
     _logCall(CallRecord(
       id: call.callId,
@@ -1373,11 +1413,16 @@ class PlaygroundController extends ChangeNotifier {
       outcome: CallOutcome.declined,
     ));
     client.reportCallScreenDeclined(sdk);
-    if (!client.isConnected && status != PhoneStatus.connecting && _hasSavedSignIn) {
+    if (!client.isConnected && status != PhoneStatus.connecting && !_sdkReconnecting && _hasSavedSignIn) {
       log('Signing in to turn the call away...', LogType.info);
       await connect();
     }
   }
+
+  /// The SDK is signed in but between connections: it reconnects with its
+  /// own sign-in, and its REGISTER carries a pending claim. A new sign-in
+  /// would tear that reconnect down.
+  bool get _sdkReconnecting => client.connectionState == ConnectionStateStatus.reconnecting;
 
   /// What became of a call Vobiz held: claimed, arrived, or never came.
   void _onPushCallUpdate(VobizPushCallUpdate update) {
@@ -1396,6 +1441,7 @@ class PlaygroundController extends ChangeNotifier {
       case VobizPushCallStatus.expired:
         final id = update.push.callId;
         final call = _ringingPushes.remove(id);
+        _turnedAway.remove(id);
         final accepted = _callScreenAccepted && _callScreenId == id;
         log('📵 The call Vobiz held did not arrive before the push expired'
             '${accepted ? ' (it was accepted on the call screen)' : ''}', LogType.warning);
@@ -1897,6 +1943,14 @@ class PlaygroundController extends ChangeNotifier {
         activeHeaders = null;
         _recordHeaders('incoming call', e);
         final ref = pushRefFromHeaders(e.headers);
+        final sipCallId = e.sipCallId;
+        if (sipCallId != null && _turnedAway.remove(sipCallId)) {
+          // Declined (or hung up) before it arrived: the SDK turns it away.
+          // It is logged already, and must not ring again.
+          log('📵 The call turned away on the call screen arrived: the SDK declines it', LogType.info);
+          _inbound = _Inbound(id: sipCallId, party: remoteParty, pushId: sipCallId)..declinedHere = true;
+          break;
+        }
         // A call Vobiz held while its push woke this phone: the push's call
         // screen is already showing (and may have been accepted).
         final held = client.isPushedCall(e.callId) ? _ringingPushes[e.sipCallId ?? ''] : null;
