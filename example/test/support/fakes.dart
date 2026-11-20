@@ -178,7 +178,7 @@ class FakeClient implements VobizClient {
 
   @override
   bool handleIncomingPush(VobizIncomingPush push) {
-    if (!push.isHeldByVobiz || push.isTest || push.isExpired()) return false;
+    if (push.isExpired()) return false;
     actions.add('handleIncomingPush:${push.callId}');
     handledPush = push;
     return true;
@@ -279,6 +279,6 @@ class FakeCallPlatform extends CallPlatform {
   Future<void> stopCallService() async => requests.add('stop');
 
   @override
-  Future<void> showMissedCall({required String id, required String caller, String? detail}) async =>
+  Future<void> showMissedCall({required String id, required String caller}) async =>
       requests.add('missed:$id');
 }

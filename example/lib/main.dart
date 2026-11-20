@@ -11,9 +11,8 @@ import 'src/push/push_service.dart';
 /// the same options as the Vobiz WebRTC Playground on the web. No credentials
 /// are built into the app.
 ///
-/// With the push bridge (example/push_bridge) and Firebase set up, calls to
-/// your Vobiz number also ring the phone when the app is in the background or
-/// has been swiped away.
+/// With Vobiz push and Firebase set up, calls also ring the phone when the
+/// app is in the background or has been swiped away.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final push = await PushService.start();

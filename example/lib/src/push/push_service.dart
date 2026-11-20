@@ -4,8 +4,8 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'call_screen.dart';
 import 'push_call.dart';
 
-/// Firebase Cloud Messaging for the running app: the device token the push
-/// bridge sends to, and the pushes that arrive while the app is open.
+/// Firebase Cloud Messaging for the running app: the device token Vobiz's
+/// push service sends to, and the pushes that arrive while the app is open.
 ///
 /// Push is optional. Without `android/app/google-services.json` the app
 /// still rings for calls while it is open; [available] is false and
@@ -16,7 +16,7 @@ class PushService {
   /// A service for tests and builds without push.
   PushService.unavailable(String this.problem) : available = false;
 
-  /// Firebase is set up, so the bridge can wake this app.
+  /// Firebase is set up, so Vobiz push can wake this app.
   final bool available;
 
   /// Why push is off, in words for the screen.
@@ -54,11 +54,11 @@ class PushService {
     }
   }
 
-  /// Firebase replaces tokens now and then; the bridge must get the new one.
+  /// Firebase replaces tokens now and then; Vobiz push must get the new one.
   Stream<String> get tokenRefresh =>
       available ? FirebaseMessaging.instance.onTokenRefresh : const Stream<String>.empty();
 
-  /// Pushes from the bridge that arrive while the app is in the foreground.
+  /// Call pushes that arrive while the app is in the foreground.
   /// The same pushes also come through [CallPlatform.pushes]; the
   /// controller handles each call once.
   Stream<PushCall> get foregroundCalls => available

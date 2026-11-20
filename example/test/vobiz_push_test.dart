@@ -60,10 +60,10 @@ void main() {
     test('reads the hold and an expiry in seconds, and is not stale on arrival', () {
       final call = PushCall.fromData(vobizPush())!;
       expect(call.isVobiz, isTrue);
-      expect(call.isExpired, isFalse, reason: 'seconds read as milliseconds would be 1970');
+      expect(call.sdkPush!.isExpired(), isFalse, reason: 'seconds read as milliseconds would be 1970');
       expect(call.displayCaller, 'Asha');
       expect(call.callerNumber, '+919876543210');
-      expect(call.sdkPush!.hold!.registerHeaders['X-Index'], '4211');
+      expect(call.sdkPush!.hold.registerHeaders['X-Index'], '4211');
     });
 
     test('keeps its hold through the call screen, so Accept after a cold start can claim it', () {
@@ -72,20 +72,13 @@ void main() {
       expect(back.isVobiz, isTrue);
       expect(back.registrar, '203.0.113.10');
       expect(back.expiresAt, call.expiresAt);
-      expect(back.sdkPush!.isHeldByVobiz, isTrue);
+      expect(back.sdkPush, isNotNull);
     });
 
-    test('matches its INVITE by SIP Call-ID only', () {
-      final call = PushCall.fromData(vobizPush())!;
-      expect(inviteMatchesPush(call, headers: const <String, String>{}, sipCallId: 'held-1@10.0.2.9'), isTrue);
-      expect(inviteMatchesPush(call, headers: const <String, String>{}, sipCallId: 'other'), isFalse);
-      expect(inviteMatchesPush(call, headers: <String, String>{'X-VH-PushRef': 'held-1@10.0.2.9'}), isFalse);
-    });
-
-    test('a bridge push is not a Vobiz one', () {
-      final bridge = PushCall.fromData(<String, String>{'type': 'incoming_call', 'call_id': 'c1', 'ttl_ms': '40000'})!;
-      expect(bridge.isVobiz, isFalse);
-      expect(bridge.sdkPush, isNull);
+    test('a call push without index, label and registrar is not a call Vobiz holds', () {
+      final other = PushCall.fromData(<String, String>{'type': 'incoming_call', 'call_id': 'c1', 'ttl_ms': '40000'})!;
+      expect(other.isVobiz, isFalse);
+      expect(other.sdkPush, isNull);
     });
   });
 
@@ -185,6 +178,58 @@ void main() {
       expect(client.actions.where((a) => a.startsWith('handleIncomingPush')), isEmpty);
     });
 
+    test('a call push without index, label and registrar rings nothing', () async {
+      await start();
+      platform.pushController.add(<String, String>{
+        'type': 'incoming_call',
+        'call_id': 'c1',
+        'caller': '+919876543210',
+        'expires_at': '${DateTime.now().millisecondsSinceEpoch ~/ 1000 + 30}',
+      });
+      await pumpEventQueue();
+      expect(screen.shown, isEmpty);
+      expect(client.actions, isEmpty, reason: 'no claim and no sign-in');
+    });
+
+    test('a replayed Accept is reported to the SDK once', () async {
+      await start();
+      final data = vobizPush();
+      platform.pushController.add(data);
+      await pumpEventQueue();
+      screen.controller.add(accept('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      screen.controller.add(accept('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      expect(client.actions.where((a) => a == 'reportAccepted:held-1@10.0.2.9'), hasLength(1));
+      expect(client.actions.where((a) => a.startsWith('connect')), hasLength(1));
+    });
+
+    for (final withRef in <bool>[false, true]) {
+      test('a held call the caller cancels while it rings closes its call screen and is logged missed once'
+          '${withRef ? ' (INVITE with PushRef)' : ''}', () async {
+        await start();
+        await controller.connect();
+        await pumpEventQueue();
+        platform.pushController.add(vobizPush());
+        await pumpEventQueue();
+        client.ring(
+          callId: 'in_1',
+          from: '+919876543210',
+          sipCallId: 'held-1@10.0.2.9',
+          headers: withRef ? <String, String>{'X-VH-PushRef': 'ref-1'} : const <String, String>{},
+        );
+        await pumpEventQueue();
+        expect(controller.showIncoming, isTrue);
+        client.emit(CallStateStatus.ended, callId: 'in_1', reason: 'Caller cancelled');
+        await pumpEventQueue();
+        expect(screen.ended, contains('held-1@10.0.2.9'), reason: 'the push\'s call screen stops ringing');
+        expect(screen.screens, isEmpty);
+        final id = withRef ? 'ref-1' : 'held-1@10.0.2.9';
+        expect(controller.history.byId(id)!.outcome, CallOutcome.missed);
+        expect(platform.requests.where((r) => r.startsWith('missed:')), <String>['missed:$id']);
+      });
+    }
+
     test('turning Vobiz push on without Firebase says so, and registers nothing', () async {
       await start();
       await controller.connect();
@@ -193,6 +238,92 @@ void main() {
       await pumpEventQueue();
       expect(controller.vobizPushState, PushState.failed);
       expect(controller.vobizPushDetail, isNotEmpty);
+    });
+  });
+
+  group('Vobiz push sign-up through the sample server', () {
+    late FakeClient client;
+    late PlaygroundController controller;
+    late List<http.Request> requests;
+    late http.Response Function(http.Request request) reply;
+
+    Future<void> start({String server = 'https://bridge.example#key=k1'}) async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      FlutterSecureStorage.setMockInitialValues(<String, String>{
+        'vobiz_auth_id': 'MA_X',
+        'vobiz_auth_token': 'tok',
+        'vobiz_push_server': server,
+      });
+      client = FakeClient();
+      requests = <http.Request>[];
+      reply = (_) => http.Response('{"message":"ok"}', 200);
+      controller = PlaygroundController(
+        client: client,
+        callScreen: FakeCallScreen(),
+        platform: FakeCallPlatform(),
+        push: _FakePush(),
+        httpClient: MockClient((request) async {
+          requests.add(request);
+          return reply(request);
+        }),
+      );
+      await controller.init();
+      await controller.connect();
+      await pumpEventQueue();
+    }
+
+    tearDown(() => controller.dispose());
+
+    test('signs up through the server with its key and the SIP user, never the account credentials', () async {
+      await start();
+      await controller.setVobizPush(true);
+      await pumpEventQueue();
+      expect(controller.vobizPushState, PushState.ready);
+      final register = requests.single;
+      expect(register.method, 'POST');
+      expect(register.url.toString(), 'https://bridge.example/push/devices/register');
+      expect(register.headers['X-Bridge-Key'], 'k1');
+      expect(register.headers['X-Bridge-User'], 'play1');
+      expect(register.headers.keys.map((k) => k.toLowerCase()), isNot(contains('x-auth-token')));
+      expect(register.headers.keys.map((k) => k.toLowerCase()), isNot(contains('x-auth-id')));
+      final body = jsonDecode(register.body) as Map<String, Object?>;
+      expect(body['sip_username'], 'play1');
+      expect(body['push_token'], 'fcm-token-1');
+      expect(body['app_bundle_id'], 'ai.vobiz.vobiz_webrtc_example');
+      expect(body['device_id'], startsWith('vobiz-example-'));
+      expect(body.containsKey('auth_id'), isFalse, reason: 'the server sets its own account');
+    });
+
+    test('a server reached under a path keeps that path', () async {
+      await start(server: 'https://tunnel.example/vobiz#key=k1');
+      await controller.setVobizPush(true);
+      await pumpEventQueue();
+      expect(requests.single.url.toString(), 'https://tunnel.example/vobiz/push/devices/register');
+    });
+
+    test('sign-out removes the device through the server, with the same device id', () async {
+      await start();
+      await controller.setVobizPush(true);
+      await pumpEventQueue();
+      final deviceId = (jsonDecode(requests.single.body) as Map<String, Object?>)['device_id'];
+      requests.clear();
+      await controller.disconnect();
+      final logout = requests.single;
+      expect(logout.method, 'DELETE');
+      expect(logout.url.toString(), 'https://bridge.example/push/devices/logout');
+      expect(logout.headers['X-Bridge-Key'], 'k1');
+      expect(logout.headers['X-Bridge-User'], 'play1');
+      expect(jsonDecode(logout.body), <String, Object?>{'device_id': deviceId});
+    });
+
+    test('a refusal from the server is shown', () async {
+      await start();
+      reply = (_) => http.Response('{"error":"play1 is not an endpoint of this account"}', 403);
+      await controller.setVobizPush(true);
+      await pumpEventQueue();
+      expect(controller.vobizPushState, PushState.failed);
+      expect(controller.vobizPushDetail, contains('403'));
+      expect(controller.vobizPushDetail, contains('not an endpoint of this account'));
     });
   });
 

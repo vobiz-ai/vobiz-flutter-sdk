@@ -73,7 +73,7 @@ class _ConferenceSheet extends StatelessWidget {
           Text(
             state == null
                 ? 'The first person you add makes this call a conference: you and the other side move '
-                    'into a Vobiz conference room, then they are dialled into it. The push server does it '
+                    'into a Vobiz conference room, then they are dialled into it. The sample server does it '
                     'with your Auth Token, which never comes to this phone.'
                 : 'Everyone below is in the same Vobiz conference room. Hold takes a person out onto '
                     'music; Resume brings them back.',
@@ -130,7 +130,7 @@ class _ConferenceSheet extends StatelessWidget {
             const SizedBox(height: 6),
             Text(
               c.callerId.isEmpty
-                  ? 'They see the push server\'s Vobiz number (VOBIZ_NUMBER).'
+                  ? 'They see the sample server\'s Vobiz number (VOBIZ_NUMBER).'
                   : 'They see ${c.callerId} (the Caller ID on the Dialer).',
               style: TextStyle(fontSize: 11, color: pg.faint),
             ),
