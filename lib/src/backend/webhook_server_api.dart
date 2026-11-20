@@ -24,7 +24,9 @@ import '../models/call/transfer_leg.dart';
 /// the request body, and the hosted server's recordings list is shared by all
 /// of its users. All three refuse to run unless [allowAccountCredentials] is
 /// true (`SdkConfig.unsafeDemoZeroConfig`), so a production build cannot send
-/// the account credential off the device by accident.
+/// the account credential off the device by accident. Even then, the two
+/// that carry the Auth Token refuse a plain `http://` server unless it is
+/// this device or the Android emulator's host.
 @internal
 class WebhookServerApi {
   WebhookServerApi({
@@ -52,6 +54,23 @@ class WebhookServerApi {
     }
   }
 
+  /// Hosts a plain `http://` server may be on: this device, or the host of
+  /// the Android emulator, for a server run on the developer's machine.
+  static const Set<String> _localHosts = <String>{'localhost', '127.0.0.1', '::1', '10.0.2.2'};
+
+  /// The account Auth Token is in the request body: never send it in clear
+  /// over a network.
+  static void _requireSecure(String code, String base) {
+    final uri = Uri.tryParse(base);
+    final scheme = uri?.scheme.toLowerCase();
+    if (scheme == 'https') return;
+    if (scheme == 'http' && _localHosts.contains(uri!.host.toLowerCase())) return;
+    throw VobizException(
+        code,
+        'The webhook server must use https: it receives the account Auth Token '
+        '($base)');
+  }
+
   /// Strips trailing slashes so `$base/api/...` never doubles them.
   static String normalizeBase(String url) => url.trim().replaceAll(RegExp(r'/+$'), '');
 
@@ -65,6 +84,7 @@ class WebhookServerApi {
   }) async {
     _requireDemoMode('Zero-Config Setup');
     final base = normalizeBase(webhookUrl);
+    _requireSecure('setup_failed', base);
     final response = await _post(
       'setup_failed',
       Uri.parse('$base/api/setup'),
@@ -100,6 +120,7 @@ class WebhookServerApi {
   }) {
     _requireDemoMode('The Playground transfer');
     final base = normalizeBase(webhookUrl);
+    _requireSecure('transfer_failed', base);
     return _post(
       'transfer_failed',
       Uri.parse('$base/api/transfer'),
