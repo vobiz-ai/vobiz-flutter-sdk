@@ -44,6 +44,11 @@ jobs:
         working-directory: example
         run: flutter test test
 
+      # Validates the package pub.dev would receive (.pubignore, pubspec
+      # metadata, a clean tree) without uploading anything. Any warning fails.
+      - name: Publish dry run
+        run: flutter pub publish --dry-run
+
   push-bridge:
     name: Push bridge (node --test)
     runs-on: ubuntu-latest

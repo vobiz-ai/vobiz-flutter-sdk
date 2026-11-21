@@ -5,7 +5,19 @@ version: 0.2.0
 homepage: https://vobiz.ai
 repository: https://github.com/vobiz-ai/vobiz-flutter-sdk
 issue_tracker: https://github.com/vobiz-ai/vobiz-flutter-sdk/issues
-documentation: https://github.com/vobiz-ai/vobiz-flutter-sdk#readme
+
+topics:
+  - voip
+  - webrtc
+  - sip
+  - calling
+  - telephony
+
+# Android and iOS only, as PLATFORM_SETUP.md says: no web (the SDK uses
+# dart:io for its WebSocket) and no desktop.
+platforms:
+  android:
+  ios:
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
