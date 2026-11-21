@@ -61,10 +61,10 @@
             android:name=".CallService"
             android:exported="false"
             android:foregroundServiceType="phoneCall|microphone" />
-        <!-- The push bridge's Firebase messages, handed to the app's one Flutter
+        <!-- Vobiz's push messages (Firebase), handed to the app's one Flutter
              engine (CallEngine), started headless when the app is closed. The
              same broadcast firebase_messaging listens to; this receiver takes
-             only the bridge's message types. -->
+             only incoming-call messages. -->
         <receiver
             android:name=".CallPushReceiver"
             android:exported="true"

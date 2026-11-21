@@ -1,10 +1,8 @@
-import 'dart:convert';
-import 'dart:io';
-
-import 'package:fake_async/fake_async.dart';
 import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import 'package:vobiz_webrtc_example/src/call_history.dart';
@@ -12,36 +10,34 @@ import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 
 import 'support/fakes.dart';
 
-/// Incoming calls: pushes, the call screen, the call service and the log.
+/// Incoming calls over SIP: the call screen, the call service and the log.
 void main() {
   late FakeClient client;
   late FakeCallScreen screen;
   late FakeCallPlatform platform;
   late PlaygroundController controller;
+  late List<http.Request> requests;
 
-  Map<String, String> incoming(String id, {bool lineBusy = false}) => <String, String>{
-        'type': 'incoming_call',
-        'call_id': id,
-        'call_key': 'k-$id',
-        'caller': '+919876543210',
-        'callee': '+918000000000',
-        'ttl_ms': '40000',
-        if (lineBusy) 'line_busy': '1',
-      };
-
-  Map<String, String> ended(String id, String reason) =>
-      <String, String>{'type': 'call_ended', 'call_id': id, 'reason': reason};
-
-  Future<void> start({bool saved = true}) async {
-    SharedPreferences.setMockInitialValues(<String, Object>{});
+  Future<void> start({Map<String, String> secure = const <String, String>{}, Map<String, Object> prefs = const <String, Object>{}}) async {
+    SharedPreferences.setMockInitialValues(prefs);
     FlutterSecureStorage.setMockInitialValues(<String, String>{
-      if (saved) 'vobiz_auth_id': 'MA_X',
-      if (saved) 'vobiz_auth_token': 'tok',
+      'vobiz_auth_id': 'MA_X',
+      'vobiz_auth_token': 'tok',
+      ...secure,
     });
     client = FakeClient();
     screen = FakeCallScreen();
     platform = FakeCallPlatform();
-    controller = PlaygroundController(client: client, callScreen: screen, platform: platform);
+    requests = <http.Request>[];
+    controller = PlaygroundController(
+      client: client,
+      callScreen: screen,
+      platform: platform,
+      httpClient: MockClient((request) async {
+        requests.add(request);
+        return http.Response('{}', 200);
+      }),
+    );
     await controller.init();
   }
 
@@ -54,131 +50,8 @@ void main() {
 
   tearDown(() => controller.dispose());
 
-  group('push while the app is closed or signed out (#8)', () {
-    test('rings the call screen and signs in at once, before any Accept', () async {
-      await start();
-      platform.pushController.add(incoming('c1'));
-      await pumpEventQueue();
-
-      expect(screen.shown, contains('c1'));
-      expect(client.actions, contains('connectWithAuthToken'));
-      expect(client.isConnected, isTrue);
-      expect(controller.logs.map((l) => l.message),
-          contains(contains('asking the push server to ring this phone now')));
-    });
-
-    test('a push while already signed in reports "registered" at once (no push wait)', () async {
-      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      addTearDown(() => server.close(force: true));
-      final seen = <String>[];
-      server.listen((request) async {
-        seen.add('${request.uri.path} ${await utf8.decodeStream(request)}');
-        request.response
-          ..headers.contentType = ContentType.json
-          ..write('{"ok":true,"redial":"transferred","finished":false}');
-        await request.response.close();
-      });
-      await start();
-      await signIn();
-      expect(client.isConnected, isTrue);
-      platform.pushController.add(<String, String>{
-        ...incoming('c1'),
-        'server': 'http://127.0.0.1:${server.port}',
-      });
-      for (var i = 0; i < 100 && seen.isEmpty; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 10));
-      }
-      expect(seen, <String>['/push/registered {"call_id":"c1","call_key":"k-c1"}']);
-      expect(controller.logs.map((l) => l.message), contains(contains('already signed in')));
-    });
-
-    test('the same push from Firebase and from the receiver is handled once', () async {
-      await start();
-      platform.pushController.add(incoming('c1'));
-      platform.pushController.add(incoming('c1'));
-      await pumpEventQueue();
-      expect(screen.shown.where((id) => id == 'c1'), hasLength(1));
-      expect(client.actions.where((a) => a == 'connectWithAuthToken'), hasLength(1));
-    });
-
-    test('a stale push (ttl_ms already over) does not ring', () async {
-      await start();
-      platform.pushController.add(<String, String>{...incoming('c1'), 'ttl_ms': '0'});
-      await Future<void>.delayed(const Duration(milliseconds: 5));
-      await pumpEventQueue();
-      expect(screen.shown, isEmpty);
-    });
-  });
-
-  group('call_ended pushes (#9, #19)', () {
-    test('answered elsewhere: stops ringing, no missed call', () async {
-      await start();
-      platform.pushController.add(incoming('c1'));
-      await pumpEventQueue();
-      platform.pushController.add(ended('c1', 'answered_elsewhere'));
-      await pumpEventQueue();
-
-      expect(screen.ended, contains('c1'));
-      expect(missedNotifications(), isEmpty);
-      expect(controller.history.byId('c1')!.outcome, CallOutcome.answeredElsewhere);
-
-      // The plugin's own 45 s timeout can still fire: no false missed call.
-      screen.controller.add(const ck.CallEventActionCallTimeout('c1'));
-      await pumpEventQueue();
-      expect(missedNotifications(), isEmpty);
-    });
-
-    test('answered elsewhere also stops a call ringing here over SIP', () async {
-      await start();
-      await signIn();
-      platform.pushController.add(incoming('c1'));
-      client.ring(headers: <String, String>{'X-VH-PushRef': 'c1'});
-      await pumpEventQueue();
-      platform.pushController.add(ended('c1', 'answered_elsewhere'));
-      await pumpEventQueue();
-      expect(client.actions, contains('rejectCall'));
-      expect(missedNotifications(), isEmpty);
-      expect(controller.history.byId('c1')!.outcome, CallOutcome.answeredElsewhere);
-    });
-
-    test('a phone already in the call ignores answered_elsewhere', () async {
-      await start();
-      await signIn();
-      client.ring(headers: <String, String>{'X-VH-PushRef': 'c1'});
-      await pumpEventQueue();
-      await controller.answer();
-      client.emit(CallStateStatus.active);
-      await pumpEventQueue();
-      platform.pushController.add(ended('c1', 'answered_elsewhere'));
-      await pumpEventQueue();
-      expect(client.actions, isNot(contains('rejectCall')));
-      expect(controller.status, PhoneStatus.inCall);
-    });
-
-    test('caller hung up: one missed-call notification, however many signals follow', () async {
-      await start();
-      platform.pushController.add(incoming('c1'));
-      await pumpEventQueue();
-      platform.pushController.add(ended('c1', 'caller_hung_up'));
-      await pumpEventQueue();
-      screen.controller.add(const ck.CallEventActionCallTimeout('c1'));
-      await pumpEventQueue();
-
-      expect(missedNotifications(), <String>['missed:c1']);
-      expect(controller.history.byId('c1')!.outcome, CallOutcome.missed);
-      expect(controller.history.byId('c1')!.party, '+919876543210');
-    });
-
-    test('a call_ended for a push that never arrived still logs the missed call', () async {
-      await start();
-      platform.pushController.add(ended('lost', 'missed'));
-      await pumpEventQueue();
-      expect(missedNotifications(), <String>['missed:lost']);
-    });
-  });
-
   group('missed calls over SIP, with the app open (#19)', () {
-    test('a direct call (no bridge) the caller gave up on is missed at once', () async {
+    test('a direct call the caller gave up on is missed at once', () async {
       await start();
       await signIn();
       client.ring();
@@ -186,6 +59,19 @@ void main() {
       client.emit(CallStateStatus.ended, reason: 'Caller cancelled');
       await pumpEventQueue();
       expect(missedNotifications(), <String>['missed:sip-1']);
+    });
+
+    test('a call rung by the sample server (PushRef) the caller gives up on is missed at once, under its PushRef',
+        () async {
+      await start();
+      await signIn();
+      client.ring(headers: <String, String>{'X-VH-PushRef': 'c1'});
+      await pumpEventQueue();
+      client.emit(CallStateStatus.ended, reason: 'Caller cancelled');
+      await pumpEventQueue();
+      expect(missedNotifications(), <String>['missed:c1']);
+      expect(controller.history.byId('c1')!.outcome, CallOutcome.missed);
+      expect(screen.ended, contains('c1'), reason: 'its call screen stops ringing');
     });
 
     test('CANCEL with Reason cause=200 is answered elsewhere, not missed', () async {
@@ -210,29 +96,6 @@ void main() {
       expect(missedNotifications(), isEmpty);
       expect(controller.history.byId('sip-1')!.outcome, CallOutcome.declined);
     });
-
-    test('a bridge call between ringing attempts is missed only if nothing follows', () {
-      fakeAsync((async) {
-        start();
-        async.flushMicrotasks();
-        controller.connect();
-        async.flushMicrotasks();
-        client.ring(headers: <String, String>{'X-VH-PushRef': 'c1'});
-        async.flushMicrotasks();
-        client.emit(CallStateStatus.ended);
-        async.flushMicrotasks();
-        async.elapse(const Duration(seconds: 3));
-        // The bridge rings again: still the same call.
-        client.ring(callId: 'sip-2', headers: <String, String>{'X-VH-PushRef': 'c1'});
-        async.flushMicrotasks();
-        client.emit(CallStateStatus.ended, callId: 'sip-2');
-        async.flushMicrotasks();
-        async.elapse(PlaygroundController.missedGrace - const Duration(seconds: 1));
-        expect(missedNotifications(), isEmpty);
-        async.elapse(const Duration(seconds: 2));
-        expect(missedNotifications(), <String>['missed:c1']);
-      });
-    });
   });
 
   group('the app open (#40)', () {
@@ -247,41 +110,60 @@ void main() {
     });
   });
 
-  group('a second call during a call (#45)', () {
-    test('no ringing screen; call waiting; the running call is left alone', () async {
+  group('the system call screen for a call ringing over SIP', () {
+    ck.CallKitParams sipScreen(String id) =>
+        ck.CallKitParams(id: id, extra: <String, dynamic>{'source': 'sip', 'call': 'sip-1'});
+
+    test('Accept answers the call', () async {
       await start();
       await signIn();
-      client.ring(headers: <String, String>{'X-VH-PushRef': 'first'});
+      client.ring();
       await pumpEventQueue();
-      await controller.answer();
-      client.emit(CallStateStatus.active);
+      expect(screen.shown, <String>['sip-sip-1']);
+      screen.controller.add(ck.CallEventActionCallAccept(sipScreen('sip-sip-1')));
       await pumpEventQueue();
-      screen.shown.clear();
-      platform.requests.clear();
-
-      platform.pushController.add(incoming('second'));
-      await pumpEventQueue();
-      expect(screen.shown, isEmpty);
-      expect(controller.callWaiting?.callId, 'second');
-      expect(platform.requests, isNot(contains('stop')));
-
-      platform.pushController.add(ended('second', 'busy'));
-      await pumpEventQueue();
-      expect(controller.callWaiting, isNull);
-      expect(screen.ended, isNot(contains('second')));
-      expect(controller.history.byId('second')!.outcome, CallOutcome.busy);
-      expect(missedNotifications(), <String>['missed:second']);
-      expect(platform.requests, isNot(contains('stop')));
-      expect(controller.status, PhoneStatus.inCall);
+      expect(client.actions.where((a) => a == 'acceptCall'), hasLength(1));
+      expect(platform.requests, contains(startsWith('start:')), reason: 'the call service starts on the tap');
     });
 
-    test('line_busy from the bridge: call waiting, no full-screen screen', () async {
+    test('Decline turns the call away once, logs it declined, and tells no server', () async {
       await start();
       await signIn();
-      platform.pushController.add(incoming('c1', lineBusy: true));
+      client.ring();
       await pumpEventQueue();
-      expect(screen.shown, isEmpty);
-      expect(controller.callWaiting?.callId, 'c1');
+      screen.controller.add(ck.CallEventActionCallDecline(sipScreen('sip-sip-1')));
+      await pumpEventQueue();
+      client.emit(CallStateStatus.ended);
+      await pumpEventQueue();
+      expect(client.actions.where((a) => a == 'rejectCall'), hasLength(1));
+      expect(controller.history.byId('sip-1')!.outcome, CallOutcome.declined);
+      expect(missedNotifications(), isEmpty);
+      expect(requests, isEmpty);
+    });
+
+    test('the screen ringing out turns the call away and logs it missed', () async {
+      await start();
+      await signIn();
+      client.ring();
+      await pumpEventQueue();
+      screen.controller.add(const ck.CallEventActionCallTimeout('sip-sip-1'));
+      await pumpEventQueue();
+      expect(client.actions, contains('rejectCall'));
+      expect(controller.history.byId('sip-1')!.outcome, CallOutcome.missed);
+      expect(missedNotifications(), <String>['missed:sip-1']);
+    });
+
+    test('Accept on another call\'s screen never answers the call ringing over SIP (#46)', () async {
+      await start();
+      await signIn();
+      client.ring(callId: 'sip-9', headers: <String, String>{'X-VH-PushRef': 'other-call'});
+      await pumpEventQueue();
+      screen.controller.add(ck.CallEventActionCallAccept(
+          ck.CallKitParams(id: 'ref-1', extra: <String, dynamic>{'source': 'sip', 'call': 'sip-1'})));
+      await pumpEventQueue();
+      expect(client.actions, isNot(contains('acceptCall')));
+      expect(screen.ended, contains('ref-1'), reason: 'the stray screen is taken down');
+      expect(controller.showIncoming, isTrue, reason: 'the real call still rings');
     });
   });
 
@@ -301,20 +183,6 @@ void main() {
       await pumpEventQueue();
       expect(platform.requests.last, 'stop');
       expect(controller.history.records.first.outcome, CallOutcome.outgoing);
-    });
-
-    test('a ring stopped by call_ended is not logged as an outgoing call', () async {
-      await start();
-      await signIn();
-      platform.pushController.add(incoming('c1'));
-      client.ring(headers: <String, String>{'X-VH-PushRef': 'c1'});
-      await pumpEventQueue();
-      platform.pushController.add(ended('c1', 'caller_hung_up'));
-      await pumpEventQueue();
-      client.direction = null;
-      client.emit(CallStateStatus.ended);
-      await pumpEventQueue();
-      expect(controller.history.records.map((r) => r.inbound), everyElement(isTrue));
     });
 
     test('a call answered in the app runs under the service', () async {
@@ -346,11 +214,14 @@ void main() {
     });
   });
 
-  test('sign-out forgets the push bridge device token (#27)', () async {
-    await start();
-    await const FlutterSecureStorage().write(key: 'vobiz_push_device_token', value: 'dev.secret');
-    await signIn();
-    await controller.disconnect();
+  test('start-up removes the device token and switch left by the version that paired with the server',
+      () async {
+    await start(
+      secure: <String, String>{'vobiz_push_device_token': 'dev.secret'},
+      prefs: <String, Object>{'vobiz_playground_receive_calls': true},
+    );
     expect(await const FlutterSecureStorage().read(key: 'vobiz_push_device_token'), isNull);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.containsKey('vobiz_playground_receive_calls'), isFalse);
   });
 }

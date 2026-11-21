@@ -1,4 +1,4 @@
-// Test helpers: a bridge on a free port with fake Firebase and Vobiz APIs.
+// Test helpers: a bridge on a free port with a fake Vobiz API.
 // Nothing here talks to the network beyond localhost.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -11,19 +11,18 @@ export const AUTH_TOKEN = 'test-auth-token-not-a-secret';
 export const AUTH_ID = 'MA_TESTTEST';
 export const BRIDGE_KEY = 'test-bridge-key-0123456789';
 
-/** A long, fake FCM registration token. */
-export function fcmToken(name) {
-  return `fcm-${name}-${'x'.repeat(40)}`;
+/** The app's headers: the bridge key, and the SIP user it is signed in as when `user` is given. */
+export function appAuth(user) {
+  return { 'X-Bridge-Key': BRIDGE_KEY, ...(user === undefined ? {} : { 'X-Bridge-User': user }) };
 }
 
 /**
  * Starts a bridge. `env` is merged over a signed, fully configured default.
- * Returns { bridge, base, pushes, api, logs, stateFile, stop }.
+ * Returns { bridge, base, api, logs, stateFile, stop }.
  */
-export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, endpoints = ['alice', 'bob', 'carol'], deps = {} } = {}) {
+export async function startBridge({ env = {}, stateFile, apiHandler, deps = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-bridge-test-'));
   const file = stateFile || path.join(dir, 'bridge-state.json');
-  const pushes = [];
   const api = [];
   const logs = [];
   const bridge = createBridge({
@@ -38,17 +37,9 @@ export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, 
     stateFile: file,
     deps: {
       log: (tag, message) => logs.push(`${tag} ${message}`),
-      sendPush: async (token, data, opts) => {
-        if (pushDelay) await pushDelay();
-        pushes.push({ token, data, opts });
-        return { ok: true };
-      },
       vobizApi: async (method, pathname, body) => {
         api.push({ method, pathname, body });
         if (apiHandler) return apiHandler(method, pathname, body);
-        if (pathname.startsWith('/Endpoint/')) {
-          return { objects: endpoints.map((username) => ({ username })), meta: { total_count: endpoints.length } };
-        }
         return { message: 'ok' };
       },
       ...deps,
@@ -59,7 +50,6 @@ export async function startBridge({ env = {}, stateFile, apiHandler, pushDelay, 
   return {
     bridge,
     base,
-    pushes,
     api,
     logs,
     stateFile: file,
@@ -90,9 +80,10 @@ export async function webhook(ctx, pathAndQuery, params = {}, { sign = true, hea
   return { status: response.status, text: await response.text(), headers: signed };
 }
 
-export async function postJson(ctx, pathname, body, headers = {}) {
+/** Sends `body` as JSON with `method`. Returns { status, json, text }. */
+export async function requestJson(ctx, method, pathname, body, headers = {}) {
   const response = await fetch(`${ctx.base}${pathname}`, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
   });
@@ -101,6 +92,8 @@ export async function postJson(ctx, pathname, body, headers = {}) {
   try { json = JSON.parse(text); } catch { /* not JSON */ }
   return { status: response.status, json, text };
 }
+
+export const postJson = (ctx, pathname, body, headers = {}) => requestJson(ctx, 'POST', pathname, body, headers);
 
 /** Pulls an attribute value out of returned XML. */
 export function xmlAttr(xml, element, attr) {
@@ -112,8 +105,8 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Waits until fn() is truthy, up to `ms`. 5 s, not 2: with every test file
- * starting bridges in parallel, a push can take over 2 s on a loaded machine;
- * a passing check returns at once.
+ * starting bridges in parallel, a callback can take over 2 s on a loaded
+ * machine; a passing check returns at once.
  */
 export async function until(fn, ms = 5000) {
   const end = Date.now() + ms;
@@ -126,35 +119,16 @@ export async function until(fn, ms = 5000) {
 }
 
 /**
- * Pairs a phone for `username` with its own FCM token. Returns the response
- * body ({ device_id, device_token, … }) plus `auth`, the header to send later.
- */
-export async function registerDevice(ctx, username, { name = username } = {}) {
-  const r = await postJson(ctx, '/push/register', { username, token: fcmToken(name), platform: 'android' }, { 'X-Bridge-Key': BRIDGE_KEY });
-  if (r.status !== 200) throw new Error(`register ${username}: ${r.status} ${r.text}`);
-  return { ...r.json, fcm: fcmToken(name), auth: { Authorization: `Bearer ${r.json.device_token}` } };
-}
-
-/**
- * An inbound call up to its Dial. /answer holds the caller on ringback while
- * a pushed phone wakes (PreAnswer + Redirect to /dial-now); this follows the
- * Redirect as Vobiz does when the wait ends. Returns { text: the Dial XML,
- * hold: the hold XML or null, action, events }.
+ * An inbound call: Vobiz asks /answer, which replies with the Dial at once.
+ * Returns { text: the Dial XML, headers: the signature sent, action and
+ * events: the Dial's callback paths }.
  */
 export async function answerCall(ctx, params) {
   const answer = await webhook(ctx, '/answer', params);
-  let text = answer.text;
-  let hold = null;
-  const redirect = text.match(/<Redirect[^>]*>([^<]+)<\/Redirect>/);
-  if (redirect) {
-    hold = text;
-    text = (await webhook(ctx, new URL(redirect[1].replace(/&amp;/g, '&')).pathname, { CallUUID: params.CallUUID, Event: 'Redirect' })).text;
-  }
-  const action = xmlAttr(text, 'Dial', 'action');
-  const events = xmlAttr(text, 'Dial', 'callbackUrl');
+  const action = xmlAttr(answer.text, 'Dial', 'action');
+  const events = xmlAttr(answer.text, 'Dial', 'callbackUrl');
   return {
-    text,
-    hold,
+    text: answer.text,
     headers: answer.headers,
     action: action && new URL(action).pathname,
     events: events && new URL(events).pathname,

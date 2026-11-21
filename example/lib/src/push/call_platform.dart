@@ -8,9 +8,9 @@ import 'package:flutter/services.dart';
 /// * `CallService`, the foreground service (types `phoneCall|microphone`)
 ///   that keeps the microphone and the process alive during every call,
 ///   inbound or outbound, however it was answered;
-/// * `CallPushReceiver` + `CallEngine`, which hand each push from the bridge
-///   to the one Flutter engine that hosts both the SIP connection and the
-///   UI, starting it (headless) when the app was closed;
+/// * `CallPushReceiver` + `CallEngine`, which hand each call push from
+///   Vobiz's push service to the one Flutter engine that hosts both the SIP
+///   connection and the UI, starting it (headless) when the app was closed;
 /// * the missed-call notification.
 ///
 /// Every method is a no-op where that code is missing (tests, iOS, web).
@@ -31,9 +31,9 @@ class CallPlatform {
 
   static bool get _supported => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
-  /// Push data messages from the bridge, as Android received them. They
-  /// arrive here whether the app is open, in the background, or was started
-  /// by the push itself.
+  /// Call push data messages, as Android received them. They arrive here
+  /// whether the app is open, in the background, or was started by the push
+  /// itself.
   Stream<Map<String, String>> get pushes => _pushes.stream;
 
   /// "Hang up" tapped on the ongoing-call notification.
@@ -61,8 +61,8 @@ class CallPlatform {
 
   /// Posts a "Missed call" notification. One per [id]; a second post for
   /// the same call replaces the first.
-  Future<void> showMissedCall({required String id, required String caller, String? detail}) =>
-      _invoke<void>('showMissedCall', <String, Object?>{'id': id, 'caller': caller, 'detail': detail});
+  Future<void> showMissedCall({required String id, required String caller}) =>
+      _invoke<void>('showMissedCall', <String, Object?>{'id': id, 'caller': caller});
 
   Future<Object?> _onNativeCall(MethodCall call) async {
     switch (call.method) {

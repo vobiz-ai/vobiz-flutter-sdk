@@ -542,14 +542,11 @@ class VobizClient {
   /// [pushCallUpdates] reports each step, and `expired` when no INVITE came
   /// by the push's expiry: take the call screen down then.
   ///
-  /// Returns false and does nothing for a push that is not a call Vobiz holds
-  /// ([VobizIncomingPush.isHeldByVobiz]), is a test, or has expired. A repeat
-  /// of the push being handled returns true and does nothing more.
+  /// Returns false and does nothing for a push that has expired. A repeat of
+  /// the push being handled returns true and does nothing more.
   bool handleIncomingPush(VobizIncomingPush push) {
     final hold = push.hold;
-    if (push.kind != VobizPushKind.incomingCall || hold == null || push.isTest || push.isExpired()) {
-      return false;
-    }
+    if (push.isExpired()) return false;
     final current = _pushed;
     if (current != null && current.push.callId == push.callId) return true;
     _forgetPushedCall();
@@ -617,11 +614,11 @@ class VobizClient {
   /// An INVITE arrived: is it the call the push announced? Only an exact
   /// Call-ID match counts, so another call from the same caller is never
   /// answered for them.
-  void _matchPushedCall(String callId, String callerId, Map<String, String> headers) {
+  void _matchPushedCall(String callId, String callerId) {
     final pushed = _pushed;
     if (pushed == null || pushed.callId != null) return;
     final sipCallId = _sip.activeSipCallId;
-    if (!pushed.push.matchesIncomingCall(headers: headers, sipCallId: sipCallId)) {
+    if (!pushed.push.matchesIncomingCall(sipCallId: sipCallId)) {
       final number = pushed.push.callerNumber.isNotEmpty ? pushed.push.callerNumber : pushed.push.caller;
       if (VobizIncomingPush.samePhoneNumber(callerId, number)) {
         _logger.warn('A call from $callerId arrived while the pushed call ${pushed.push.callId} was '
@@ -645,10 +642,9 @@ class VobizClient {
   /// A pushed call that no REGISTER has claimed yet rides on the next one.
   void _claimPushedCallOnRegister() {
     final pushed = _pushed;
-    final hold = pushed?.push.hold;
-    if (pushed == null || hold == null || pushed.claimed || pushed.callId != null) return;
+    if (pushed == null || pushed.claimed || pushed.callId != null) return;
     if (pushed.push.isExpired()) return;
-    _sip.claimHeldCall(hold.registerHeaders);
+    _sip.claimHeldCall(pushed.push.hold.registerHeaders);
   }
 
   void _expirePushedCall(_PushedCall pushed) {
@@ -1342,7 +1338,7 @@ class VobizClient {
       _callHeaders = Map<String, String>.unmodifiable(headers);
       _callState = CallStateStatus.incoming;
       _emitCallEvent(callId, CallStateStatus.incoming, callerId);
-      _matchPushedCall(callId, callerId, headers);
+      _matchPushedCall(callId, callerId);
     };
 
     _sip.onCallEnded = (reason) {

@@ -78,7 +78,7 @@ object CallEngine {
         return engine
     }
 
-    /** A push from the bridge: hand it to Dart, starting the engine if needed. */
+    /** A call push: hand it to Dart, starting the engine if needed. */
     @JvmStatic
     fun deliverPush(context: Context, data: Map<String, String>) {
         main.post {
@@ -124,7 +124,6 @@ object CallEngine {
                         context,
                         call.argument<String>("id") ?: "",
                         call.argument<String>("caller") ?: "Unknown caller",
-                        call.argument<String>("detail"),
                     )
                     result.success(null)
                 }
@@ -137,7 +136,7 @@ object CallEngine {
         }
     }
 
-    private fun showMissedCall(context: Context, id: String, caller: String, detail: String?) {
+    private fun showMissedCall(context: Context, id: String, caller: String) {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             manager.createNotificationChannel(
@@ -160,7 +159,7 @@ object CallEngine {
         val notification = builder
             .setSmallIcon(android.R.drawable.sym_call_missed)
             .setContentTitle("Missed call")
-            .setContentText(if (detail.isNullOrEmpty()) caller else "$caller · $detail")
+            .setContentText(caller)
             .setCategory(Notification.CATEGORY_MISSED_CALL)
             .setAutoCancel(true)
             .setContentIntent(tap)

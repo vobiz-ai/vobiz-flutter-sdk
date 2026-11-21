@@ -5,9 +5,8 @@ import '../playground_controller.dart';
 import '../theme.dart';
 import 'common.dart';
 
-/// "Incoming calls": connects the app to the push bridge, so calls to the
-/// Vobiz number ring this phone in the foreground, in the background and
-/// after the app is swiped away.
+/// "Incoming calls" (Vobiz push, which rings this phone also when the app is
+/// closed) and "Sample server" (the line example/push_bridge prints).
 class PushPanel extends StatefulWidget {
   const PushPanel({super.key, required this.controller});
 
@@ -58,13 +57,6 @@ class _PushPanelState extends State<PushPanel> {
   Widget build(BuildContext context) {
     final c = widget.controller;
     final pg = context.pg;
-    final (chipText, chipColor) = switch (c.pushState) {
-      PushState.off => ('OFF', pg.faint),
-      PushState.registering => ('CONNECTING', pg.muted),
-      PushState.ready => c.push.available ? ('PUSH ON', pg.success) : ('RINGS WHEN OPEN', pg.warning),
-      PushState.failed => ('ERROR', pg.danger),
-    };
-    final canTest = c.pushState == PushState.ready && c.push.available;
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -76,105 +68,19 @@ class _PushPanelState extends State<PushPanel> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          Row(children: <Widget>[
-            Icon(Icons.ring_volume_outlined, size: 15, color: pg.accent.withValues(alpha: 0.85)),
-            const SizedBox(width: 8),
-            Text('INCOMING CALLS',
-                style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
-            const Spacer(),
-            Chip2(chipText, color: chipColor),
-          ]),
-          const SizedBox(height: 8),
-          Text(
-            'Ring this phone for calls to your Vobiz number: while it is open, in the background, '
-            'and after it is swiped away. Run example/push_bridge behind an https tunnel and '
-            'paste the line it prints.',
-            style: TextStyle(fontSize: 11, height: 1.45, color: pg.muted),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            key: const Key('pushServer'),
-            controller: _server,
-            obscureText: !_showServer,
-            autocorrect: false,
-            enableSuggestions: false,
-            keyboardType: TextInputType.url,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-            decoration: InputDecoration(
-              hintText: 'https://….trycloudflare.com#key=…',
-              errorText: _error,
-              suffixIcon: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  IconButton(
-                    tooltip: _showServer ? 'Hide' : 'Show',
-                    icon: Icon(_showServer ? Icons.visibility_off : Icons.visibility, size: 18),
-                    onPressed: () => setState(() => _showServer = !_showServer),
-                  ),
-                  IconButton(
-                    tooltip: 'Paste',
-                    icon: const Icon(Icons.content_paste, size: 18),
-                    onPressed: _paste,
-                  ),
-                ],
-              ),
-            ),
-            onSubmitted: _save,
-            onTapOutside: (_) {
-              FocusScope.of(context).unfocus();
-              if (_server.text.trim() != c.pushServer) _save();
-            },
-          ),
-          const SizedBox(height: 6),
-          Row(children: <Widget>[
-            Expanded(
-              child: Text('Receive calls through the push server',
-                  style: TextStyle(fontSize: 13, color: pg.text)),
-            ),
-            Switch(
-              key: const Key('receiveCalls'),
-              value: c.receiveCalls,
-              onChanged: c.pushServer.isEmpty ? null : c.setReceiveCalls,
-            ),
-          ]),
-          if (c.pushDetail.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(c.pushDetail,
-                  style: TextStyle(
-                      fontSize: 11,
-                      height: 1.4,
-                      color: c.pushState == PushState.failed ? pg.danger : pg.muted)),
-            ),
-          _check(pg, 'Firebase push', c.push.available,
-              c.push.available ? 'Wakes the app when it is closed' : (c.push.problem ?? '')),
-          _check(pg, 'Notifications', c.notificationsAllowed,
-              'The call screen is a notification',
-              action: c.notificationsAllowed == true ? null : c.requestCallPermissions),
-          _check(pg, 'Full-screen call screen', c.fullScreenAllowed,
-              'Rings over the lock screen',
-              action: c.fullScreenAllowed == false ? c.requestCallPermissions : null),
-          _check(pg, 'Remember me', c.rememberMe,
-              'Lets the app sign itself in to answer when it was closed'),
-          const SizedBox(height: 8),
-          OutlinedButton.icon(
-            key: const Key('testCall'),
-            onPressed: canTest ? c.sendTestCall : null,
-            icon: const Icon(Icons.notifications_active_outlined, size: 16),
-            label: const Text('Send a test call in 10 s'),
-          ),
+          ..._incomingCalls(c, pg),
           const SizedBox(height: 14),
           Divider(color: pg.border, height: 1),
           const SizedBox(height: 12),
-          ..._vobizPush(c, pg),
+          ..._sampleServer(c, pg),
         ],
       ),
     );
   }
 
-  /// Ringing a closed app through Vobiz's own push, with no push server:
-  /// Vobiz holds the call, pushes, and sends it to the REGISTER that claims it.
-  List<Widget> _vobizPush(PlaygroundController c, PlaygroundColors pg) {
+  /// Ringing this phone, also when closed, through Vobiz push: Vobiz holds
+  /// the call, pushes, and sends it to the REGISTER that claims it.
+  List<Widget> _incomingCalls(PlaygroundController c, PlaygroundColors pg) {
     final (chipText, chipColor) = switch (c.vobizPushState) {
       PushState.off => ('OFF', pg.faint),
       PushState.registering => ('REGISTERING', pg.muted),
@@ -183,10 +89,10 @@ class _PushPanelState extends State<PushPanel> {
     };
     return <Widget>[
       Row(children: <Widget>[
-        Icon(Icons.cloud_outlined, size: 15, color: pg.accent.withValues(alpha: 0.85)),
+        Icon(Icons.ring_volume_outlined, size: 15, color: pg.accent.withValues(alpha: 0.85)),
         const SizedBox(width: 8),
         Expanded(
-          child: Text('VOBIZ PUSH',
+          child: Text('INCOMING CALLS',
               overflow: TextOverflow.ellipsis,
               style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
         ),
@@ -194,20 +100,32 @@ class _PushPanelState extends State<PushPanel> {
       ]),
       const SizedBox(height: 8),
       Text(
-        'Ring this phone for calls to the SIP user you sign in as, with no push server: Vobiz '
-        'holds the call, pushes this phone, and the app claims the call as it signs in. Needs '
-        "Vobiz's server side for it, and this app's Firebase key under Push Notifications in "
-        'the Vobiz Console.',
+        'Ring this phone for calls to the SIP user you sign in as, also when the app is closed: Vobiz '
+        'holds the call, pushes this phone, and the app claims the call as it signs in. Needs this '
+        "app's Firebase key under Push Notifications in the Vobiz Console. With a sample server line "
+        'below, this phone signs up through the server.',
         style: TextStyle(fontSize: 11, height: 1.45, color: pg.muted),
       ),
       Row(children: <Widget>[
         Expanded(child: Text('Receive calls through Vobiz push', style: TextStyle(fontSize: 13, color: pg.text))),
         Switch(key: const Key('vobizPush'), value: c.vobizPush, onChanged: c.setVobizPush),
       ]),
+      _check(pg, 'Firebase push', c.push.available,
+          c.push.available ? 'Wakes the app when it is closed' : (c.push.problem ?? '')),
+      _check(pg, 'Notifications', c.notificationsAllowed,
+          'The call screen is a notification',
+          action: c.notificationsAllowed == true ? null : c.requestCallPermissions),
+      _check(pg, 'Full-screen call screen', c.fullScreenAllowed,
+          'Rings over the lock screen',
+          action: c.fullScreenAllowed == false ? c.requestCallPermissions : null),
+      _check(pg, 'Remember me', c.rememberMe,
+          'Lets the app sign itself in to answer when it was closed'),
       if (c.vobizPush) ...<Widget>[
+        const SizedBox(height: 8),
         Text(
-          'TEST ONLY: registering this phone takes the account\'s Auth ID and Auth Token (its API '
-          'key). Vobiz has no device sign-in for apps yet. Left empty, the Zero-Config ones are used.',
+          'TEST ONLY: without a sample server line, signing this phone up takes the account\'s Auth ID '
+          'and Auth Token (its API key), sent straight to Vobiz. The test call below always takes them. '
+          'Left empty, the Zero-Config ones are used.',
           style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.warning),
         ),
         const SizedBox(height: 8),
@@ -289,6 +207,77 @@ class _PushPanelState extends State<PushPanel> {
           'call: Vobiz should push this phone, and the app sign back in to take it.',
           style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.faint),
         ),
+      ),
+    ];
+  }
+
+  /// The sample server (example/push_bridge): access tokens, Conference, the
+  /// connection watch and Vobiz push sign-up. It does not wake a closed app.
+  List<Widget> _sampleServer(PlaygroundController c, PlaygroundColors pg) {
+    return <Widget>[
+      Row(children: <Widget>[
+        Icon(Icons.dns_outlined, size: 15, color: pg.accent.withValues(alpha: 0.85)),
+        const SizedBox(width: 8),
+        Text('SAMPLE SERVER',
+            style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
+      ]),
+      const SizedBox(height: 8),
+      Text(
+        'For access tokens, Conference, the connection watch, and signing this phone up for Vobiz push '
+        'without the account\'s Auth Token on the phone. Run example/push_bridge behind an https tunnel '
+        'and paste the line it prints. It does not wake a closed app: Vobiz push does.',
+        style: TextStyle(fontSize: 11, height: 1.45, color: pg.muted),
+      ),
+      const SizedBox(height: 12),
+      TextField(
+        key: const Key('pushServer'),
+        controller: _server,
+        obscureText: !_showServer,
+        autocorrect: false,
+        enableSuggestions: false,
+        keyboardType: TextInputType.url,
+        style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        decoration: InputDecoration(
+          hintText: 'https://….trycloudflare.com#key=…',
+          errorText: _error,
+          suffixIcon: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              IconButton(
+                tooltip: _showServer ? 'Hide' : 'Show',
+                icon: Icon(_showServer ? Icons.visibility_off : Icons.visibility, size: 18),
+                onPressed: () => setState(() => _showServer = !_showServer),
+              ),
+              IconButton(
+                tooltip: 'Paste',
+                icon: const Icon(Icons.content_paste, size: 18),
+                onPressed: _paste,
+              ),
+            ],
+          ),
+        ),
+        onSubmitted: _save,
+        onTapOutside: (_) {
+          FocusScope.of(context).unfocus();
+          if (_server.text.trim() != c.pushServer) _save();
+        },
+      ),
+      const SizedBox(height: 6),
+      Row(children: <Widget>[
+        Expanded(
+          child: Text('Let the sample server watch my calls', style: TextStyle(fontSize: 13, color: pg.text)),
+        ),
+        Switch(
+          key: const Key('connectionWatch'),
+          value: c.connectionWatch,
+          onChanged: c.pushServer.isEmpty ? null : c.setConnectionWatch,
+        ),
+      ]),
+      Text(
+        'During a call the app reports to the server every second. When the reports stop (this phone '
+        'lost its network), the server plays a tone to the other side and ends the call a few seconds '
+        'later. Starts with the next call.',
+        style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.faint),
       ),
     ];
   }

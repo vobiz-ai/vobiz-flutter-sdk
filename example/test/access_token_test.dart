@@ -70,7 +70,31 @@ void main() {
     controller.dispose();
   });
 
-  test('without a token server or a push server it says so, and signs nothing in', () async {
+  test('with no token server, the sample server\'s /token is asked with its key and the user id', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{'vobiz_push_server': 'https://bridge.example#key=k1'});
+    final token = jwt();
+    final requests = <http.Request>[];
+    final controller = make(MockClient((request) async {
+      requests.add(request);
+      return http.Response(jsonEncode(<String, String>{'token': token}), 200);
+    }));
+    await controller.init();
+    controller.setAuthTab(AuthTab.accessToken);
+    controller.tokenUser = 'agent42';
+
+    await controller.connect();
+
+    final asked = requests.single;
+    expect(asked.url.toString(), 'https://bridge.example/token');
+    expect(asked.headers['X-Bridge-Key'], 'k1');
+    expect(asked.headers.containsKey('Authorization'), isFalse);
+    expect(jsonDecode(asked.body), <String, String>{'reason': 'sign_in', 'sub': 'agent42'});
+    expect(client.tokens, <String>[token]);
+    expect(controller.connectedAs, 'agent42_MA_TESTACCT');
+    controller.dispose();
+  });
+
+  test('without a token server or a sample server it says so, and signs nothing in', () async {
     final controller = make(MockClient((_) async => http.Response('{}', 500)));
     await controller.init();
     controller.setAuthTab(AuthTab.accessToken);

@@ -4,7 +4,7 @@
 // Vobiz signs them.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { BRIDGE_KEY, answerCall, postJson, registerDevice, sleep, startBridge, until, webhook, xmlAttr } from './helpers.mjs';
+import { BRIDGE_KEY, answerCall, appAuth, postJson, sleep, startBridge, until, webhook, xmlAttr } from './helpers.mjs';
 
 const CALL = '11111111-2222-4333-8444-555555555555';
 const GUEST_LEG = '22222222-2222-4333-8444-555555555555';
@@ -19,9 +19,6 @@ const CALLER_ID = '+919800000001';
 function vobiz({ owner = 'alice', placed = [ADDED, ADDED_2] } = {}) {
   const queue = [...placed];
   return (method, pathname) => {
-    if (pathname.startsWith('/Endpoint/')) {
-      return { objects: ['alice', 'bob'].map((username) => ({ username })), meta: { total_count: 2 } };
-    }
     if (method === 'GET' && pathname === `/Call/${CALL}/?status=live`) {
       return { call_uuid: CALL, call_status: 'in-progress', from: `sip:${owner}@registrar.vobiz.ai`, to: '919876543210' };
     }
@@ -35,11 +32,11 @@ function vobiz({ owner = 'alice', placed = [ADDED, ADDED_2] } = {}) {
 const calls = (ctx, method, pathname) => ctx.api.filter((c) => c.method === method && c.pathname === pathname);
 const pathOf = (url) => new URL(url).pathname;
 
-/** Alice's phone pairs, and turns call CALL into a conference by adding +919811111111. */
+/** Alice's app turns call CALL into a conference by adding +919811111111. */
 async function startConference({ env = { VOBIZ_NUMBER: CALLER_ID }, owner, placed } = {}) {
   const ctx = await startBridge({ env, apiHandler: vobiz({ owner, placed }) });
-  const alice = await registerDevice(ctx, 'alice');
-  const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111', caller_id: CALLER_ID }, alice.auth);
+  const alice = appAuth('alice');
+  const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111', caller_id: CALLER_ID }, alice);
   const move = calls(ctx, 'POST', `/Call/${CALL}/`)[0];
   const dial = calls(ctx, 'POST', '/Call/')[0];
   return { ctx, alice, added, move, dial };
@@ -60,7 +57,7 @@ async function everyoneJoins(c) {
 }
 
 async function state(c) {
-  return (await postJson(c.ctx, '/conference/state', { call_uuid: CALL }, c.alice.auth)).json;
+  return (await postJson(c.ctx, '/conference/state', { call_uuid: CALL }, c.alice)).json;
 }
 
 const byRole = (s, role) => s.participants.find((p) => p.role === role);
@@ -101,7 +98,7 @@ test('mute, hold, resume and remove act on the right member', async () => {
   try {
     const { events, room } = await everyoneJoins(c);
     const person = byRole(await state(c), 'added');
-    const act = (action) => postJson(c.ctx, '/conference/participant', { call_uuid: CALL, participant_id: person.id, action }, c.alice.auth);
+    const act = (action) => postJson(c.ctx, '/conference/participant', { call_uuid: CALL, participant_id: person.id, action }, c.alice);
 
     assert.equal((await act('mute')).status, 200);
     assert.equal(calls(c.ctx, 'POST', `/Conference/${room}/Member/12/Mute/`).length, 1);
@@ -133,7 +130,7 @@ test('mute, hold, resume and remove act on the right member', async () => {
     assert.equal(removed.reason, 'removed');
 
     assert.equal((await act('mute')).status, 409, 'nobody to mute any more');
-    assert.equal((await postJson(c.ctx, '/conference/participant', { call_uuid: CALL, participant_id: byRole(await state(c), 'host').id, action: 'mute' }, c.alice.auth)).status, 400, 'the app is not a participant to manage');
+    assert.equal((await postJson(c.ctx, '/conference/participant', { call_uuid: CALL, participant_id: byRole(await state(c), 'host').id, action: 'mute' }, c.alice)).status, 400, 'the app is not a participant to manage');
   } finally {
     await c.ctx.stop();
   }
@@ -159,7 +156,7 @@ test('a person who does not answer is shown as not joined, and the call goes on'
   const c = await startConference();
   try {
     const { room } = await everyoneJoins(c);
-    const second = await postJson(c.ctx, '/conference/add', { call_uuid: CALL, number: '+919822222222', caller_id: CALLER_ID }, c.alice.auth);
+    const second = await postJson(c.ctx, '/conference/add', { call_uuid: CALL, number: '+919822222222', caller_id: CALLER_ID }, c.alice);
     assert.equal(second.status, 200);
     assert.equal(calls(c.ctx, 'POST', `/Call/${CALL}/`).length, 1, 'already a conference: not moved again');
     const hangup = calls(c.ctx, 'POST', '/Call/')[1].body.hangup_url;
@@ -180,7 +177,7 @@ test('when the app leaves, the room ends and people on hold are hung up', async 
   try {
     const { events, room } = await everyoneJoins(c);
     const person = byRole(await state(c), 'added');
-    await postJson(c.ctx, '/conference/participant', { call_uuid: CALL, participant_id: person.id, action: 'hold' }, c.alice.auth);
+    await postJson(c.ctx, '/conference/participant', { call_uuid: CALL, participant_id: person.id, action: 'hold' }, c.alice);
     await webhook(c.ctx, events, { ConferenceAction: 'exit', ConferenceName: room, ConferenceMemberID: '12', CallUUID: ADDED });
     await webhook(c.ctx, events, { ConferenceAction: 'exit', ConferenceName: room, ConferenceMemberID: '10', CallUUID: CALL });
     assert.equal((await state(c)).active, false);
@@ -194,7 +191,7 @@ test('end hangs up the room for everyone', async () => {
   const c = await startConference();
   try {
     const { room } = await everyoneJoins(c);
-    const ended = await postJson(c.ctx, '/conference/end', { call_uuid: CALL }, c.alice.auth);
+    const ended = await postJson(c.ctx, '/conference/end', { call_uuid: CALL }, c.alice);
     assert.equal(ended.status, 200);
     assert.equal(ended.json.active, false);
     assert.equal(calls(c.ctx, 'DELETE', `/Conference/${room}/`).length, 1);
@@ -203,21 +200,22 @@ test('end hangs up the room for everyone', async () => {
   }
 });
 
-test('a phone can only turn its own call into a conference', async () => {
+test('an app can only turn its own SIP user\'s call into a conference', async () => {
   const ctx = await startBridge({ env: { VOBIZ_NUMBER: CALLER_ID }, apiHandler: vobiz({ owner: 'alice' }) });
   try {
-    const bob = await registerDevice(ctx, 'bob');
+    const bob = appAuth('bob');
     const body = { call_uuid: CALL, number: '+919811111111' };
     assert.equal((await postJson(ctx, '/conference/add', body)).status, 401, 'no credential');
-    assert.equal((await postJson(ctx, '/conference/add', body, bob.auth)).status, 403, 'bob is not on alice\'s call');
+    assert.equal((await postJson(ctx, '/conference/add', body, { Authorization: 'Bearer abc.def' })).status, 401, 'device tokens are gone');
+    assert.equal((await postJson(ctx, '/conference/add', body, bob)).status, 403, 'bob is not on alice\'s call');
     assert.equal(ctx.api.filter((c) => c.method === 'POST').length, 0, 'nothing was moved or dialled');
 
-    const alice = await registerDevice(ctx, 'alice');
-    const ok = await postJson(ctx, '/conference/add', body, alice.auth);
+    const alice = appAuth('alice');
+    const ok = await postJson(ctx, '/conference/add', body, alice);
     assert.equal(ok.status, 200);
     assert.equal(ok.json.participants[2].label, '+919811111111');
     assert.equal(calls(ctx, 'POST', '/Call/')[0].body.from, CALLER_ID, 'VOBIZ_NUMBER is the default caller ID');
-    assert.equal((await postJson(ctx, '/conference/state', { call_uuid: CALL }, bob.auth)).status, 403, 'bob cannot read it either');
+    assert.equal((await postJson(ctx, '/conference/state', { call_uuid: CALL }, bob)).status, 403, 'bob cannot read it either');
   } finally {
     await ctx.stop();
   }
@@ -240,13 +238,28 @@ test('the bridge key may manage any live call; bad input is refused', async () =
   }
 });
 
-test('an inbound call the bridge rang: the app is the B-leg and hosts', async () => {
-  const ctx = await startBridge({ env: { VOBIZ_NUMBER: CALLER_ID, PUSH_WAIT_SECONDS: '3' }, apiHandler: vobiz() });
+test('an empty or malformed X-Bridge-User is refused, never treated as the key holder', async () => {
+  const ctx = await startBridge({ env: { VOBIZ_NUMBER: CALLER_ID }, apiHandler: vobiz({ owner: 'alice' }) });
   try {
-    const alice = await registerDevice(ctx, 'alice');
+    const body = { call_uuid: CALL, number: '+919811111111', host_leg: 'bleg' };
+    for (const user of ['', 'alice, bob', 'sip user']) {
+      const r = await postJson(ctx, '/conference/add', body, appAuth(user));
+      assert.equal(r.status, 400, `X-Bridge-User "${user}"`);
+    }
+    assert.equal((await postJson(ctx, '/conference/state', { call_uuid: CALL }, appAuth(''))).status, 400);
+    assert.equal(ctx.api.length, 0, 'Vobiz was not even asked');
+  } finally {
+    await ctx.stop();
+  }
+});
+
+test('an inbound call the bridge rang: the app is the B-leg and hosts', async () => {
+  const ctx = await startBridge({ env: { VOBIZ_NUMBER: CALLER_ID, ROUTES: `${CALLER_ID}=alice` }, apiHandler: vobiz() });
+  try {
+    const alice = appAuth('alice');
     const call = await answerCall(ctx, { CallUUID: CALL, From: '+919876543210', To: CALLER_ID, CallStatus: 'ringing' });
     await webhook(ctx, call.events, { Event: 'DialAnswer', DialAction: 'answer', DialBLegTo: 'sip:alice@registrar.vobiz.ai' });
-    const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice.auth);
+    const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice);
     assert.equal(added.status, 200, added.text);
     const move = calls(ctx, 'POST', `/Call/${CALL}/`).find((c) => c.body.legs === 'both');
     assert.match(move.body.bleg_url, /\.host\./, 'the app answered the Dial: B-leg');
@@ -280,10 +293,10 @@ test('in a conference the connection watch does not beep, and a lost host ends t
     deps: { lostBeepMs: 100, lostHangupMs: 30000, confHostLostMs: 300, watchTickMs: 20 },
   });
   try {
-    const alice = await registerDevice(ctx, 'alice');
-    const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice.auth);
+    const alice = appAuth('alice');
+    const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice);
     assert.equal(added.status, 200);
-    await postJson(ctx, '/call/alive', { call_uuid: CALL }, alice.auth);
+    await postJson(ctx, '/call/alive', { call_uuid: CALL }, alice);
     const lastReport = Date.now();
     const ended = await until(() => calls(ctx, 'DELETE', `/Conference/${added.json.room}/`)[0], 3000);
     assert.ok(ended, 'the room was ended once the host had been silent for CONF_HOST_LOST_SECONDS');

@@ -2,16 +2,15 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
-import 'push_call.dart';
-
-/// Where the push bridge is and the key that lets this app register with it.
+/// Where the sample server (`example/push_bridge`) is and the key the app
+/// sends it.
 ///
-/// The bridge prints both as one line, `https://<tunnel>#key=<key>`, so they
+/// The server prints both as one line, `https://<tunnel>#key=<key>`, so they
 /// can be pasted into the app together.
 class PushBridgeConfig {
   const PushBridgeConfig({required this.baseUrl, required this.key});
 
-  /// Reads the line the bridge prints. Null when it is not one.
+  /// Reads the line the server prints. Null when it is not one.
   static PushBridgeConfig? parse(String input) {
     final text = input.trim();
     final hash = text.indexOf('#');
@@ -27,36 +26,9 @@ class PushBridgeConfig {
   final String baseUrl;
   final String key;
 
-  /// Vobiz can only reach the bridge over HTTPS; plain http is for a bridge
+  /// Vobiz can only reach the server over HTTPS; plain http is for a server
   /// on the same network as an emulator.
   bool get isHttps => baseUrl.startsWith('https://');
-}
-
-/// What the bridge said to a registration.
-class PushRegistration {
-  const PushRegistration({required this.username, required this.push, this.warning, this.deviceToken});
-
-  final String username;
-
-  /// The bridge has a Firebase token for this device and can wake it.
-  final bool push;
-  final String? warning;
-
-  /// This phone's own credential with the bridge, returned once when the
-  /// phone pairs (registers with the bridge key). Keep it secret; send it
-  /// from then on instead of the bridge key.
-  final String? deviceToken;
-}
-
-/// What the bridge said to Accept, Decline or "registered" for one call.
-class PerCallReply {
-  const PerCallReply({this.finished = false, this.reason = ''});
-
-  /// The call is already over: nothing to answer.
-  final bool finished;
-
-  /// Why it ended, when the bridge says.
-  final String reason;
 }
 
 class PushBridgeException implements Exception {
@@ -69,144 +41,63 @@ class PushBridgeException implements Exception {
   String toString() => message;
 }
 
-/// The push bridge's HTTP API, as the app uses it.
+/// The sample server's HTTP API, as the app uses it: access tokens and the
+/// connection watch. (Conference goes through the SDK's `VobizConference`,
+/// and Vobiz push sign-up through the SDK's `VobizPushDevices`, with the same
+/// headers.)
 ///
-/// The bridge key only pairs a phone: the first registration sends it and
-/// gets a [PushRegistration.deviceToken] back. Everything after that
-/// (re-registering, unregistering, test calls) sends the device token as
-/// `Authorization: Bearer`, and acts on this phone only.
+/// Every request sends the server's key as `X-Bridge-Key`, and, when
+/// [sipUser] is set, the SIP user the app is signed in as as
+/// `X-Bridge-User`, so the server acts on that user's calls only.
 class PushBridgeApi {
-  PushBridgeApi(this.config, {http.Client? client, this.deviceToken}) : _http = client ?? http.Client();
+  PushBridgeApi(this.config, {http.Client? client, this.sipUser})
+      : _http = client ?? http.Client(),
+        _ownsHttp = client == null;
 
   final PushBridgeConfig config;
   final http.Client _http;
+  final bool _ownsHttp;
 
-  /// This phone's token from an earlier pairing, if any.
-  final String? deviceToken;
+  /// The SIP user the app is signed in as; null or empty when it is not.
+  final String? sipUser;
 
   static const Duration _timeout = Duration(seconds: 10);
 
   /// Shorter for the once-a-second call reports: a late one is useless.
   static const Duration _aliveTimeout = Duration(seconds: 2);
 
-  /// Rings this endpoint for inbound calls, and wakes this device with
-  /// [token] when it is closed (no token: rings only while the app is open).
-  ///
-  /// With a [deviceToken] it re-registers this phone; if the bridge no longer
-  /// knows it (401), it pairs again with the bridge key.
-  Future<PushRegistration> register({
-    required String username,
-    String? token,
-    String platform = 'android',
-    String app = '',
-  }) async {
-    final body = <String, Object?>{
-      'username': username,
-      'token': token,
-      'platform': platform,
-      'app': app,
-    };
-    Map<String, dynamic> json;
-    if (deviceToken != null) {
-      try {
-        json = await _post('/push/register', body, pair: false);
-      } on PushBridgeException catch (e) {
-        if (e.statusCode != 401) rethrow;
-        json = await _post('/push/register', body, pair: true);
-      }
-    } else {
-      json = await _post('/push/register', body, pair: true);
-    }
-    return PushRegistration(
-      username: '${json['username'] ?? username}',
-      push: json['push'] == true,
-      warning: json['warning'] as String?,
-      deviceToken: json['device_token'] as String?,
-    );
-  }
+  /// The headers the sample server authenticates the app by.
+  static Map<String, String> headers(PushBridgeConfig config, {String? sipUser}) => <String, String>{
+        'X-Bridge-Key': config.key,
+        if (sipUser != null && sipUser.isNotEmpty) 'X-Bridge-User': sipUser,
+      };
 
-  /// Forgets this phone on the bridge (device token).
-  Future<void> unregister() => _post('/push/unregister', const <String, Object?>{});
-
-  /// An access token (JWT) the bridge mints with the account's Auth Token,
-  /// for signing in as `<sub>_<auth id>` (the bridge's JWT_SUB unless [sub]
+  /// An access token (JWT) the server mints with the account's Auth Token,
+  /// for signing in as `<sub>_<auth id>` (the server's JWT_SUB unless [sub]
   /// is given). [reason] is the SDK's (`sign_in`, `expiring`, `rejected`,
-  /// `refresh`). Sends the device token when this phone has paired, else
-  /// the bridge key.
+  /// `refresh`).
   Future<String> accessToken({String? sub, required String reason}) async {
-    final body = <String, Object?>{'reason': reason, if (sub != null) 'sub': sub};
-    Map<String, dynamic> json;
-    try {
-      json = await _post('/token', body);
-    } on PushBridgeException catch (e) {
-      if (e.statusCode != 401 || deviceToken == null) rethrow;
-      json = await _post('/token', body, pair: true);
-    }
+    final json = await _post('/token', <String, Object?>{'reason': reason, if (sub != null) 'sub': sub});
     final token = json['token'];
     if (token is! String || token.isEmpty) {
-      throw PushBridgeException('The push server returned no token');
+      throw PushBridgeException('The sample server returned no token');
     }
     return token;
   }
 
   /// During a call, every second: this phone still has its network. When the
-  /// reports stop, the bridge (still online) has Vobiz beep to the other
+  /// reports stop, the server (still online) has Vobiz beep to the other
   /// party, and ends the call once the SDK's 12 s reconnect window is over:
   /// an offline phone's own hangup cannot reach Vobiz.
   Future<void> callAlive(String callUuid) =>
       _post('/call/alive', <String, Object?>{'call_uuid': callUuid}, timeout: _aliveTimeout);
 
-  /// The call ended in the app: the bridge stops watching it.
+  /// The call ended in the app: the server stops watching it.
   Future<void> callEnded(String callUuid) =>
       _post('/call/ended', <String, Object?>{'call_uuid': callUuid}, timeout: _aliveTimeout);
 
-  /// A pretend incoming call to this phone (device token), pushed after
-  /// [delaySeconds] so there is time to lock the phone or swipe the app away.
-  Future<void> sendTestCall({int delaySeconds = 10}) =>
-      _post('/push/test', <String, Object?>{'delay_seconds': delaySeconds});
-
-  /// Tells the bridge the user accepted [call]: it keeps the caller waiting
-  /// while the app starts and signs in. Needs no bridge key, only the call's.
-  /// [PerCallReply.finished] when the call is already over.
-  static Future<PerCallReply> accept(PushCall call, {http.Client? client}) =>
-      _perCall('/push/accept', call, client);
-
-  /// Tells the bridge the user declined [call]: the caller hears busy.
-  static Future<PerCallReply> decline(PushCall call, {http.Client? client}) =>
-      _perCall('/push/decline', call, client);
-
-  /// Tells the bridge this phone is registered while [call] rings, so it
-  /// dials now instead of at the end of its push wait. A reply of
-  /// `too_late` (the Dial already started) needs nothing: the bridge's
-  /// `call_ended` push closes the call screen.
-  static Future<PerCallReply> registered(PushCall call, {http.Client? client}) =>
-      _perCall('/push/registered', call, client);
-
-  static Future<PerCallReply> _perCall(String path, PushCall call, http.Client? client) async {
-    if (call.server.isEmpty || call.callKey.isEmpty) return const PerCallReply();
-    final http_ = client ?? http.Client();
-    try {
-      final response = await http_
-          .post(
-            Uri.parse('${call.server}$path'),
-            headers: const <String, String>{'Content-Type': 'application/json'},
-            body: jsonEncode(<String, String>{'call_id': call.callId, 'call_key': call.callKey}),
-          )
-          .timeout(_timeout);
-      Object? json;
-      try {
-        json = jsonDecode(response.body);
-      } catch (_) {}
-      if (json is! Map) return const PerCallReply();
-      return PerCallReply(finished: json['finished'] == true, reason: '${json['reason'] ?? ''}');
-    } finally {
-      if (client == null) http_.close();
-    }
-  }
-
   Future<Map<String, dynamic>> _post(String path, Map<String, Object?> body,
-      {bool pair = false, Duration timeout = _timeout}) async {
-    final device = deviceToken;
+      {Duration timeout = _timeout}) async {
     final http.Response response;
     try {
       response = await _http
@@ -214,14 +105,13 @@ class PushBridgeApi {
             Uri.parse('${config.baseUrl}$path'),
             headers: <String, String>{
               'Content-Type': 'application/json',
-              if (pair || device == null) 'X-Bridge-Key': config.key,
-              if (!pair && device != null) 'Authorization': 'Bearer $device',
+              ...headers(config, sipUser: sipUser),
             },
             body: jsonEncode(body),
           )
           .timeout(timeout);
     } catch (e) {
-      throw PushBridgeException('Could not reach the push server at ${config.baseUrl} ($e)');
+      throw PushBridgeException('Could not reach the sample server at ${config.baseUrl} ($e)');
     }
     Map<String, dynamic> json = const <String, dynamic>{};
     try {
@@ -230,17 +120,19 @@ class PushBridgeApi {
     } catch (_) {}
     if (response.statusCode == 401) {
       throw PushBridgeException(
-          'The push server did not accept the key. Paste the whole line the bridge printed, '
-          'including #key=…',
+          'The sample server did not accept the key. Paste the whole line it printed, including #key=…',
           statusCode: 401);
     }
     if (response.statusCode >= 400) {
       throw PushBridgeException(
-          '${json['error'] ?? 'The push server answered ${response.statusCode}'}',
+          '${json['error'] ?? 'The sample server answered ${response.statusCode}'}',
           statusCode: response.statusCode);
     }
     return json;
   }
 
-  void close() => _http.close();
+  /// Closes the HTTP client, unless it was passed in.
+  void close() {
+    if (_ownsHttp) _http.close();
+  }
 }

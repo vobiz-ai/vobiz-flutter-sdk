@@ -1,34 +1,35 @@
-// Access tokens: POST /token mints a JWT through the Vobiz API for a paired
-// phone, and a phone signed in with one registers as "<sub>_<auth id>".
+// Access tokens: POST /token mints a JWT through the Vobiz API for the app
+// (bridge key), and an app signed in with one is the SIP user
+// "<sub>_<auth id>", which ROUTES can ring.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AUTH_ID, BRIDGE_KEY, fcmToken, postJson, registerDevice, startBridge } from './helpers.mjs';
+import { AUTH_ID, BRIDGE_KEY, answerCall, appAuth, postJson, startBridge } from './helpers.mjs';
 
-/** A fake Vobiz API that mints `minted-<sub>` tokens and lists the usual endpoints. */
+/** A fake Vobiz API that mints `minted-<sub>` tokens. */
 function tokenApi(calls) {
   return (method, pathname, body) => {
     if (pathname === '/JWT/Token/') {
       calls.push(body);
       return { token: `minted-${body.sub}` };
     }
-    if (pathname.startsWith('/Endpoint/')) {
-      return { objects: [{ username: 'alice' }], meta: { total_count: 1 } };
-    }
     return { message: 'ok' };
   };
 }
 
-test('/token needs the bridge key or a paired phone\'s device token', async (t) => {
+test('/token needs the bridge key; a bad X-Bridge-User is refused', async (t) => {
   const minted = [];
   const ctx = await startBridge({ apiHandler: tokenApi(minted) });
   t.after(ctx.stop);
   assert.equal((await postJson(ctx, '/token', {})).status, 401);
-  assert.equal((await postJson(ctx, '/token', {}, { Authorization: 'Bearer abc.def' })).status, 401);
+  assert.equal((await postJson(ctx, '/token', {}, { Authorization: 'Bearer abc.def' })).status, 401, 'device tokens are gone');
+  assert.equal((await postJson(ctx, '/token', {}, { 'X-Bridge-Key': 'wrong-key-0123456789' })).status, 401);
+  assert.equal((await postJson(ctx, '/token', {}, appAuth(''))).status, 400, 'an empty X-Bridge-User is not the key holder');
+  assert.equal((await postJson(ctx, '/token', {}, appAuth('not a user'))).status, 400);
   assert.deepEqual(minted, []);
 
-  const alice = await registerDevice(ctx, 'alice');
-  const r = await postJson(ctx, '/token', { reason: 'sign_in' }, alice.auth);
-  assert.equal(r.status, 200);
+  assert.equal((await postJson(ctx, '/token', { reason: 'sign_in' }, appAuth())).status, 200);
+  assert.equal((await postJson(ctx, '/token', { reason: 'refresh' }, appAuth(`flutter-app_${AUTH_ID}`))).status, 200);
+  assert.equal(minted.length, 2);
 });
 
 test('/token mints with the account as issuer, both grants and the configured lifetime', async (t) => {
@@ -79,7 +80,7 @@ test('/token reports a Vobiz refusal as 502', async (t) => {
   const ctx = await startBridge({
     apiHandler: (method, pathname) => {
       if (pathname === '/JWT/Token/') throw new Error('POST /JWT/Token/ → 400 invalid app');
-      return { objects: [], meta: { total_count: 0 } };
+      return { message: 'ok' };
     },
   });
   t.after(ctx.stop);
@@ -88,18 +89,9 @@ test('/token reports a Vobiz refusal as 502', async (t) => {
   assert.ok(ctx.logs.some((l) => l.includes('could not mint an access token')));
 });
 
-test('a phone signed in with a token registers as <sub>_<auth id>; another account\'s suffix is refused', async (t) => {
-  const ctx = await startBridge();
+test('a token identity <sub>_<auth id> listed in ROUTES is rung as a <User>', async (t) => {
+  const ctx = await startBridge({ env: { ROUTES: `+918000000001=agent42_${AUTH_ID}` } });
   t.after(ctx.stop);
-  const ok = await postJson(ctx, '/push/register',
-    { username: `agent42_${AUTH_ID}`, token: fcmToken('tok') }, { 'X-Bridge-Key': BRIDGE_KEY });
-  assert.equal(ok.status, 200);
-  assert.deepEqual(Object.values(ctx.bridge.state.devices).map((d) => d.username), [`agent42_${AUTH_ID}`]);
-
-  const foreign = await postJson(ctx, '/push/register',
-    { username: 'agent42_MA_SOMEONEELSE', token: fcmToken('x') }, { 'X-Bridge-Key': BRIDGE_KEY });
-  assert.equal(foreign.status, 403);
-  const bare = await postJson(ctx, '/push/register',
-    { username: `_${AUTH_ID}`, token: fcmToken('y') }, { 'X-Bridge-Key': BRIDGE_KEY });
-  assert.equal(bare.status, 403);
+  const call = await answerCall(ctx, { CallUUID: 'c1', From: '+919800000001', To: '+918000000001' });
+  assert.match(call.text, new RegExp(`<User [^>]*>sip:agent42_${AUTH_ID}@registrar\\.vobiz\\.ai</User>`));
 });

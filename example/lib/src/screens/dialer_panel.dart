@@ -57,7 +57,6 @@ class _DialerPanelState extends State<DialerPanel> {
             ],
           ),
           const SizedBox(height: 16),
-          if (c.callWaiting != null) _callWaiting(c, pg),
           Expanded(
             child: AnimatedOpacity(
               duration: const Duration(milliseconds: 200),
@@ -73,29 +72,6 @@ class _DialerPanelState extends State<DialerPanel> {
             ),
         ],
       ),
-    );
-  }
-
-  /// A call that arrived while this line is busy. No full-screen ringing:
-  /// show who it is and let it be declined.
-  Widget _callWaiting(PlaygroundController c, PlaygroundColors pg) {
-    return Container(
-      key: const Key('callWaiting'),
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
-      decoration: BoxDecoration(
-        color: pg.warning.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Row(children: <Widget>[
-        Icon(Icons.phone_paused, size: 18, color: pg.warning),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Text('Call waiting: ${c.callWaiting!.caller}',
-              style: TextStyle(fontSize: 13, color: pg.text)),
-        ),
-        TextButton(onPressed: c.declineWaitingCall, child: const Text('Decline')),
-      ]),
     );
   }
 

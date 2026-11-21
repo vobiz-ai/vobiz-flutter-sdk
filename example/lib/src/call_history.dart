@@ -17,7 +17,8 @@ enum CallOutcome {
   /// Another phone, browser or device took it. Not a missed call.
   answeredElsewhere,
 
-  /// Arrived while this phone was on another call.
+  /// Arrived while this phone was on another call. No longer logged; kept so
+  /// call logs saved by earlier versions still load.
   busy,
 
   /// Placed from this phone.
@@ -76,7 +77,8 @@ class CallRecord {
     );
   }
 
-  /// The bridge's call id (PushRef) when there is one, else the SIP Call-ID.
+  /// The sample server's call id (PushRef), the push's call id, or the SIP
+  /// Call-ID.
   final String id;
   final bool inbound;
 

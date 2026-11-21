@@ -164,7 +164,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
                 title: 'Token server',
                 message: 'Your backend\'s route that returns {"token": "<JWT>"}. It mints the token '
                     'with POST /api/v1/Account/{auth_id}/JWT/Token/, so the Auth Token stays on the '
-                    'server. The Vobiz WebRTC demo\'s /token works. Leave it empty to use the push '
+                    'server. The Vobiz WebRTC demo\'s /token works. Leave it empty to use the sample '
                     'server\'s /token.')),
         TextField(
           key: const Key('tokenServer'),
@@ -173,7 +173,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
           keyboardType: TextInputType.url,
           decoration: InputDecoration(
             hintText: c.bridgeConfig != null
-                ? 'Empty: the push server\'s /token'
+                ? 'Empty: the sample server\'s /token'
                 : 'https://<your server>/token',
             errorText: _missing(c, 'tokenServer'),
           ),
@@ -183,14 +183,14 @@ class _IdentityPanelState extends State<IdentityPanel> {
         const SectionLabel('User ID',
             trailing: InfoTip(
                 title: 'User ID (sub)',
-                message: 'Who the push server\'s /token signs you in as: you register as '
-                    '<User ID>_<Auth ID>. Empty: the bridge\'s JWT_SUB. Your own token server '
+                message: 'Who the sample server\'s /token signs you in as: you register as '
+                    '<User ID>_<Auth ID>. Empty: the server\'s JWT_SUB. Your own token server '
                     'decides this itself.')),
         TextField(
           key: const Key('tokenUser'),
           controller: _tokenUser,
           autocorrect: false,
-          decoration: const InputDecoration(hintText: 'e.g. agent42 (push server only)'),
+          decoration: const InputDecoration(hintText: 'e.g. agent42 (sample server only)'),
           onChanged: (v) => c.tokenUser = v,
           onSubmitted: (_) => c.connect(),
         ),
@@ -506,9 +506,9 @@ class _IdentityPanelState extends State<IdentityPanel> {
             'Answer URL handles your outbound calls; to ring you, dial '
             '<User>sip:<sub>_<Auth ID>@registrar.vobiz.ai</User>.'),
         qa('How do calls to my Vobiz number reach this phone?',
-            'The push bridge in example/push_bridge answers the number. It rings this app over SIP and sends a '
-            'Firebase push that wakes it when it is in the background or closed. Accept on the call screen opens '
-            'the app, which signs in and answers.'),
+            'The sample server in example/push_bridge answers the number and rings your SIP user with one '
+            '<Dial>. If the app is closed, Vobiz holds the call and pushes this phone (Incoming calls, above); '
+            'the app signs in and takes it.'),
       ],
     );
   }
