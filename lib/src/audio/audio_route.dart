@@ -66,8 +66,9 @@ abstract class AudioDeviceBackend {
   Future<void> selectAudioOutput(String deviceId);
   Future<void> setSpeakerphoneOn(bool enabled);
 
-  /// Calls [onChange] whenever an output appears or disappears.
-  void listenForDeviceChanges(void Function() onChange);
+  /// Calls [onChange] whenever an output appears or disappears, until the
+  /// returned function is called.
+  void Function() listenForDeviceChanges(void Function() onChange);
 }
 
 class FlutterWebRtcAudioBackend implements AudioDeviceBackend {
@@ -85,18 +86,34 @@ class FlutterWebRtcAudioBackend implements AudioDeviceBackend {
   Future<void> setSpeakerphoneOn(bool enabled) =>
       Helper.setSpeakerphoneOn(enabled);
 
+  /// flutter_webrtc has one device-change handler for the whole app: the
+  /// one already there (the app's own, say) keeps being called, and gets
+  /// its place back when this one stops, unless another took it since.
   @override
-  void listenForDeviceChanges(void Function() onChange) {
-    navigator.mediaDevices.ondevicechange = (_) => onChange();
+  void Function() listenForDeviceChanges(void Function() onChange) {
+    final devices = navigator.mediaDevices;
+    final previous = devices.ondevicechange;
+    final handler = (dynamic event) {
+      previous?.call(event);
+      onChange();
+    };
+    devices.ondevicechange = handler;
+    return () {
+      if (identical(devices.ondevicechange, handler)) {
+        devices.ondevicechange = previous;
+      }
+    };
   }
 }
 
 /// Lists and selects call audio outputs, and puts the route back to the
 /// default (earpiece, or a connected headset) between calls.
 ///
-/// The route the SDK reports is the one it last selected. The platform can
-/// still move audio on its own (a headset connects mid-call), which
-/// [routeChanges] reports when flutter_webrtc signals a device change.
+/// The route the SDK reports is the one it last selected, or the default
+/// after speaker-off and between calls. When the output in use goes away (a
+/// headset disconnects), [routeChanges] reports the default the platform
+/// falls back to. A headset that connects while another output is in use is
+/// listed by [availableDevices] but not reported as the route.
 class AudioRouteController {
   AudioRouteController({
     AudioDeviceBackend backend = const FlutterWebRtcAudioBackend(),
@@ -112,6 +129,8 @@ class AudioRouteController {
 
   AudioRoute _route = AudioRoute.earpiece;
   bool _listening = false;
+  bool _disposed = false;
+  void Function()? _stopListening;
   bool? _bluetoothPermitted;
 
   /// See [BluetoothPermissionRequester].
@@ -210,8 +229,9 @@ class AudioRouteController {
     _setRoute(enabled ? AudioRoute.speaker : await _defaultRoute());
   }
 
-  /// Puts the route back to the default so the next call does not start on
-  /// the loudspeaker while the app shows the earpiece. Called when the last
+  /// Puts the route back to the default (earpiece, or a connected headset,
+  /// which speaker-off prefers) so the next call does not start on the
+  /// loudspeaker while the app shows the earpiece. Called when the last
   /// call ends.
   Future<void> reset() async {
     try {
@@ -219,10 +239,15 @@ class AudioRouteController {
     } catch (e) {
       _logger.warn('Could not reset the audio route: $e');
     }
-    _setRoute(AudioRoute.earpiece);
+    _setRoute(await _defaultRoute());
   }
 
+  /// Stops reporting route changes and hands flutter_webrtc's device-change
+  /// handler back.
   Future<void> dispose() async {
+    _disposed = true;
+    _stopListening?.call();
+    _stopListening = null;
     await _routeChanges.close();
   }
 
@@ -277,13 +302,14 @@ class AudioRouteController {
   }
 
   void _listen() {
-    if (_listening) return;
+    if (_listening || _disposed) return;
     _listening = true;
     try {
-      _backend.listenForDeviceChanges(() async {
+      _stopListening = _backend.listenForDeviceChanges(() async {
+        if (_disposed) return;
         // A headset that vanished takes its route with it.
         final routes = await availableRoutes();
-        if (!routes.contains(_route) && routes.isNotEmpty) {
+        if (!_disposed && !routes.contains(_route) && routes.isNotEmpty) {
           _setRoute(await _defaultRoute());
         }
       });

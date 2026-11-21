@@ -134,6 +134,11 @@ class VobizAccessToken {
   /// The SIP user this token registers as: `<sub>_<iss>`, the name to put in
   /// `<Dial><User>sip:<sipUsername>@registrar.vobiz.ai</User></Dial>` to ring
   /// this user.
+  ///
+  /// A token without `sub` gets a made-up one-off name instead, a new one on
+  /// every [VobizAccessToken.parse] of it. A client keeps the name it signed
+  /// in with across `updateAccessToken`, so `VobizClient.sipUsername` is the
+  /// registered name, not this.
   final String sipUsername;
 
   /// Whether the token allows outgoing calls (`outgoing_allow: true`).

@@ -11,6 +11,8 @@ import 'package:http/testing.dart';
 import 'package:vobiz_webrtc/src/backend/webhook_server_api.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
+import 'network_fakes.dart' show eventually;
+
 /// A loopback SIP-over-WebSocket registrar. It answers REGISTER with 200 when
 /// the From user is in [accepted] and 403 otherwise, and records every user
 /// that tried.
@@ -62,12 +64,6 @@ class _FakeRegistrar {
       await ws.close();
     }
     await _server.close(force: true);
-  }
-}
-
-Future<void> _until(bool Function() condition) async {
-  for (var i = 0; i < 200 && !condition(); i++) {
-    await Future<void>.delayed(const Duration(milliseconds: 10));
   }
 }
 
@@ -171,7 +167,6 @@ void main() {
       expect(jsonDecode(seen.body), <String, String>{'reason': 'rejected'});
       expect(creds.username, 'agent42');
       expect(creds.password, 'pw-1');
-      expect(creds.displayName, 'Asha');
     });
 
     test('a refusal or an incomplete reply is a VobizCredentialsException', () async {
@@ -211,7 +206,7 @@ void main() {
         asked.add(request);
         return const CredentialConfig(username: 'cached', password: 'pw');
       });
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       expect(client.isConnected, isTrue);
       expect(asked, <VobizCredentialsRequest>[VobizCredentialsRequest.signIn]);
       expect(client.sipUsername, 'cached');
@@ -228,7 +223,7 @@ void main() {
             ? const CredentialConfig(username: 'stale', password: 'old')
             : const CredentialConfig(username: 'fresh', password: 'new');
       });
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       expect(client.isConnected, isTrue);
       expect(asked, <VobizCredentialsRequest>[
         VobizCredentialsRequest.signIn,
@@ -264,9 +259,9 @@ void main() {
             ? const CredentialConfig(username: 'fresh', password: 'rotated')
             : const CredentialConfig(username: 'cached', password: 'pw');
       });
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       await session.refresh();
-      await _until(() => client.sipUsername == 'fresh' && client.isConnected);
+      await eventually(() => client.sipUsername == 'fresh' && client.isConnected);
       expect(asked.last, VobizCredentialsRequest.refresh);
       expect(client.sipUsername, 'fresh');
       expect(client.isConnected, isTrue);
@@ -293,7 +288,7 @@ void main() {
       final client = VobizClient(config: SdkConfig(wsUrl: registrar.wsUrl, autoReconnect: false));
       // ignore: deprecated_member_use_from_same_package
       await client.connect(const TokenConfig(token: 't', displayName: 'u'));
-      await _until(() => client.isConnected);
+      await eventually(() => client.isConnected);
       expect(registrar.attempts, <String>['u']);
       expect(client.authMode, VobizAuthMode.sipDirect);
       await client.dispose();

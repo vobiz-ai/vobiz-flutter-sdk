@@ -7,6 +7,7 @@ import '../errors/vobiz_exception.dart';
 import '../events/connection_event.dart';
 import '../events/error_event.dart';
 import '../models/auth/auth_mode.dart';
+import '../state/connection_state.dart';
 import '../state/registration_state.dart';
 
 /// Why the SDK is asking the app's [VobizAccessTokenProvider] for a token.
@@ -50,6 +51,15 @@ extension VobizClientAccessTokenProvider on VobizClient {
   /// row before the session gives up and reports it on
   /// [VobizAccessTokenSession.failures].
   ///
+  /// The expiry is timed by the registrar's own count of the time a token
+  /// has left (from its 200 OK) once it has accepted that token, so a phone
+  /// whose clock is wrong still renews in time; until then, by the device's
+  /// clock. When the provider fails, or the token it returns cannot be
+  /// presented, the session asks again after
+  /// [VobizAccessTokenSession.firstRetryDelay], doubling the wait up to
+  /// [VobizAccessTokenSession.maximumRetryDelay], and reports each failure on
+  /// [VobizAccessTokenSession.failures].
+  ///
   /// A token the registrar calls not valid yet (10005, its clock behind the
   /// minting server's) is presented again after
   /// [VobizAccessTokenSession.notValidYetRetryDelay] instead of asking for a
@@ -61,8 +71,14 @@ extension VobizClientAccessTokenProvider on VobizClient {
   /// Completes once the REGISTER has been sent; watch
   /// [VobizClient.connectionEvents] for the registrar's answer. Throws
   /// [VobizAccessTokenException] when the provider fails or returns
-  /// something that is not a Vobiz token. Dispose the session when the user
-  /// signs out (it does not disconnect the client).
+  /// something that is not a Vobiz token; nothing is left running then.
+  /// When the socket cannot be opened, the client's error is thrown unless
+  /// the client retries the connection by itself (`SdkConfig.autoReconnect`):
+  /// then the session is returned and keeps the token fresh, and the failure
+  /// is reported on [VobizClient.connectionEvents] and
+  /// [VobizClient.errorEvents] (`connect_failed`). Dispose the session when
+  /// the user signs out (it does not disconnect the client); a client signed
+  /// out without it stops the session's timers, and nothing more is asked.
   Future<VobizAccessTokenSession> connectWithAccessTokenProvider(
     VobizAccessTokenProvider provider, {
     Duration refreshBefore = const Duration(seconds: 60),
@@ -100,6 +116,15 @@ class VobizAccessTokenSession {
   /// problem, so the same one is presented again.
   static const Duration notValidYetRetryDelay = Duration(seconds: 3);
 
+  /// How long to wait before asking the provider again after it failed, or
+  /// after the token it returned could not be presented. Each failure in a
+  /// row doubles the wait, up to [maximumRetryDelay].
+  static const Duration firstRetryDelay = Duration(seconds: 5);
+
+  /// The longest wait between two attempts: after failures in a row, and
+  /// between tokens that arrive (nearly) expired.
+  static const Duration maximumRetryDelay = Duration(seconds: 60);
+
   /// The clock the refresh is scheduled by.
   @visibleForTesting
   static DateTime Function() now = DateTime.now;
@@ -119,20 +144,41 @@ class VobizAccessTokenSession {
   final StreamController<VobizException> _failures =
       StreamController<VobizException>.broadcast();
 
+  /// The next time the provider is asked: ahead of the current token's
+  /// expiry, or a retry after a failure.
   Timer? _timer;
   Timer? _retryTimer;
   DateTime? _nextRefresh;
   String? _current;
+
+  /// The last token the registrar accepted (a `registered` event with it).
+  String? _registered;
+
+  /// The wait before the pending retry, while retrying after failures.
+  Duration? _retryDelay;
+
+  /// What [_timer] asks the provider for.
+  VobizAccessTokenRequest _pendingRequest = VobizAccessTokenRequest.expiring;
+
+  /// The wait used for a token that arrived (nearly) expired, and the token
+  /// it was used for: doubled for each such token in a row.
+  Duration? _clampedDelay;
+  String? _clampedFor;
+
   int _consecutiveRefreshes = 0;
   bool _busy = false;
   bool _disposed = false;
 
-  /// When the session will next ask for a token; null when nothing is
-  /// scheduled (after a failure, or once disposed).
+  /// When the session will next ask for a token: ahead of the current
+  /// token's expiry, or the retry after a failure. Null when nothing is
+  /// scheduled: the session gave up, the client was signed out, or the
+  /// session was disposed.
   DateTime? get nextRefreshAt => _nextRefresh;
 
-  /// Failures the session could not recover from: the provider threw, or the
-  /// registrar kept refusing fresh tokens.
+  /// Failures the session reports: each failed attempt to get a token or
+  /// present it (the session asks again after [firstRetryDelay], doubling the
+  /// wait), and those it gives up on: the registrar kept refusing fresh
+  /// tokens, or a token is for another user.
   Stream<VobizException> get failures => _failures.stream;
 
   /// Asks the provider for a new token now and registers with it.
@@ -142,11 +188,7 @@ class VobizAccessTokenSession {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
-    _timer?.cancel();
-    _timer = null;
-    _retryTimer?.cancel();
-    _retryTimer = null;
-    _nextRefresh = null;
+    _stopTimers();
     await _errorSub.cancel();
     await _connectionSub.cancel();
     await _failures.close();
@@ -154,7 +196,11 @@ class VobizAccessTokenSession {
 
   Future<void> _signIn() async {
     final token = await _fetch(VobizAccessTokenRequest.signIn);
-    await client.connectWithAccessToken(token);
+    try {
+      await client.connectWithAccessToken(token);
+    } catch (_) {
+      if (!_clientRetriesWith(token)) rethrow;
+    }
     _schedule();
   }
 
@@ -164,12 +210,23 @@ class VobizAccessTokenSession {
     try {
       final token = await _fetch(request);
       if (_disposed) return;
-      await client.updateAccessToken(token);
+      try {
+        await client.updateAccessToken(token);
+      } catch (_) {
+        if (!_clientRetriesWith(token)) rethrow;
+      }
+      _retryDelay = null;
       _schedule();
     } finally {
       _busy = false;
     }
   }
+
+  /// Whether the client took [token] and, its connection having failed,
+  /// retries it by itself (`SdkConfig.autoReconnect`): the token is in use.
+  bool _clientRetriesWith(String token) =>
+      client.accessToken?.token == token.trim() &&
+      client.connectionState == ConnectionStateStatus.reconnecting;
 
   Future<String> _fetch(VobizAccessTokenRequest request) async {
     final String token;
@@ -189,44 +246,118 @@ class VobizAccessTokenSession {
   }
 
   /// Asks for the next token [refreshBefore] ahead of the current one's
-  /// expiry (never sooner than [minimumRefreshDelay]).
+  /// expiry. A token that arrives with less than that left is renewed after
+  /// [minimumRefreshDelay], twice as long for the next such token in a row,
+  /// up to [maximumRetryDelay].
   void _schedule() {
-    _timer?.cancel();
     final current = client.accessToken;
     if (_disposed || current == null) {
-      _nextRefresh = null;
+      _stopTimers();
       return;
     }
-    final at = now();
-    var delay = current.expiresAt.difference(at) - refreshBefore;
-    if (delay < minimumRefreshDelay) delay = minimumRefreshDelay;
-    _nextRefresh = at.add(delay);
+    // Once the registrar has accepted this token, its own count of the time
+    // left (at that 200 OK) beats the device's clock, which can be wrong.
+    final registrarLeft = _registered == current.token ? client.accessTokenTimeLeft : null;
+    var delay = (registrarLeft ?? current.expiresAt.difference(now())) - refreshBefore;
+    if (delay < minimumRefreshDelay) {
+      if (_clampedFor != current.token) {
+        _clampedFor = current.token;
+        final last = _clampedDelay;
+        _clampedDelay = last == null ? minimumRefreshDelay : _shorter(last * 2, maximumRetryDelay);
+      }
+      delay = _clampedDelay!;
+    } else {
+      _clampedDelay = null;
+      _clampedFor = null;
+    }
+    _arm(delay, VobizAccessTokenRequest.expiring);
+  }
+
+  /// Asks the provider for a token ([request]) after [delay].
+  void _arm(Duration delay, VobizAccessTokenRequest request) {
+    _timer?.cancel();
+    _pendingRequest = request;
+    _nextRefresh = now().add(delay);
     _timer = Timer(delay, () {
       _timer = null;
-      _renew(VobizAccessTokenRequest.expiring).catchError((Object e) {
-        _nextRefresh = null;
-        _fail(e is VobizException
-            ? e
-            : VobizAccessTokenException('Renewing the access token failed: $e', cause: e));
-      });
+      _nextRefresh = null;
+      // Signed out (or signed in another way) without disposing the session.
+      if (_disposed || client.authMode != VobizAuthMode.accessToken) return;
+      final request = _pendingRequest;
+      _renew(request).catchError((Object e) => _renewFailed(request, e));
     });
   }
 
-  void _onConnection(ConnectionEvent event) {
-    if (event.registrationState == RegistrationState.registered) {
-      _consecutiveRefreshes = 0;
+  /// Reports a failed renewal and asks again later, unless asking again
+  /// cannot help.
+  void _renewFailed(VobizAccessTokenRequest request, Object e) {
+    if (_disposed) return;
+    if (client.authMode != VobizAuthMode.accessToken) {
+      // Signed out meanwhile: nothing to renew, and nothing to report.
+      _stopTimers();
+      return;
     }
+    _fail(e is VobizException
+        ? e
+        : VobizAccessTokenException(
+            request == VobizAccessTokenRequest.rejected
+                ? 'Signing in again failed: $e'
+                : 'Renewing the access token failed: $e',
+            cause: e));
+    // A token for another user: another one from the same provider will be too.
+    if (e is StateError || e is ArgumentError) {
+      _stopTimers();
+      return;
+    }
+    final last = _retryDelay;
+    final delay = last == null ? firstRetryDelay : _shorter(last * 2, maximumRetryDelay);
+    _retryDelay = delay;
+    _arm(delay, request);
+  }
+
+  void _stopTimers() {
+    _timer?.cancel();
+    _timer = null;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _nextRefresh = null;
+    _retryDelay = null;
+  }
+
+  static Duration _shorter(Duration a, Duration b) => a < b ? a : b;
+
+  void _onConnection(ConnectionEvent event) {
+    if (_disposed) return;
+    if (client.authMode != VobizAuthMode.accessToken) {
+      // Signed out, or signed in another way: there is nothing to renew.
+      _stopTimers();
+      return;
+    }
+    if (event.registrationState != RegistrationState.registered) return;
+    _consecutiveRefreshes = 0;
+    final token = client.accessToken?.token;
+    if (token == null || token == _registered) return;
+    _registered = token;
+    // Time the pending refresh by the registrar's clock now that it has
+    // accepted this token. A retry after a failure keeps its own time.
+    if (_timer != null && _retryDelay == null) _schedule();
   }
 
   void _onError(ErrorEvent event) {
     if (_disposed || _busy) return;
     if (event.code != VobizErrorCode.registrationFailed) return;
     if (client.authMode != VobizAuthMode.accessToken) return;
+    if (_retryDelay != null && _timer != null) {
+      // Already asking again after a failure, and no new token was presented
+      // yet: the registrar refused the old one. Ask for a new one, not a
+      // cached one, at that retry.
+      _pendingRequest = VobizAccessTokenRequest.rejected;
+      return;
+    }
     final cause = event.cause;
     final tokenError = cause is VobizAccessTokenException ? cause.tokenError : null;
     if (_consecutiveRefreshes >= maxRefreshes) {
-      _timer?.cancel();
-      _nextRefresh = null;
+      _stopTimers();
       _fail(VobizAccessTokenException(
           'The registrar refused the access token, also after asking the provider '
           'for a new one: ${event.message}',
@@ -242,7 +373,7 @@ class VobizAccessTokenSession {
       _retryTimer?.cancel();
       _retryTimer = Timer(notValidYetRetryDelay, () {
         _retryTimer = null;
-        if (_disposed) return;
+        if (_disposed || client.authMode != VobizAuthMode.accessToken) return;
         client.updateAccessToken(current).then((_) => _schedule()).catchError((Object e) {
           _fail(e is VobizException
               ? e
@@ -251,11 +382,8 @@ class VobizAccessTokenSession {
       });
       return;
     }
-    _renew(VobizAccessTokenRequest.rejected).catchError((Object e) {
-      _fail(e is VobizException
-          ? e
-          : VobizAccessTokenException('Signing in again failed: $e', cause: e));
-    });
+    _renew(VobizAccessTokenRequest.rejected)
+        .catchError((Object e) => _renewFailed(VobizAccessTokenRequest.rejected, e));
   }
 
   void _fail(VobizException e) {

@@ -95,8 +95,10 @@ void main() {
       expect(h.backend.speakerPreferred, isFalse,
           reason: 'the plugin keeps preferring the speaker otherwise');
       expect(h.service.audioRoutes.currentRoute, AudioRoute.earpiece);
-      // The reset happens before the PC is disposed (audio switch still up).
-      expect(h.backend.calls.last, 'speaker:false');
+      // The reset happens before the PC is disposed: on Android the audio
+      // switch stops with the last connection.
+      expect(h.log, containsAllInOrder(<String>['speaker:false', 'peer:dispose']));
+      expect(h.log.lastIndexOf('speaker:false'), lessThan(h.log.indexOf('peer:dispose')));
     });
 
     test('a route change is reported as an event', () async {

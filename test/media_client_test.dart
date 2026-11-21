@@ -10,6 +10,7 @@ import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 
 import 'media_fakes.dart';
+import 'sip_test_support.dart' show respond;
 
 String _inboundInvite(String body) =>
     'INVITE sip:abcd@203.0.113.5;transport=ws SIP/2.0\r\n'
@@ -20,23 +21,6 @@ String _inboundInvite(String body) =>
     'Contact: <sip:Vobiz@10.0.2.9:5060>\r\n'
     'Content-Type: application/sdp\r\n'
     'Content-Length: ${utf8.encode(body).length}\r\n\r\n$body';
-
-String _response(String callId, int code, String reason, String cseq,
-        {String body = ''}) =>
-    'SIP/2.0 $code $reason\r\n'
-    'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bKx\r\n'
-    'From: <sip:play1@registrar.vobiz.ai>;tag=t\r\n'
-    'To: <sip:+918000000000@10.0.2.9>;tag=ms\r\n'
-    'Call-ID: $callId\r\nCSeq: $cseq\r\n'
-    'Contact: <sip:Vobiz@10.0.2.9:5060>\r\n'
-    '${body.isEmpty ? '' : 'Content-Type: application/sdp\r\n'}'
-    'Content-Length: ${utf8.encode(body).length}\r\n\r\n$body';
-
-String _header(String msg, String name) => msg
-    .split('\r\n')
-    .firstWhere((l) => l.startsWith('$name:'), orElse: () => '')
-    .substring(name.length + 1)
-    .trim();
 
 class _Rig {
   _Rig() {
@@ -92,9 +76,7 @@ class _Rig {
   /// Answers the last re-INVITE with [code].
   void answerReInvite(int code, {String body = ''}) {
     final reinvite = sent.lastWhere((m) => m.startsWith('INVITE'));
-    sip.debugReceive(_response('in-1', code, code == 200 ? 'OK' : 'Refused',
-        _header(reinvite, 'CSeq'),
-        body: body));
+    sip.debugReceive(respond(reinvite, code, code == 200 ? 'OK' : 'Refused', body: body));
   }
 
   Future<void> dispose() async {
@@ -192,6 +174,7 @@ void main() {
       await rig.connectedCall();
       await rig.client.sendDtmf('123');
       expect(rig.methods, isNot(contains('INFO')));
+      expect(rig.media.peer.fakeSenders.single.dtmf.sent, <String>['123/100/70']);
       await rig.dispose();
     });
 
@@ -225,13 +208,11 @@ void main() {
       expect(rig.client.isConnected, isTrue);
       await rig.client.makeCall('+919876543210');
       final invite = rig.sent.lastWhere((m) => m.startsWith('INVITE'));
-      final callId = _header(invite, 'Call-ID');
-      final cseq = _header(invite, 'CSeq');
-      rig.sip.debugReceive(_response(callId, 183, 'Session Progress', cseq, body: audioSdp));
+      rig.sip.debugReceive(respond(invite, 183, 'Session Progress', body: audioSdp));
       await _settle();
       expect(rig.media.peer.remoteSet.single.type, 'pranswer');
       expect(early, hasLength(1));
-      rig.sip.debugReceive(_response(callId, 200, 'OK', cseq));
+      rig.sip.debugReceive(respond(invite, 200, 'OK'));
       await _settle();
       expect(rig.media.peer.remoteSet.last.type, 'answer');
       expect(rig.media.peer.remoteSet.last.sdp, audioSdp);

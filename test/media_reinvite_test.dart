@@ -3,6 +3,8 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 
+import 'sip_test_support.dart' show respond;
+
 const String _invite = 'INVITE sip:abcd@203.0.113.5;transport=ws SIP/2.0\r\n'
     'Record-Route: <sip:10.0.1.5:443;transport=ws;r2=on;lr>\r\n'
     'Via: SIP/2.0/WSS 10.0.1.5:443;branch=z9hG4bKa\r\n'
@@ -11,15 +13,6 @@ const String _invite = 'INVITE sip:abcd@203.0.113.5;transport=ws SIP/2.0\r\n'
     'Call-ID: call-1\r\nCSeq: 101 INVITE\r\n'
     'Contact: <sip:Vobiz@10.0.2.9:5060>\r\n'
     'Content-Type: application/sdp\r\nContent-Length: 3\r\n\r\nv=0';
-
-String _response(int code, String reason, int cseq,
-        {String body = '', String extra = ''}) =>
-    'SIP/2.0 $code $reason\r\n'
-    'Via: SIP/2.0/WSS vobiz-client;branch=z9hG4bKx\r\n'
-    'From: <sip:play1@registrar.vobiz.ai>;tag=t\r\n'
-    'To: <sip:+918000000000@10.0.2.9>;tag=ms\r\n'
-    'Call-ID: call-1\r\nCSeq: $cseq INVITE\r\n$extra'
-    'Content-Length: ${body.length}\r\n\r\n$body';
 
 String _line(String msg, String header) => msg
     .split('\r\n')
@@ -55,7 +48,7 @@ void main() {
     expect(_line(reinvite, 'To'), contains('tag=ms'));
     expect(reinvite, contains('a=sendonly'));
 
-    sip.debugReceive(_response(200, 'OK', _cseq(reinvite), body: 'v=0\r\na=recvonly'));
+    sip.debugReceive(respond(reinvite, 200, 'OK', body: 'v=0\r\na=recvonly'));
     expect(await answer, 'v=0\r\na=recvonly');
     final ack = sent.last;
     expect(ack.split(' ').first, 'ACK');
@@ -66,7 +59,7 @@ void main() {
     var ended = false;
     sip.onCallEnded = (_) => ended = true;
     final answer = sip.reInvite('v=0');
-    sip.debugReceive(_response(488, 'Not Acceptable Here', _cseq(sent.single)));
+    sip.debugReceive(respond(sent.single, 488, 'Not Acceptable Here'));
     await expectLater(
         answer,
         throwsA(isA<SipRequestFailed>()
@@ -78,12 +71,12 @@ void main() {
   test('a digest challenge is answered once', () async {
     final answer = sip.reInvite('v=0');
     final first = sent.single;
-    sip.debugReceive(_response(407, 'Proxy Authentication Required', _cseq(first),
-        extra: 'Proxy-Authenticate: Digest realm="registrar.vobiz.ai", nonce="n"\r\n'));
+    sip.debugReceive(respond(first, 407, 'Proxy Authentication Required',
+        headers: <String>['Proxy-Authenticate: Digest realm="registrar.vobiz.ai", nonce="n"']));
     final retry = sent.last;
     expect(retry, contains('Proxy-Authorization: Digest'));
     expect(_cseq(retry), greaterThan(_cseq(first)));
-    sip.debugReceive(_response(200, 'OK', _cseq(retry), body: 'v=0'));
+    sip.debugReceive(respond(retry, 200, 'OK', body: 'v=0'));
     expect(await answer, 'v=0');
   });
 

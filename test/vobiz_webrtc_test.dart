@@ -174,10 +174,11 @@ void main() {
       expect(audio['echoCancellation'], isTrue);
     });
 
-    test('toWebRtcConstraints with audio=false returns false for audio', () {
-      const mc = MediaConstraints(audio: false);
+    test('toWebRtcConstraints always asks for the microphone, never the camera', () {
+      const mc = MediaConstraints(audio: false, video: true);
       final constraints = mc.toWebRtcConstraints();
-      expect(constraints['audio'], isFalse);
+      expect(constraints['audio'], isA<Map<String, dynamic>>());
+      expect(constraints['video'], isFalse);
     });
   });
 

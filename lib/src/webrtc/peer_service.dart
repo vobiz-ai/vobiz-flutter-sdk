@@ -43,7 +43,6 @@ class _PeerCallState {
   MediaStream? localStream;
   MediaStream? remoteStream;
   bool localAudioAttached = false;
-  bool remoteDescriptionApplied = false;
   bool disposed = false;
 
   /// The user's mute choice. Applies to the track whenever it exists.
@@ -51,6 +50,13 @@ class _PeerCallState {
 
   /// On hold: the track is silenced whatever [muted] says.
   bool held = false;
+
+  /// While a [PeerService.beginHold] offer waits for its answer: the hold
+  /// state to go back to if it fails. Null when no hold offer is pending.
+  bool? heldBeforeOffer;
+
+  /// A [PeerService.beginIceRestart] offer waits for its answer.
+  bool iceRestartPending = false;
 
   /// The last remote SDP applied (offer, answer or provisional answer).
   String? remoteSdp;
@@ -66,15 +72,13 @@ class _PeerCallState {
   final CallQualityAnalyzer qualityAnalyzer = CallQualityAnalyzer();
   final CallQualityLevelTracker levelTracker = CallQualityLevelTracker();
   final CallQualityAnalyzer pollAnalyzer = CallQualityAnalyzer();
-
-  final List<RTCIceCandidate> pendingRemoteCandidates = <RTCIceCandidate>[];
 }
 
-/// Handles `flutter_webrtc` peer-connection work, supporting multiple
-/// simultaneous call legs (e.g. for hold + add-call conference scenarios).
+/// Handles `flutter_webrtc` peer-connection work: the WebRTC resources of
+/// each call leg, keyed by its call id.
 ///
-/// Each call is identified by its [callId]. Operations that do not receive an
-/// explicit [callId] operate on the "active" call tracked by [_activeCallId].
+/// Operations that do not take a call id act on the "active" call: the leg
+/// created last ([_activeCallId]).
 @internal
 class PeerService {
   PeerService({
@@ -99,6 +103,9 @@ class PeerService {
     });
   }
 
+  /// The ICE servers and policy. Read when a call's peer connection is
+  /// created, so a new value (fresh TURN credentials) applies from the next
+  /// call on.
   IceConfig iceConfig;
   final MediaConstraints mediaConstraints;
   final Logger _logger;
@@ -128,8 +135,6 @@ class PeerService {
       StreamController<MediaEvent>.broadcast();
   final StreamController<CallMediaEvent> _callMediaEvents =
       StreamController<CallMediaEvent>.broadcast();
-  final StreamController<RTCIceCandidate> _iceCandidates =
-      StreamController<RTCIceCandidate>.broadcast();
 
   /// Per-call state keyed by callId.
   final Map<String, _PeerCallState> _callStates = <String, _PeerCallState>{};
@@ -148,20 +153,9 @@ class PeerService {
   /// Typed updates: mute, hold, early media, route, quality.
   Stream<CallMediaEvent> get callMediaEvents => _callMediaEvents.stream;
 
-  /// Emits local ICE candidates so signaling can forward them to the far end.
-  Stream<RTCIceCandidate> get iceCandidates => _iceCandidates.stream;
-
   /// Current peer connection for the active call.
   RTCPeerConnection? get peerConnection =>
       _activeCallId == null ? null : _callStates[_activeCallId]?.peerConnection;
-
-  /// Current local media stream for the active call.
-  MediaStream? get localStream =>
-      _activeCallId == null ? null : _callStates[_activeCallId]?.localStream;
-
-  /// Current remote media stream for the active call.
-  MediaStream? get remoteStream =>
-      _activeCallId == null ? null : _callStates[_activeCallId]?.remoteStream;
 
   /// Whether the active call's microphone is muted by the user. False when
   /// there is no call.
@@ -237,14 +231,6 @@ class PeerService {
   Future<void> initialize(String callId) async {
     await createPeerConnection(callId);
     await attachLocalAudioStream(callId);
-  }
-
-  /// Switches which call is treated as "active" for operations without an
-  /// explicit [callId]. Does nothing if [callId] has no state entry.
-  void setActiveCall(String callId) {
-    if (_callStates.containsKey(callId)) {
-      _activeCallId = callId;
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -346,37 +332,6 @@ class PeerService {
     return answer;
   }
 
-  /// Creates an offer for the active call after ensuring local audio is ready.
-  Future<RTCSessionDescription> createOfferExchange() async {
-    final String callId = _requireActiveCallId();
-    final _PeerCallState state = _requireState(callId);
-
-    if (state.peerConnection == null) {
-      throw StateError('Peer connection has not been created for $callId');
-    }
-    if (!state.localAudioAttached) {
-      await attachLocalAudioStream(callId);
-    }
-    return createOffer();
-  }
-
-  /// Accepts a remote offer and produces a local answer for the active call.
-  Future<RTCSessionDescription> handleRemoteOffer(
-    RTCSessionDescription offer,
-  ) async {
-    final String callId = _requireActiveCallId();
-    final _PeerCallState state = _requireState(callId);
-
-    if (state.peerConnection == null) {
-      throw StateError('Peer connection has not been created for $callId');
-    }
-    if (!state.localAudioAttached) {
-      await attachLocalAudioStream(callId);
-    }
-    await setRemoteDescription(offer);
-    return createAnswer();
-  }
-
   /// Applies a remote answer to complete an outbound offer/answer exchange.
   Future<void> handleRemoteAnswer(RTCSessionDescription answer) async {
     await setRemoteDescription(answer);
@@ -394,9 +349,7 @@ class PeerService {
 
     await _requirePeerForState(state, callId).setRemoteDescription(description);
     _requireLive(callId, state);
-    state.remoteDescriptionApplied = true;
     state.remoteSdp = description.sdp;
-    await _flushPendingRemoteCandidates(callId, state);
     _emitMediaMessage(callId, state, 'Remote description applied');
   }
 
@@ -422,8 +375,6 @@ class PeerService {
     final bool first = state.provisionalSdp == null;
     state.provisionalSdp = sdp;
     state.remoteSdp = sdp;
-    state.remoteDescriptionApplied = true;
-    await _flushPendingRemoteCandidates(callId, state);
     _emitMediaMessage(callId, state, 'Early media applied');
     if (first) _callMediaEvents.addIfOpen(EarlyMediaEvent(callId: callId));
     return true;
@@ -446,40 +397,36 @@ class PeerService {
   /// Answers a session change the far end offered mid-call (a re-INVITE or
   /// UPDATE with new SDP, such as the far end putting us on hold): applies
   /// the offer and returns the local answer's SDP. Returns null, leaving the
-  /// session as it was, when it cannot be applied.
+  /// session as it was, when it cannot be applied, and while this side's own
+  /// hold or ICE-restart offer waits for its answer (applying the far end's
+  /// offer would throw ours away).
   Future<String?> answerSessionOffer(String offerSdp) async {
     final String? callId = _activeCallId;
     final _PeerCallState? state = _activeState;
     final RTCPeerConnection? peer = state?.peerConnection;
     if (callId == null || state == null || peer == null) return null;
+    if (state.heldBeforeOffer != null || state.iceRestartPending) {
+      _logger.warn('Session change for $callId refused: our own offer is pending');
+      return null;
+    }
+    var offerApplied = false;
     try {
       await setRemoteDescription(RTCSessionDescription(offerSdp, 'offer'));
+      offerApplied = true;
       await createAnswer();
       final RTCSessionDescription? local = await peer.getLocalDescription();
       if (!_isLive(callId, state)) return null;
       return local?.sdp;
     } catch (e) {
       _logger.warn('Could not answer the session change for $callId: $e');
-      try {
-        await peer.setRemoteDescription(RTCSessionDescription('', 'rollback'));
-      } catch (_) {}
+      // Undo only the offer applied here.
+      if (offerApplied) {
+        try {
+          await peer.setRemoteDescription(RTCSessionDescription('', 'rollback'));
+        } catch (_) {}
+      }
       return null;
     }
-  }
-
-  /// Adds a remote ICE candidate to the active call.
-  Future<void> addIceCandidate(RTCIceCandidate candidate) async {
-    final String callId = _requireActiveCallId();
-    final _PeerCallState state = _requireState(callId);
-
-    if (!state.remoteDescriptionApplied) {
-      state.pendingRemoteCandidates.add(candidate);
-      _emitMediaMessage(callId, state, 'Remote ICE candidate queued');
-      return;
-    }
-
-    await _requirePeerForState(state, callId).addCandidate(candidate);
-    _emitMediaMessage(callId, state, 'Remote ICE candidate added');
   }
 
   /// Waits until the offer or answer can carry a candidate the media server
@@ -526,28 +473,43 @@ class PeerService {
   /// (or restores) the microphone, sets the audio direction to `sendonly`
   /// (or `sendrecv`) and returns the new local offer's SDP for a re-INVITE.
   /// Finish with [completeHold] when the 200 OK arrives, or [abortHold].
+  ///
+  /// When building the offer fails, the microphone, the direction and the
+  /// hold state are put back before the error is rethrown; [abortHold] then
+  /// has nothing left to undo.
   Future<String> beginHold(bool hold) async {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
     final RTCPeerConnection peer = _requirePeerForState(state, callId);
     final String direction = hold ? 'sendonly' : 'sendrecv';
 
+    state.heldBeforeOffer = state.held;
     state.held = hold;
     _applyTrackEnabled(state);
 
-    final bool viaTransceiver = await _setDirection(
-        peer, hold ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
-    RTCSessionDescription offer = await peer.createOffer(<String, dynamic>{});
-    if (!viaTransceiver || SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
-      offer = RTCSessionDescription(
-          SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
+    var offerApplied = false;
+    try {
+      final bool viaTransceiver = await _setDirection(
+          peer, hold ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
+      RTCSessionDescription offer = await peer.createOffer(<String, dynamic>{});
+      if (!viaTransceiver || SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
+        offer = RTCSessionDescription(
+            SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
+      }
+      offer = _withPreferredCodecs(offer);
+      _requireLive(callId, state);
+      await peer.setLocalDescription(offer);
+      offerApplied = true;
+      final RTCSessionDescription? local = await peer.getLocalDescription();
+      _emitMediaMessage(callId, state, hold ? 'Hold offer created' : 'Resume offer created');
+      return local?.sdp ?? offer.sdp ?? '';
+    } catch (_) {
+      // Not left silent (or live) while the call's state says otherwise.
+      if (_isLive(callId, state)) {
+        await _undoHold(callId, peer, state, rollBack: offerApplied);
+      }
+      rethrow;
     }
-    offer = _withPreferredCodecs(offer);
-    _requireLive(callId, state);
-    await peer.setLocalDescription(offer);
-    final RTCSessionDescription? local = await peer.getLocalDescription();
-    _emitMediaMessage(callId, state, hold ? 'Hold offer created' : 'Resume offer created');
-    return local?.sdp ?? offer.sdp ?? '';
   }
 
   /// Applies the far end's answer to a [beginHold] offer.
@@ -555,26 +517,42 @@ class PeerService {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
     await setRemoteDescription(RTCSessionDescription(answerSdp, 'answer'));
+    state.heldBeforeOffer = null;
     _callMediaEvents.addIfOpen(HoldChangedEvent(callId: callId, held: state.held));
     _updateProximity();
   }
 
   /// Undoes a [beginHold] the far end refused: rolls the offer back and puts
-  /// the microphone and direction back as they were.
+  /// the microphone and direction back as they were. Does nothing when no
+  /// hold offer is pending.
   Future<void> abortHold() async {
     final String? callId = _activeCallId;
     final _PeerCallState? state = _activeState;
     final RTCPeerConnection? peer = state?.peerConnection;
     if (callId == null || state == null || peer == null) return;
-    state.held = !state.held;
+    await _undoHold(callId, peer, state, rollBack: true);
+  }
+
+  Future<void> _undoHold(
+    String callId,
+    RTCPeerConnection peer,
+    _PeerCallState state, {
+    required bool rollBack,
+  }) async {
+    final bool? before = state.heldBeforeOffer;
+    if (before == null) return;
+    state.heldBeforeOffer = null;
+    state.held = before;
     _applyTrackEnabled(state);
-    try {
-      await peer.setLocalDescription(RTCSessionDescription('', 'rollback'));
-    } catch (e) {
-      _logger.warn('Could not roll back the hold offer for $callId: $e');
+    if (rollBack) {
+      try {
+        await peer.setLocalDescription(RTCSessionDescription('', 'rollback'));
+      } catch (e) {
+        _logger.warn('Could not roll back the hold offer for $callId: $e');
+      }
     }
-    await _setDirection(peer,
-        state.held ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
+    await _setDirection(
+        peer, before ? TransceiverDirection.SendOnly : TransceiverDirection.SendRecv);
   }
 
   // -------------------------------------------------------------------------
@@ -587,7 +565,9 @@ class PeerService {
   /// come back without fresh ICE credentials and candidates. Keeps the hold
   /// direction. Waits for gathering as for the first offer and returns the
   /// new offer's SDP for a re-INVITE. Finish with [completeIceRestart] when
-  /// the 200 OK arrives, or [abortIceRestart].
+  /// the 200 OK arrives, or [abortIceRestart]. When building the offer
+  /// fails, an offer already applied is rolled back before the error is
+  /// rethrown.
   Future<String> beginIceRestart({bool Function()? cancelled}) async {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
@@ -599,29 +579,39 @@ class PeerService {
     // ones gathered on the network that is gone.
     state.gatheringComplete = false;
     state.candidateTypes.clear();
+    state.iceRestartPending = true;
+    var offerApplied = false;
     try {
-      await peer.restartIce();
-    } catch (e) {
-      // createOffer's iceRestart option below asks for the same thing.
-      _logger.warn('restartIce failed for $callId: $e');
+      try {
+        await peer.restartIce();
+      } catch (e) {
+        // createOffer's iceRestart option below asks for the same thing.
+        _logger.warn('restartIce failed for $callId: $e');
+      }
+      RTCSessionDescription offer =
+          await peer.createOffer(<String, dynamic>{'iceRestart': true});
+      if (SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
+        offer = RTCSessionDescription(
+            SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
+      }
+      offer = _withPreferredCodecs(offer);
+      _requireLive(callId, state);
+      await peer.setLocalDescription(offer);
+      offerApplied = true;
+      await waitForIceGathering(callId, cancelled: cancelled);
+      final RTCSessionDescription? local = await peer.getLocalDescription();
+      final String sdp = local?.sdp ?? offer.sdp ?? '';
+      if (oldUfrag != null && _iceUfrag(sdp) == oldUfrag) {
+        _logger.warn('ICE restart offer for $callId kept the old ICE credentials');
+      }
+      _emitMediaMessage(callId, state, 'ICE restart offer created');
+      return sdp;
+    } catch (_) {
+      if (_isLive(callId, state)) {
+        await _undoIceRestart(callId, peer, state, rollBack: offerApplied);
+      }
+      rethrow;
     }
-    RTCSessionDescription offer =
-        await peer.createOffer(<String, dynamic>{'iceRestart': true});
-    if (SdpUtils.audioDirection(offer.sdp ?? '') != direction) {
-      offer = RTCSessionDescription(
-          SdpUtils.setAudioDirection(offer.sdp ?? '', direction), 'offer');
-    }
-    offer = _withPreferredCodecs(offer);
-    _requireLive(callId, state);
-    await peer.setLocalDescription(offer);
-    await waitForIceGathering(callId, cancelled: cancelled);
-    final RTCSessionDescription? local = await peer.getLocalDescription();
-    final String sdp = local?.sdp ?? offer.sdp ?? '';
-    if (oldUfrag != null && _iceUfrag(sdp) == oldUfrag) {
-      _logger.warn('ICE restart offer for $callId kept the old ICE credentials');
-    }
-    _emitMediaMessage(callId, state, 'ICE restart offer created');
-    return sdp;
   }
 
   /// Applies the far end's answer to a [beginIceRestart] offer. ICE then
@@ -631,14 +621,29 @@ class PeerService {
     final String callId = _requireActiveCallId();
     final _PeerCallState state = _requireState(callId);
     await setRemoteDescription(RTCSessionDescription(answerSdp, 'answer'));
+    state.iceRestartPending = false;
     _emitMediaMessage(callId, state, 'ICE restart answered');
   }
 
-  /// Rolls back a [beginIceRestart] offer the far end refused.
+  /// Rolls back a [beginIceRestart] offer the far end refused. Does nothing
+  /// when no ICE-restart offer is pending.
   Future<void> abortIceRestart() async {
     final String? callId = _activeCallId;
-    final RTCPeerConnection? peer = _activeState?.peerConnection;
-    if (callId == null || peer == null) return;
+    final _PeerCallState? state = _activeState;
+    final RTCPeerConnection? peer = state?.peerConnection;
+    if (callId == null || state == null || peer == null) return;
+    await _undoIceRestart(callId, peer, state, rollBack: true);
+  }
+
+  Future<void> _undoIceRestart(
+    String callId,
+    RTCPeerConnection peer,
+    _PeerCallState state, {
+    required bool rollBack,
+  }) async {
+    if (!state.iceRestartPending) return;
+    state.iceRestartPending = false;
+    if (!rollBack) return;
     try {
       await peer.setLocalDescription(RTCSessionDescription('', 'rollback'));
     } catch (e) {
@@ -773,16 +778,6 @@ class PeerService {
   // Disposal
   // -------------------------------------------------------------------------
 
-  /// Disposes the active call's peer connection and removes its state entry.
-  ///
-  /// Other call legs are unaffected. After disposal [_activeCallId] is cleared.
-  Future<void> disposeCurrentCall() async {
-    final String? callId = _activeCallId;
-    if (callId != null) {
-      await disposeCall(callId);
-    }
-  }
-
   /// Disposes a specific call leg by [callId].
   Future<void> disposeCall(String callId) async {
     final _PeerCallState? state = _callStates.remove(callId);
@@ -811,7 +806,6 @@ class PeerService {
     await disposeAllCalls();
     await _routeSubscription.cancel();
     await audioRoutes.dispose();
-    await _iceCandidates.close();
     await _mediaEvents.close();
     await _callMediaEvents.close();
   }
@@ -843,7 +837,6 @@ class PeerService {
       final RegExpMatch? type =
           RegExp(r' typ (\w+)').firstMatch(candidate.candidate ?? '');
       if (type != null) state.candidateTypes.add(type.group(1)!);
-      _iceCandidates.addIfOpen(candidate);
       _mediaEvents.addIfOpen(
         MediaEvent(
           callId: callId,
@@ -898,24 +891,6 @@ class PeerService {
     });
   }
 
-  Future<void> _flushPendingRemoteCandidates(
-    String callId,
-    _PeerCallState state,
-  ) async {
-    if (!state.remoteDescriptionApplied ||
-        state.pendingRemoteCandidates.isEmpty) {
-      return;
-    }
-
-    final RTCPeerConnection peer = _requirePeerForState(state, callId);
-    for (final RTCIceCandidate candidate
-        in List<RTCIceCandidate>.from(state.pendingRemoteCandidates)) {
-      await peer.addCandidate(candidate);
-    }
-    state.pendingRemoteCandidates.clear();
-    _emitMediaMessage(callId, state, 'Queued remote ICE candidates applied');
-  }
-
   /// Releases everything a call holds. `close()` alone leaves the native
   /// PeerConnection (and on Android flutter_webrtc's audio switch: call
   /// mode, audio focus, speaker/Bluetooth route) alive until the app dies;
@@ -945,8 +920,6 @@ class PeerService {
     if (peerConnection != null) await _releasePeer(peerConnection);
 
     state.localAudioAttached = false;
-    state.remoteDescriptionApplied = false;
-    state.pendingRemoteCandidates.clear();
 
     _updateProximity();
     if (wasMuted) {
