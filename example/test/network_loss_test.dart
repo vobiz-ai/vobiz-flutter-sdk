@@ -21,8 +21,100 @@ void main() {
     await controller.init();
   });
 
+  tearDown(() => controller.dispose());
+
   Future<void> settle() => Future<void>.delayed(Duration.zero);
   int answers() => controller.logs.where((l) => l.message.contains('Call answered')).length;
+
+  Future<void> signIn() async {
+    controller
+      ..authId = 'MA_X'
+      ..authToken = 'tok';
+    await controller.connect();
+    await settle();
+    expect(controller.status, PhoneStatus.online);
+  }
+
+  /// What the SDK reports when its socket drops: it reconnects by itself.
+  void dropSocket() {
+    client.connected = false;
+    client.connection = ConnectionStateStatus.reconnecting;
+    client.fakeConnections.add(ConnectionEvent(
+      connectionState: ConnectionStateStatus.reconnecting,
+      registrationState: RegistrationState.unregistered,
+      message: 'Socket error: Connection reset by peer',
+    ));
+  }
+
+  void registerAgain() {
+    client.connected = true;
+    client.connection = null;
+    client.fakeConnections.add(ConnectionEvent(
+      connectionState: ConnectionStateStatus.connected,
+      registrationState: RegistrationState.registered,
+    ));
+  }
+
+  /// What the SDK reports when its reconnects give up.
+  void giveUp() {
+    client.connection = ConnectionStateStatus.failed;
+    client.fakeConnections.add(ConnectionEvent(
+      connectionState: ConnectionStateStatus.failed,
+      registrationState: RegistrationState.failed,
+      message: 'Gave up after 10 attempts: timeout',
+    ));
+    client.fakeErrors.add(ErrorEvent(code: 'reconnect_failed', message: 'Gave up after 10 attempts: timeout'));
+  }
+
+  group('a connection lost while idle', () {
+    test('shows Reconnecting..., and Disconnect stays reachable', () async {
+      await signIn();
+      dropSocket();
+      await settle();
+      expect(controller.status, PhoneStatus.connecting);
+      expect(controller.statusText, 'Reconnecting...');
+      expect(controller.isSignedIn, isTrue, reason: 'the connected card, with Disconnect, stays');
+    });
+
+    test('coming back shows Registered without pulling the user to another tab', () async {
+      await signIn();
+      final tabs = <int>[];
+      controller.onTabRequest = tabs.add;
+      dropSocket();
+      await settle();
+      registerAgain();
+      await settle();
+      expect(controller.status, PhoneStatus.online);
+      expect(controller.statusText, 'Registered');
+      expect(tabs, isEmpty);
+    });
+
+    test('a reconnect that gives up shows an error, and Connect works again', () async {
+      await signIn();
+      dropSocket();
+      await settle();
+      giveUp();
+      await settle();
+      expect(controller.status, PhoneStatus.error);
+      expect(controller.isSignedIn, isFalse, reason: 'the sign-in form, with Connect, is back');
+      expect(controller.connectError, contains('Gave up after 10 attempts'));
+    });
+
+    test('one failed attempt is not the end: the reconnect goes on', () async {
+      await signIn();
+      dropSocket();
+      await settle();
+      client.fakeConnections.add(ConnectionEvent(
+        connectionState: ConnectionStateStatus.failed,
+        registrationState: RegistrationState.failed,
+        message: 'Connection failed: SocketException',
+      ));
+      client.fakeErrors.add(ErrorEvent(code: 'connect_failed', message: 'Could not connect'));
+      await settle();
+      expect(controller.status, PhoneStatus.connecting);
+      expect(controller.statusText, 'Reconnecting...');
+    });
+  });
 
   test('a dropped connection and its recovery are not new answers', () async {
     client.connected = true;
@@ -39,6 +131,8 @@ void main() {
     await settle();
     expect(controller.statusText, 'In Call');
     expect(answers(), 1);
+    client.emit(CallStateStatus.ended, dir: CallDirection.outbound);
+    await settle();
   });
 
   test('a call that ends while the network is down leaves the call screen', () async {
@@ -53,16 +147,26 @@ void main() {
     await settle();
     expect(controller.status, PhoneStatus.connecting);
     expect(controller.statusText, 'Reconnecting...');
+    expect(controller.isSignedIn, isTrue, reason: 'Disconnect stays reachable while it reconnects');
 
     // Registered again: back to the dial pad.
-    client.connected = true;
-    client.connection = null;
-    client.fakeConnections.add(ConnectionEvent(
-      connectionState: ConnectionStateStatus.connected,
-      registrationState: RegistrationState.registered,
-    ));
+    registerAgain();
     await settle();
     expect(controller.status, PhoneStatus.online);
+  });
+
+  test('a call that ended while offline, then a reconnect that gives up: Connect works again', () async {
+    client.connected = true;
+    client.emit(CallStateStatus.active, dir: CallDirection.outbound);
+    await settle();
+    client.connected = false;
+    client.connection = ConnectionStateStatus.reconnecting;
+    client.emit(CallStateStatus.ended, dir: CallDirection.outbound, reason: 'network_lost');
+    await settle();
+    giveUp();
+    await settle();
+    expect(controller.status, PhoneStatus.error);
+    expect(controller.isSignedIn, isFalse);
   });
 
   // Seen live 2026-10-26: the network went while an outgoing call rang. The
@@ -83,12 +187,7 @@ void main() {
     expect(controller.status, PhoneStatus.connecting);
     expect(controller.statusText, 'Reconnecting...');
 
-    client.connected = true;
-    client.connection = null;
-    client.fakeConnections.add(ConnectionEvent(
-      connectionState: ConnectionStateStatus.connected,
-      registrationState: RegistrationState.registered,
-    ));
+    registerAgain();
     await settle();
     expect(controller.status, PhoneStatus.online);
   });

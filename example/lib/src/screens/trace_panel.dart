@@ -50,6 +50,11 @@ class _TracePanelState extends State<TracePanel> {
     final c = widget.controller;
     final pg = context.pg;
     final logs = c.logs;
+    if (logs.isEmpty) {
+      // Cleared: the next lines start a new list, followed from the top.
+      _follow = true;
+      _seen = 0;
+    }
     if (_follow) {
       _seen = logs.length;
       WidgetsBinding.instance.addPostFrameCallback((_) {

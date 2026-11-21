@@ -22,7 +22,7 @@ class SectionLabel extends StatelessWidget {
                 style: TextStyle(
                     fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
           ),
-          if (trailing != null) trailing!,
+          ?trailing,
         ],
       ),
     );
@@ -39,22 +39,29 @@ class InfoTip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final pg = context.pg;
-    return InkResponse(
-      radius: 18,
-      onTap: () => showDialog<void>(
-        context: context,
-        builder: (_) => AlertDialog(
-          backgroundColor: pg.panel,
-          title: Text(title, style: TextStyle(color: pg.accent, fontSize: 16, fontWeight: FontWeight.w700)),
-          content: Text(message, style: TextStyle(color: pg.text, height: 1.45)),
-          actions: <Widget>[
-            TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Got it')),
-          ],
+    return Semantics(
+      container: true,
+      button: true,
+      label: 'About $title',
+      child: InkResponse(
+        radius: 18,
+        onTap: () => showDialog<void>(
+          context: context,
+          // The dialog's own context: the tip may be gone from the tree (an
+          // incoming call replaced its screen) before "Got it" is tapped.
+          builder: (dialogContext) => AlertDialog(
+            backgroundColor: pg.panel,
+            title: Text(title, style: TextStyle(color: pg.accent, fontSize: 16, fontWeight: FontWeight.w700)),
+            content: Text(message, style: TextStyle(color: pg.text, height: 1.45)),
+            actions: <Widget>[
+              TextButton(onPressed: () => Navigator.of(dialogContext).pop(), child: const Text('Got it')),
+            ],
+          ),
         ),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(4),
-        child: Icon(Icons.info_outline, size: 15, color: pg.faint),
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Icon(Icons.info_outline, size: 15, color: pg.faint),
+        ),
       ),
     );
   }
@@ -90,8 +97,12 @@ class StatusPill extends StatelessWidget {
         children: <Widget>[
           Container(width: 8, height: 8, decoration: BoxDecoration(color: dot, shape: BoxShape.circle)),
           const SizedBox(width: 6),
-          Text(text.toUpperCase(),
-              style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, letterSpacing: 0.6, color: pg.muted)),
+          Flexible(
+            child: Text(text.toUpperCase(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, letterSpacing: 0.6, color: pg.muted)),
+          ),
         ],
       ),
     );
@@ -100,16 +111,15 @@ class StatusPill extends StatelessWidget {
 
 /// A rounded, bordered panel.
 class Panel extends StatelessWidget {
-  const Panel({super.key, required this.child, this.padding = const EdgeInsets.all(20)});
+  const Panel({super.key, required this.child});
 
   final Widget child;
-  final EdgeInsetsGeometry padding;
 
   @override
   Widget build(BuildContext context) {
     final pg = context.pg;
     return Container(
-      padding: padding,
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: pg.panel,
         borderRadius: BorderRadius.circular(24),
@@ -218,4 +228,79 @@ class ThemeToggle extends StatelessWidget {
       ),
     );
   }
+}
+
+/// The tappable header of a collapsible section: icon, upper-case title,
+/// chips, and a chevron that says whether it is [open].
+class SectionHeader extends StatelessWidget {
+  const SectionHeader({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.open,
+    required this.onTap,
+    this.chips = const <Widget>[],
+  });
+
+  final IconData icon;
+  final String title;
+  final bool open;
+  final VoidCallback onTap;
+  final List<Widget> chips;
+
+  @override
+  Widget build(BuildContext context) {
+    final pg = context.pg;
+    return InkWell(
+      borderRadius: BorderRadius.circular(18),
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        child: Row(
+          children: <Widget>[
+            Icon(icon, size: 14, color: pg.accent.withValues(alpha: 0.8)),
+            const SizedBox(width: 8),
+            Text(title, style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
+            for (var i = 0; i < chips.length; i++) ...<Widget>[SizedBox(width: i == 0 ? 8 : 6), chips[i]],
+            const Spacer(),
+            Icon(open ? Icons.expand_less : Icons.expand_more, size: 18, color: pg.faint),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The drag handle at the top of a bottom sheet.
+class SheetHandle extends StatelessWidget {
+  const SheetHandle({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Container(
+        width: 40,
+        height: 4,
+        decoration: BoxDecoration(color: context.pg.border, borderRadius: BorderRadius.circular(2)),
+      ),
+    );
+  }
+}
+
+/// A bottom sheet in the Playground's style that stays above the keyboard
+/// and rebuilds whenever [listenable] changes.
+Future<void> showPlaygroundSheet(BuildContext context, Listenable listenable, WidgetBuilder builder) {
+  return showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    backgroundColor: context.pg.panel,
+    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+    // The sheet's own context: the opener's sits in the Scaffold body, which
+    // has the keyboard inset removed already.
+    builder: (sheetContext) => Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(sheetContext).bottom),
+      child: ListenableBuilder(listenable: listenable, builder: (context, _) => builder(context)),
+    ),
+  );
 }

@@ -34,28 +34,13 @@ class _RecentCallsPanelState extends State<RecentCallsPanel> {
           ),
           child: Column(
             children: <Widget>[
-              InkWell(
+              SectionHeader(
                 key: const Key('recentCalls'),
-                borderRadius: BorderRadius.circular(18),
+                icon: Icons.history,
+                title: 'RECENT CALLS',
+                open: _open,
                 onTap: () => setState(() => _open = !_open),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                  child: Row(
-                    children: <Widget>[
-                      Icon(Icons.history, size: 14, color: pg.accent.withValues(alpha: 0.8)),
-                      const SizedBox(width: 8),
-                      Text('RECENT CALLS',
-                          style: TextStyle(
-                              fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
-                      if (missed > 0) ...<Widget>[
-                        const SizedBox(width: 8),
-                        Chip2('$missed missed', color: pg.danger),
-                      ],
-                      const Spacer(),
-                      Icon(_open ? Icons.expand_less : Icons.expand_more, size: 18, color: pg.faint),
-                    ],
-                  ),
-                ),
+                chips: <Widget>[if (missed > 0) Chip2('$missed missed', color: pg.danger)],
               ),
               if (_open && records.isEmpty)
                 Padding(

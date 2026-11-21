@@ -94,6 +94,22 @@ void main() {
     controller.dispose();
   });
 
+  test('a user id the sample server will not mint for (403) is shown at sign-in', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{'vobiz_push_server': 'https://bridge.example#key=k1'});
+    final controller = make(MockClient((_) async =>
+        http.Response(jsonEncode(<String, String>{'error': 'agent99 is not in JWT_ALLOWED_SUBS'}), 403)));
+    await controller.init();
+    controller.setAuthTab(AuthTab.accessToken);
+    controller.tokenUser = 'agent99';
+
+    await controller.connect();
+
+    expect(controller.connectError, startsWith('Access token error:'));
+    expect(controller.connectError, contains('agent99 is not in JWT_ALLOWED_SUBS'));
+    expect(client.actions, isNot(contains('connectWithAccessToken')));
+    controller.dispose();
+  });
+
   test('without a token server or a sample server it says so, and signs nothing in', () async {
     final controller = make(MockClient((_) async => http.Response('{}', 500)));
     await controller.init();
@@ -105,6 +121,40 @@ void main() {
     expect(controller.connectError, contains('token server'));
     expect(client.actions, isNot(contains('connectWithAccessToken')));
     controller.dispose();
+  });
+
+  test('a plain http token server is refused in a release build, not in a debug one', () async {
+    final requests = <http.Request>[];
+    final release = PlaygroundController(
+      client: client,
+      callScreen: FakeCallScreen(),
+      platform: FakeCallPlatform(),
+      httpClient: MockClient((request) async {
+        requests.add(request);
+        return http.Response(jsonEncode(<String, String>{'token': jwt()}), 200);
+      }),
+      allowHttp: false,
+    );
+    await release.init();
+    release.setAuthTab(AuthTab.accessToken);
+    release.tokenServerUrl = 'http://192.168.1.20:8080/token';
+    await release.connect();
+    expect(release.connectError, contains('https URL'));
+    expect(release.missingFields, contains('tokenServer'));
+    expect(requests, isEmpty, reason: 'nothing is fetched in clear text');
+    release.dispose();
+
+    final debug = make(MockClient((request) async {
+      requests.add(request);
+      return http.Response(jsonEncode(<String, String>{'token': jwt()}), 200);
+    }));
+    await debug.init();
+    debug.setAuthTab(AuthTab.accessToken);
+    debug.tokenServerUrl = 'http://192.168.1.20:8080/token';
+    await debug.connect();
+    expect(debug.connectError, isNull);
+    expect(requests.single.url.scheme, 'http');
+    debug.dispose();
   });
 
   test('a token server that refuses shows an access token error', () async {
@@ -137,6 +187,8 @@ void main() {
     expect(prefs.getString('vobiz_playground_mode'), 'token');
     final stored = await const FlutterSecureStorage().readAll();
     expect(stored.values.any((v) => v.contains(token)), isFalse);
+    expect(prefs.getKeys().any((k) => '${prefs.get(k)}'.contains(token)), isFalse,
+        reason: 'nor next to the sign-in settings, in plain text');
 
     final second = make(MockClient((_) async => http.Response('{}', 500)));
     await second.init();

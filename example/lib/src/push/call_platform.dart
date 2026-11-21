@@ -49,6 +49,11 @@ class CallPlatform {
     ];
   }
 
+  /// The app's package name (its Android application id), or null where
+  /// there is no Android side. Vobiz pushes with the Firebase credential
+  /// saved for it in the Vobiz Console.
+  Future<String?> packageName() => _invoke<String>('packageName');
+
   /// Starts the foreground service for a call that is now ringing out,
   /// connecting or connected. Call it while the app is visible or right
   /// after the user's tap: Android 14 refuses a microphone service started
@@ -56,8 +61,13 @@ class CallPlatform {
   Future<void> startCallService({required String caller, required bool outbound}) =>
       _invoke<void>('startCallService', <String, Object>{'caller': caller, 'outbound': outbound});
 
-  /// Stops the foreground service: the call is over.
+  /// Stops the foreground service: the call is over. An app that Accept
+  /// opened over the lock screen goes back behind it.
   Future<void> stopCallService() => _invoke<void>('stopCallService');
+
+  /// An accepted call screen led to no call: an app that Accept opened over
+  /// the lock screen goes back behind it, unless a call is running.
+  Future<void> leaveLockScreen() => _invoke<void>('leaveLockScreen');
 
   /// Posts a "Missed call" notification. One per [id]; a second post for
   /// the same call replaces the first.

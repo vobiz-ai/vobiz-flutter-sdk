@@ -9,6 +9,7 @@ import 'package:vobiz_webrtc_example/src/call_history.dart';
 import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 
 import 'support/fakes.dart';
+import 'support/setup.dart';
 
 /// Incoming calls over SIP: the call screen, the call service and the log.
 void main() {
@@ -19,26 +20,21 @@ void main() {
   late List<http.Request> requests;
 
   Future<void> start({Map<String, String> secure = const <String, String>{}, Map<String, Object> prefs = const <String, Object>{}}) async {
-    SharedPreferences.setMockInitialValues(prefs);
-    FlutterSecureStorage.setMockInitialValues(<String, String>{
-      'vobiz_auth_id': 'MA_X',
-      'vobiz_auth_token': 'tok',
-      ...secure,
-    });
     client = FakeClient();
     screen = FakeCallScreen();
     platform = FakeCallPlatform();
     requests = <http.Request>[];
-    controller = PlaygroundController(
+    controller = await startController(
       client: client,
-      callScreen: screen,
+      screen: screen,
       platform: platform,
+      secure: <String, String>{...savedZeroConfig, ...secure},
+      prefs: prefs,
       httpClient: MockClient((request) async {
         requests.add(request);
         return http.Response('{}', 200);
       }),
     );
-    await controller.init();
   }
 
   Future<void> signIn() async {
@@ -102,7 +98,6 @@ void main() {
     test('a SIP call rings the system call screen in the foreground too', () async {
       await start();
       await signIn();
-      controller.setForeground(true);
       client.ring(headers: <String, String>{'X-VH-PushRef': 'c9'});
       await pumpEventQueue();
       expect(screen.shown, contains('c9'));
@@ -164,6 +159,22 @@ void main() {
       expect(client.actions, isNot(contains('acceptCall')));
       expect(screen.ended, contains('ref-1'), reason: 'the stray screen is taken down');
       expect(controller.showIncoming, isTrue, reason: 'the real call still rings');
+      expect(platform.requests, contains('leaveLockScreen'), reason: 'Accept opened the app over the lock screen');
+    });
+
+    test('the app leaves the lock screen when the call accepted there ends', () async {
+      await start();
+      await signIn();
+      client.ring();
+      await pumpEventQueue();
+      screen.controller.add(ck.CallEventActionCallAccept(sipScreen('sip-sip-1')));
+      await pumpEventQueue();
+      client.emit(CallStateStatus.active);
+      await pumpEventQueue();
+      expect(platform.requests, isNot(contains('stop')));
+      client.emit(CallStateStatus.ended);
+      await pumpEventQueue();
+      expect(platform.requests.last, 'stop', reason: 'stopCallService also takes the app off the lock screen');
     });
   });
 
@@ -183,6 +194,36 @@ void main() {
       await pumpEventQueue();
       expect(platform.requests.last, 'stop');
       expect(controller.history.records.first.outcome, CallOutcome.outgoing);
+    });
+
+    test('a transfer sends the caller ID as + and digits, or none when it is empty', () async {
+      await start();
+      await signIn();
+      client.direction = CallDirection.outbound;
+      client.emit(CallStateStatus.active, dir: CallDirection.outbound);
+      await pumpEventQueue();
+      controller
+        ..transferTarget = TransferTarget.number
+        ..transferNumber = '9876543210';
+      await controller.transfer();
+      controller.callerIdNumber = '9999999999';
+      await controller.transfer();
+      expect(client.transferCallerIds, <String?>[null, '+919999999999']);
+      client.emit(CallStateStatus.ended, dir: CallDirection.outbound);
+      await pumpEventQueue();
+    });
+
+    test('a destination the SDK refuses is shown in the Trace, and the dialer is back', () async {
+      await start();
+      await signIn();
+      controller
+        ..callerIdNumber = '9999999999'
+        ..destNumber = '9876543210';
+      client.failMakeCall = ArgumentError('The destination must not contain a space');
+      await controller.call();
+      expect(controller.logs.last.message, contains('must not contain a space'));
+      expect(controller.status, PhoneStatus.online);
+      expect(platform.requests.last, 'stop', reason: 'the call service started for it is stopped');
     });
 
     test('a call answered in the app runs under the service', () async {

@@ -35,6 +35,11 @@ class CallService : Service() {
         private const val EXTRA_CALLER = "caller"
         private const val EXTRA_OUTBOUND = "outbound"
 
+        /** Whether the service is in the foreground for a call. */
+        @Volatile
+        var running = false
+            private set
+
         fun start(context: Context, caller: String, outbound: Boolean) {
             val intent = Intent(context, CallService::class.java)
                 .putExtra(EXTRA_CALLER, caller)
@@ -53,6 +58,11 @@ class CallService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onDestroy() {
+        running = false
+        super.onDestroy()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_HANG_UP) {
             CallEngine.requestHangUp()
@@ -61,7 +71,8 @@ class CallService : Service() {
         val caller = intent?.getStringExtra(EXTRA_CALLER).orEmpty()
         val outbound = intent?.getBooleanExtra(EXTRA_OUTBOUND, false) ?: false
         val notification = buildNotification(caller, outbound)
-        if (!goForeground(notification)) {
+        running = goForeground(notification)
+        if (!running) {
             stopSelf()
         }
         // A call cannot be resumed after the process dies: do not restart.

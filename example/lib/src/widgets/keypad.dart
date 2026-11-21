@@ -4,17 +4,11 @@ import '../theme.dart';
 
 /// A phone keypad. Before a call it types digits; during one it sends DTMF.
 class Keypad extends StatelessWidget {
-  const Keypad({super.key, required this.onKey, this.compact = false});
+  const Keypad({super.key, required this.onKey});
 
   final ValueChanged<String> onKey;
-  final bool compact;
 
-  static const List<(String, String)> _keys = <(String, String)>[
-    ('1', ''), ('2', 'ABC'), ('3', 'DEF'),
-    ('4', 'GHI'), ('5', 'JKL'), ('6', 'MNO'),
-    ('7', 'PQRS'), ('8', 'TUV'), ('9', 'WXYZ'),
-    ('*', ''), ('0', '+'), ('#', ''),
-  ];
+  static const List<String> _keys = <String>['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
 
   @override
   Widget build(BuildContext context) {
@@ -25,26 +19,19 @@ class Keypad extends StatelessWidget {
       physics: const NeverScrollableScrollPhysics(),
       mainAxisSpacing: 8,
       crossAxisSpacing: 8,
-      childAspectRatio: compact ? 2.6 : 2.0,
-      children: _keys.map((k) {
+      childAspectRatio: 2.6,
+      children: _keys.map((key) {
         return Material(
           color: pg.field,
           borderRadius: BorderRadius.circular(14),
           child: InkWell(
             borderRadius: BorderRadius.circular(14),
-            onTap: () => onKey(k.$1),
+            onTap: () => onKey(key),
             child: Semantics(
               button: true,
-              label: 'Key ${k.$1}',
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: <Widget>[
-                  Text(k.$1,
-                      style: TextStyle(
-                          fontSize: compact ? 18 : 22, fontWeight: FontWeight.w600, color: pg.text)),
-                  if (k.$2.isNotEmpty && !compact)
-                    Text(k.$2, style: TextStyle(fontSize: 8, letterSpacing: 1.4, color: pg.faint)),
-                ],
+              label: 'Key $key',
+              child: Center(
+                child: Text(key, style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: pg.text)),
               ),
             ),
           ),

@@ -10,32 +10,9 @@ import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import 'package:vobiz_webrtc_example/src/call_history.dart';
 import 'package:vobiz_webrtc_example/src/playground_controller.dart';
 import 'package:vobiz_webrtc_example/src/push/push_call.dart';
-import 'package:vobiz_webrtc_example/src/push/push_service.dart';
 
 import 'support/fakes.dart';
-
-/// Firebase, as a test sees it: set up, with one token and no pushes of its own.
-class _FakePush extends PushService {
-  _FakePush() : super.unavailable('fake');
-
-  @override
-  bool get available => true;
-
-  @override
-  Future<String?> token() async => 'fcm-token-1';
-
-  @override
-  Stream<String> get tokenRefresh => const Stream<String>.empty();
-
-  @override
-  Stream<PushCall> get foregroundCalls => const Stream<PushCall>.empty();
-
-  @override
-  Future<bool?> requestNotificationPermission() async => true;
-
-  @override
-  Future<bool?> notificationsAllowed() async => true;
-}
+import 'support/setup.dart';
 
 /// A call to a closed app through Vobiz's own push: its registrar holds the
 /// call, pushes, and sends the held INVITE to the REGISTER that claims it.
@@ -88,17 +65,22 @@ void main() {
     late FakeCallPlatform platform;
     late PlaygroundController controller;
 
-    Future<void> start({bool saved = true}) async {
-      SharedPreferences.setMockInitialValues(<String, Object>{});
-      FlutterSecureStorage.setMockInitialValues(<String, String>{
-        if (saved) 'vobiz_auth_id': 'MA_X',
-        if (saved) 'vobiz_auth_token': 'tok',
-      });
+    Future<void> start({
+      bool saved = true,
+      List<Map<String, String>> queued = const <Map<String, String>>[],
+      List<ck.CallKitParams> screens = const <ck.CallKitParams>[],
+      http.Client? httpClient,
+    }) async {
       client = FakeClient();
-      screen = FakeCallScreen();
-      platform = FakeCallPlatform();
-      controller = PlaygroundController(client: client, callScreen: screen, platform: platform);
-      await controller.init();
+      screen = FakeCallScreen()..screens.addAll(screens);
+      platform = FakeCallPlatform()..queued.addAll(queued);
+      controller = await startController(
+        client: client,
+        screen: screen,
+        platform: platform,
+        secure: saved ? savedZeroConfig : const <String, String>{},
+        httpClient: httpClient,
+      );
     }
 
     tearDown(() => controller.dispose());
@@ -115,8 +97,43 @@ void main() {
       expect(screen.shown, contains('held-1@10.0.2.9'));
       expect(client.actions, contains('handleIncomingPush:held-1@10.0.2.9'));
       expect(client.actions, contains('connectWithAuthToken'), reason: 'the sign-in carries the claim');
-      // Not a bridge call: nothing is sent to a push server.
-      expect(client.actions.where((a) => a.startsWith('report')), isEmpty);
+      expect(client.actions.where((a) => a.startsWith('report')), isEmpty, reason: 'nothing is tapped yet');
+      expect(controller.logs.map((l) => l.message), isNot(contains(contains('push server'))),
+          reason: 'Vobiz holds the call: no server is asked to ring this phone');
+    });
+
+    test('closed app started by the push: the push Android queued before Dart was ready rings and signs in',
+        () async {
+      await start(queued: <Map<String, String>>[vobizPush()]);
+      await pumpEventQueue();
+      expect(screen.shown, <String>['held-1@10.0.2.9']);
+      expect(client.actions, contains('handleIncomingPush:held-1@10.0.2.9'));
+      expect(client.actions, contains('connectWithAuthToken'));
+    });
+
+    test('closed app opened by Accept: the accepted call screen is taken without another tap', () async {
+      final data = vobizPush();
+      await start(
+        queued: <Map<String, String>>[data],
+        screens: <ck.CallKitParams>[
+          ck.CallKitParams(id: 'held-1@10.0.2.9', extra: PushCall.fromData(data)!.toExtra(), isAccepted: true),
+        ],
+      );
+      await pumpEventQueue();
+      expect(screen.shown, isEmpty, reason: 'its call screen is already up');
+      expect(client.actions, contains('reportAccepted:held-1@10.0.2.9'));
+      expect(client.actions.where((a) => a == 'connectWithAuthToken'), hasLength(1));
+      expect(platform.requests, contains('start:Asha'));
+    });
+
+    test('closed app with no saved sign-in: the call screen rings, and the Trace says why nothing connects',
+        () async {
+      await start(saved: false);
+      platform.pushController.add(vobizPush());
+      await pumpEventQueue();
+      expect(screen.shown, contains('held-1@10.0.2.9'));
+      expect(client.actions.where((a) => a.startsWith('connect')), isEmpty);
+      expect(controller.logs.map((l) => l.message), contains(contains('no saved sign-in')));
     });
 
     test('signed in already: the SDK claims it on the open connection, no new sign-in', () async {
@@ -138,12 +155,30 @@ void main() {
       await pumpEventQueue();
       expect(client.actions, contains('reportAccepted:held-1@10.0.2.9'));
       expect(platform.requests, contains('start:Asha'), reason: "the call's microphone service starts on the tap");
+      expect(controller.logs.map((l) => l.message), contains(contains('Waiting for the call Vobiz is holding')));
       final shownBefore = screen.shown.length;
       client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
       await pumpEventQueue();
       expect(screen.shown.length, shownBefore, reason: 'the push\'s screen is this call\'s');
       expect(controller.statusText, 'Answering...');
       expect(client.actions.where((a) => a == 'acceptCall'), isEmpty, reason: 'the SDK answers, not the app');
+    });
+
+    test('Accept after the INVITE rings: the SDK answers it at once, and the Trace does not say it is waiting',
+        () async {
+      await start();
+      await controller.connect();
+      await pumpEventQueue();
+      final data = vobizPush();
+      platform.pushController.add(data);
+      await pumpEventQueue();
+      client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
+      await pumpEventQueue();
+      screen.controller.add(accept('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      expect(client.actions, contains('reportAccepted:held-1@10.0.2.9'));
+      expect(client.callState, CallStateStatus.connecting, reason: 'the SDK answered the ringing call');
+      expect(controller.logs.map((l) => l.message), isNot(contains(contains('Waiting for the call Vobiz is holding'))));
     });
 
     test('Decline before the INVITE: reported to the SDK, logged as declined', () async {
@@ -172,7 +207,8 @@ void main() {
 
     test('a stale Vobiz push rings nothing', () async {
       await start();
-      platform.pushController.add(vobizPush(inSeconds: -5));
+      // Well past expiry: the SDK still takes a push up to 30 s late (a fast phone clock).
+      platform.pushController.add(vobizPush(inSeconds: -120));
       await pumpEventQueue();
       expect(screen.shown, isEmpty);
       expect(client.actions.where((a) => a.startsWith('handleIncomingPush')), isEmpty);
@@ -230,19 +266,105 @@ void main() {
       });
     }
 
-    test('turning Vobiz push on without Firebase says so, and registers nothing', () async {
+    test('Decline before the INVITE: the INVITE the SDK turns away rings nothing and is not a missed call', () async {
       await start();
+      await controller.connect();
+      await pumpEventQueue();
+      final data = vobizPush();
+      platform.pushController.add(data);
+      await pumpEventQueue();
+      screen.controller.add(decline('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      final shownBefore = List<String>.of(screen.shown);
+      // The SDK rejects the INVITE and forgets the push before the app hears
+      // of it: by then isPushedCall is false.
+      client.handledPush = null;
+      client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
+      await pumpEventQueue();
+      expect(controller.showIncoming, isFalse);
+      expect(screen.shown, shownBefore, reason: 'no second call screen');
+      client.emit(CallStateStatus.ended, callId: 'in_1', reason: 'Busy Here');
+      await pumpEventQueue();
+      expect(controller.history.records, hasLength(1));
+      expect(controller.history.byId('held-1@10.0.2.9')!.outcome, CallOutcome.declined);
+      expect(platform.requests.where((r) => r.startsWith('missed:')), isEmpty);
+    });
+
+    for (final from in <String>['the app', 'the ongoing-call notification']) {
+      test('Hang up from $from while an accepted held call is still arriving turns it away', () async {
+        await start();
+        final data = vobizPush();
+        platform.pushController.add(data);
+        await pumpEventQueue();
+        screen.controller.add(accept('held-1@10.0.2.9', data));
+        await pumpEventQueue();
+        expect(client.actions, contains('reportAccepted:held-1@10.0.2.9'));
+        client.actions.clear();
+        if (from == 'the app') {
+          await controller.hangup();
+        } else {
+          screen.controller.add(ck.CallEventActionCallEnded(
+              ck.CallKitParams(id: 'held-1@10.0.2.9', extra: PushCall.fromData(data)!.toExtra())));
+        }
+        await pumpEventQueue();
+        expect(client.actions, contains('reportDeclined:held-1@10.0.2.9'));
+        expect(screen.ended, contains('held-1@10.0.2.9'));
+        expect(platform.requests.last, 'stop');
+        expect(controller.history.byId('held-1@10.0.2.9')!.outcome, CallOutcome.declined);
+        // The INVITE comes during the sign-in; the SDK turns it away.
+        client.handledPush = null;
+        client.ring(callId: 'in_1', from: '+919876543210', sipCallId: 'held-1@10.0.2.9');
+        await pumpEventQueue();
+        expect(controller.showIncoming, isFalse);
+        expect(client.actions, isNot(contains('acceptCall')));
+      });
+    }
+
+    test('a push while the SDK is reconnecting leaves the sign-in to it', () async {
+      await start();
+      await controller.connect();
+      await pumpEventQueue();
+      client.connected = false;
+      client.connection = ConnectionStateStatus.reconnecting;
+      client.actions.clear();
+      final data = vobizPush();
+      platform.pushController.add(data);
+      await pumpEventQueue();
+      screen.controller.add(accept('held-1@10.0.2.9', data));
+      await pumpEventQueue();
+      expect(client.actions, <String>['handleIncomingPush:held-1@10.0.2.9', 'reportAccepted:held-1@10.0.2.9'],
+          reason: 'the SDK reconnects with its own sign-in and carries the claim: no second sign-in');
+    });
+
+    test('the same push delivered twice (queued before Dart was ready, then live) rings once', () async {
+      await start();
+      platform.pushController.add(vobizPush());
+      platform.pushController.add(vobizPush());
+      await pumpEventQueue();
+      expect(screen.shown.where((id) => id == 'held-1@10.0.2.9'), hasLength(1));
+      expect(client.actions.where((a) => a.startsWith('handleIncomingPush')), hasLength(1));
+      expect(client.actions.where((a) => a == 'connectWithAuthToken'), hasLength(1));
+    });
+
+    test('turning Vobiz push on without Firebase says so, and registers nothing', () async {
+      final requests = <http.Request>[];
+      await start(httpClient: MockClient((request) async {
+        requests.add(request);
+        return http.Response('{}', 200);
+      }));
       await controller.connect();
       await pumpEventQueue();
       await controller.setVobizPush(true);
       await pumpEventQueue();
       expect(controller.vobizPushState, PushState.failed);
       expect(controller.vobizPushDetail, isNotEmpty);
+      expect(requests, isEmpty);
     });
   });
 
   group('Vobiz push sign-up through the sample server', () {
     late FakeClient client;
+    late FakeCallPlatform platform;
     late PlaygroundController controller;
     late List<http.Request> requests;
     late http.Response Function(http.Request request) reply;
@@ -255,13 +377,14 @@ void main() {
         'vobiz_push_server': server,
       });
       client = FakeClient();
+      platform = FakeCallPlatform();
       requests = <http.Request>[];
       reply = (_) => http.Response('{"message":"ok"}', 200);
       controller = PlaygroundController(
         client: client,
         callScreen: FakeCallScreen(),
-        platform: FakeCallPlatform(),
-        push: _FakePush(),
+        platform: platform,
+        push: FakePush(),
         httpClient: MockClient((request) async {
           requests.add(request);
           return reply(request);
@@ -292,6 +415,14 @@ void main() {
       expect(body['app_bundle_id'], 'ai.vobiz.vobiz_webrtc_example');
       expect(body['device_id'], startsWith('vobiz-example-'));
       expect(body.containsKey('auth_id'), isFalse, reason: 'the server sets its own account');
+    });
+
+    test('sends the application id Android runs the app as', () async {
+      await start();
+      platform.appId = 'com.example.renamed';
+      await controller.setVobizPush(true);
+      await pumpEventQueue();
+      expect((jsonDecode(requests.single.body) as Map<String, Object?>)['app_bundle_id'], 'com.example.renamed');
     });
 
     test('a server reached under a path keeps that path', () async {
@@ -332,6 +463,7 @@ void main() {
     late FakeCallPlatform platform;
     late PlaygroundController controller;
     late List<http.Request> requests;
+    late FakePush push;
     late bool connectedAtCall;
     http.Response Function(http.Request request) reply = (_) => http.Response('{"message":"Call fired"}', 200);
 
@@ -351,11 +483,12 @@ void main() {
         if (request.url.path.endsWith('/Call/')) connectedAtCall = client.connected;
         return reply(request);
       });
+      push = FakePush();
       controller = PlaygroundController(
         client: client,
         callScreen: FakeCallScreen(),
         platform: platform,
-        push: _FakePush(),
+        push: push,
         httpClient: web,
       );
       await controller.init();
@@ -368,6 +501,49 @@ void main() {
     }
 
     tearDown(() => controller.dispose());
+
+    Iterable<http.Request> deviceRequests() => requests.where((r) => r.url.path.startsWith('/api/v1/devices/'));
+
+    test('without a sample server the phone signs up straight to Vobiz with the account headers', () async {
+      await ready();
+      final register = deviceRequests().single;
+      expect(register.method, 'POST');
+      expect(register.url.toString(), 'https://api.vobiz.ai/api/v1/devices/register');
+      expect(register.headers['X-Auth-ID'], 'MA_X');
+      expect(register.headers['X-Auth-Token'], 'tok');
+      expect(body(register)['sip_username'], 'play1');
+      expect(body(register)['push_token'], 'fcm-token-1');
+    });
+
+    test('a new Firebase token is signed up again, under the same device id', () async {
+      await ready();
+      final first = body(deviceRequests().single);
+      requests.clear();
+      push.pushToken = 'fcm-token-2';
+      push.refreshes.add('fcm-token-2');
+      await pumpEventQueue();
+      final again = body(deviceRequests().single);
+      expect(again['push_token'], 'fcm-token-2');
+      expect(again['device_id'], first['device_id']);
+    });
+
+    test('sign-out and switching off each take the device off Vobiz push, by its device id', () async {
+      await ready();
+      final deviceId = body(deviceRequests().single)['device_id'];
+      requests.clear();
+      await controller.setVobizPush(false);
+      final off = deviceRequests().single;
+      expect(off.method, 'DELETE');
+      expect(off.url.toString(), 'https://api.vobiz.ai/api/v1/devices/logout');
+      expect(body(off), <String, Object?>{'device_id': deviceId});
+      await controller.setVobizPush(true);
+      await pumpEventQueue();
+      requests.clear();
+      await controller.disconnect();
+      expect(deviceRequests().single.method, 'DELETE');
+      expect(body(deviceRequests().single), <String, Object?>{'device_id': deviceId});
+      expect(deviceRequests().single.headers['X-Auth-Token'], 'tok', reason: 'read before sign-out forgot it');
+    });
 
     test('drops the connection without signing off, as a killed app does, then calls its SIP user', () async {
       await ready();
@@ -429,7 +605,7 @@ void main() {
       expect(controller.logs.where((l) => l.type == LogType.error).length, greaterThanOrEqualTo(3));
     });
 
-    test('refuses while not signed in or not registered with Vobiz push', () async {
+    test('refuses while not signed up with Vobiz push', () async {
       await ready();
       await controller.setVobizPush(false);
       client.actions.clear();
@@ -438,12 +614,23 @@ void main() {
       expect(callRequests(), isEmpty);
     });
 
+    test('refuses while not signed in', () async {
+      await ready();
+      await controller.disconnect();
+      client.actions.clear();
+      await controller.callThisPhoneThroughVobiz();
+      expect(client.actions, isEmpty);
+      expect(callRequests(), isEmpty);
+      expect(controller.logs.last.message, contains('Connect'));
+    });
+
     test('Vobiz refusing the call is shown, and the phone stays offline waiting for a push', () async {
       await ready();
       reply = (_) => http.Response('{"error":"From number not owned by account"}', 400);
       await controller.callThisPhoneThroughVobiz();
       expect(controller.logs.map((l) => l.message), contains(contains('HTTP 400')));
       expect(controller.vobizCallPlacing, isFalse, reason: 'the button is usable again');
+      expect(controller.status, PhoneStatus.offline);
     });
 
     test('the caller ID and answer URL are remembered, as digits and a trimmed address', () async {
@@ -451,7 +638,7 @@ void main() {
       expect(controller.vobizCallFrom, '14155551234');
       expect(controller.vobizCallAnswerUrl, 'https://example.com/answer');
       final again = PlaygroundController(
-          client: FakeClient(), callScreen: FakeCallScreen(), platform: FakeCallPlatform(), push: _FakePush());
+          client: FakeClient(), callScreen: FakeCallScreen(), platform: FakeCallPlatform(), push: FakePush());
       addTearDown(again.dispose);
       await again.init();
       expect(again.vobizCallFrom, '14155551234');

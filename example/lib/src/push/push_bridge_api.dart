@@ -1,17 +1,28 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+
+/// Whether plain http:// is accepted for the sample server and the token
+/// server: only outside release builds, for a server on the developer's own
+/// machine or network. A release build sends the server's key and access
+/// tokens over https only.
+const bool kAllowHttp = !kReleaseMode;
 
 /// Where the sample server (`example/push_bridge`) is and the key the app
 /// sends it.
 ///
 /// The server prints both as one line, `https://<tunnel>#key=<key>`, so they
-/// can be pasted into the app together.
+/// can be pasted into the app together. The key is the server's whole
+/// credential: whoever holds it can mint access tokens, run conferences,
+/// watch calls and sign phones up for Vobiz push, so the app keeps the line
+/// in secure storage and forgets it at sign-out.
 class PushBridgeConfig {
   const PushBridgeConfig({required this.baseUrl, required this.key});
 
-  /// Reads the line the server prints. Null when it is not one.
-  static PushBridgeConfig? parse(String input) {
+  /// Reads the line the server prints. Null when it is not one, or when it is
+  /// plain http and [allowHttp] is false.
+  static PushBridgeConfig? parse(String input, {bool allowHttp = kAllowHttp}) {
     final text = input.trim();
     final hash = text.indexOf('#');
     if (hash < 0) return null;
@@ -19,15 +30,15 @@ class PushBridgeConfig {
     final key = Uri.splitQueryString(text.substring(hash + 1))['key']?.trim() ?? '';
     final uri = Uri.tryParse(base);
     if (uri == null || uri.host.isEmpty || key.isEmpty) return null;
-    if (uri.scheme != 'https' && uri.scheme != 'http') return null;
+    if (uri.scheme != 'https' && !(allowHttp && uri.scheme == 'http')) return null;
     return PushBridgeConfig(baseUrl: base, key: key);
   }
 
   final String baseUrl;
   final String key;
 
-  /// Vobiz can only reach the server over HTTPS; plain http is for a server
-  /// on the same network as an emulator.
+  /// Vobiz can only reach the server over HTTPS; plain http (not in release
+  /// builds) is for a server on the same network as an emulator.
   bool get isHttps => baseUrl.startsWith('https://');
 }
 
@@ -77,7 +88,7 @@ class PushBridgeApi {
   /// is given). [reason] is the SDK's (`sign_in`, `expiring`, `rejected`,
   /// `refresh`).
   Future<String> accessToken({String? sub, required String reason}) async {
-    final json = await _post('/token', <String, Object?>{'reason': reason, if (sub != null) 'sub': sub});
+    final json = await _post('/token', <String, Object?>{'reason': reason, 'sub': ?sub});
     final token = json['token'];
     if (token is! String || token.isEmpty) {
       throw PushBridgeException('The sample server returned no token');

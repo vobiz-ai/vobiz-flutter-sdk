@@ -4,6 +4,7 @@ import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import 'package:vobiz_webrtc_example/src/push/call_platform.dart';
 import 'package:vobiz_webrtc_example/src/push/call_screen.dart';
+import 'package:vobiz_webrtc_example/src/push/push_service.dart';
 
 /// A VobizClient that never opens a socket: tests drive its events and read
 /// back what the app asked of it.
@@ -20,6 +21,17 @@ class FakeClient implements VobizClient {
 
   /// Sign-in completes and registers at once.
   bool registerOnConnect = true;
+
+  /// When set, the next Zero-Config or SIP Direct sign-in throws it (and
+  /// clears it), as the SDK does when its first socket attempt fails.
+  Object? failConnect;
+
+  void _throwIfFailing() {
+    final fail = failConnect;
+    if (fail == null) return;
+    failConnect = null;
+    throw fail;
+  }
 
   bool connected = false;
   CallStateStatus state = CallStateStatus.idle;
@@ -66,6 +78,11 @@ class FakeClient implements VobizClient {
   /// Every token passed to [connectWithAccessToken] / [updateAccessToken].
   final List<String> tokens = <String>[];
 
+  /// The SDK's token session reads it to time its refresh; the fake has no
+  /// registrar to say.
+  @override
+  Duration? get accessTokenTimeLeft => null;
+
   @override
   Future<void> connectWithAccessToken(String token) async {
     actions.add('connectWithAccessToken');
@@ -99,6 +116,7 @@ class FakeClient implements VobizClient {
   @override
   Future<ZeroConfigSession> connectWithAuthToken({required String authId, required String authToken}) async {
     actions.add('connectWithAuthToken');
+    _throwIfFailing();
     final gate = setupGate;
     if (gate != null) await gate.future;
     mode = VobizAuthMode.zeroConfig;
@@ -109,6 +127,7 @@ class FakeClient implements VobizClient {
   @override
   Future<void> connectWithCredentials(CredentialConfig config) async {
     actions.add('connectWithCredentials');
+    _throwIfFailing();
     mode = VobizAuthMode.sipDirect;
     _register(config.username);
   }
@@ -132,6 +151,10 @@ class FakeClient implements VobizClient {
     mode = VobizAuthMode.none;
   }
 
+  /// When set, [makeCall] throws it before anything is sent, as the SDK
+  /// does for a destination or caller ID it refuses.
+  Object? failMakeCall;
+
   @override
   Future<String> makeCall(
     String destination, {
@@ -141,9 +164,27 @@ class FakeClient implements VobizClient {
     String? dialUser,
   }) async {
     actions.add('makeCall');
+    final fail = failMakeCall;
+    if (fail != null) throw fail;
     state = CallStateStatus.connecting;
     direction = CallDirection.outbound;
     return 'out-1';
+  }
+
+  /// The caller ID of each [transferCall].
+  final List<String?> transferCallerIds = <String?>[];
+
+  @override
+  Future<String> transferCall({
+    String? number,
+    String? sipUser,
+    TransferLeg leg = TransferLeg.aLeg,
+    String? callerId,
+    Map<String, String> sipHeaders = const <String, String>{},
+  }) async {
+    actions.add('transferCall');
+    transferCallerIds.add(callerId);
+    return 'Transfer accepted';
   }
 
   @override
@@ -184,8 +225,13 @@ class FakeClient implements VobizClient {
     return true;
   }
 
+  /// As the SDK does: a pushed call that rings here already is answered at
+  /// once, so the state moves on from incoming.
   @override
-  void reportCallScreenAccepted(VobizIncomingPush push) => actions.add('reportAccepted:${push.callId}');
+  void reportCallScreenAccepted(VobizIncomingPush push) {
+    actions.add('reportAccepted:${push.callId}');
+    if (state == CallStateStatus.incoming && pushedCallId != null) state = CallStateStatus.connecting;
+  }
   @override
   void reportCallScreenDeclined(VobizIncomingPush push) => actions.add('reportDeclined:${push.callId}');
 
@@ -251,8 +297,11 @@ class FakeCallScreen extends CallScreenApi {
   @override
   Future<List<ck.CallKitParams>> active() async => List<ck.CallKitParams>.of(screens);
 
+  /// What [canUseFullScreen] answers.
+  bool? fullScreen;
+
   @override
-  Future<bool?> canUseFullScreen() async => null;
+  Future<bool?> canUseFullScreen() async => fullScreen;
 }
 
 /// The Android side (call service, missed-call notifications), recorded.
@@ -268,8 +317,22 @@ class FakeCallPlatform extends CallPlatform {
   @override
   Stream<void> get hangUpRequests => hangUpController.stream;
 
+  /// Pushes Android received before Dart was listening (the push that
+  /// started a closed app): [ready] hands them over once.
+  final List<Map<String, String>> queued = <Map<String, String>>[];
+
   @override
-  Future<List<Map<String, String>>> ready() async => const <Map<String, String>>[];
+  Future<List<Map<String, String>>> ready() async {
+    final pushes = List<Map<String, String>>.of(queued);
+    queued.clear();
+    return pushes;
+  }
+
+  /// What [packageName] returns: the application id in build.gradle.kts.
+  String? appId = 'ai.vobiz.vobiz_webrtc_example';
+
+  @override
+  Future<String?> packageName() async => appId;
 
   @override
   Future<void> startCallService({required String caller, required bool outbound}) async =>
@@ -279,6 +342,34 @@ class FakeCallPlatform extends CallPlatform {
   Future<void> stopCallService() async => requests.add('stop');
 
   @override
+  Future<void> leaveLockScreen() async => requests.add('leaveLockScreen');
+
+  @override
   Future<void> showMissedCall({required String id, required String caller}) async =>
       requests.add('missed:$id');
+}
+
+/// Firebase, as a test sees it: set up, with one token, and token refreshes
+/// the test sends through [refreshes].
+class FakePush extends PushService {
+  FakePush() : super.unavailable('fake');
+
+  /// What [token] returns.
+  String? pushToken = 'fcm-token-1';
+  final StreamController<String> refreshes = StreamController<String>.broadcast();
+
+  @override
+  bool get available => true;
+
+  @override
+  Future<String?> token() async => pushToken;
+
+  @override
+  Stream<String> get tokenRefresh => refreshes.stream;
+
+  @override
+  Future<bool?> requestNotificationPermission() async => true;
+
+  @override
+  Future<bool?> notificationsAllowed() async => true;
 }

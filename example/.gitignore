@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Release signing (android/app/build.gradle.kts): the upload keystore and its
+# passwords stay on the build machine, wherever they are kept.
+key.properties
+*.jks
+*.keystore

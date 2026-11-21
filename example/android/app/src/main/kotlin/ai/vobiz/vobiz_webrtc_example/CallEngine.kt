@@ -29,7 +29,8 @@ import io.flutter.plugin.common.MethodChannel
  * handlers).
  *
  * The method channel `ai.vobiz.example/call` (Dart: CallPlatform):
- *  - Dart -> Android: ready, startCallService, stopCallService, showMissedCall
+ *  - Dart -> Android: ready, packageName, startCallService, stopCallService,
+ *    leaveLockScreen, showMissedCall
  *  - Android -> Dart: push(data), hangUp()
  */
 object CallEngine {
@@ -107,6 +108,7 @@ object CallEngine {
                     pending.clear()
                     result.success(queued)
                 }
+                "packageName" -> result.success(context.packageName)
                 "startCallService" -> {
                     CallService.start(
                         context,
@@ -116,7 +118,14 @@ object CallEngine {
                     result.success(null)
                 }
                 "stopCallService" -> {
+                    // The call is over: so is showing over the lock screen.
                     CallService.stop(context)
+                    MainActivity.leaveLockScreen()
+                    result.success(null)
+                }
+                "leaveLockScreen" -> {
+                    // An accepted call screen led to no call; a running call keeps it.
+                    if (!CallService.running) MainActivity.leaveLockScreen()
                     result.success(null)
                 }
                 "showMissedCall" -> {

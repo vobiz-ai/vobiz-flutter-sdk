@@ -1,13 +1,16 @@
 name: vobiz_webrtc_example
 description: >-
-  Vobiz Playground for Flutter: sign in with Zero-Config Setup or SIP Direct,
-  then call with a caller ID, custom SIP headers, recording, Dial-User and
-  transfer. The same options as the Vobiz WebRTC Playground on the web.
+  Vobiz Playground for Flutter: sign in with Zero-Config Setup, SIP Direct or
+  an access token, then call with a caller ID, custom SIP headers, recording,
+  Dial-User, transfer and conference, and receive calls with Vobiz push. The
+  same options as the Vobiz WebRTC Playground on the web.
 publish_to: 'none'
 version: 2.0.0+1
 
 environment:
-  sdk: ">=3.3.0 <4.0.0"
+  # What the dependencies below need (flutter_lints 6: Dart 3.8; firebase_core 4: Flutter 3.27).
+  sdk: ^3.8.0
+  flutter: ">=3.27.0"
 
 dependencies:
   flutter:

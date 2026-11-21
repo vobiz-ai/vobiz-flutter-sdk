@@ -68,6 +68,8 @@
 	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>The microphone carries your voice on Vobiz calls.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Vobiz calls are audio only; this app does not use the camera.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

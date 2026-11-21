@@ -153,6 +153,13 @@ void main() {
     expect(add.headers.containsKey('Authorization'), isFalse);
     expect((jsonDecode(add.body) as Map<String, Object?>)['call_uuid'], 'ref-1');
     expect(controller.conferenceError, 'not now');
+
+    // The next call starts clean: no error and no half-typed target from this one.
+    client.emit(CallStateStatus.ended);
+    await pumpEventQueue();
+    expect(controller.conferenceError, isEmpty);
+    expect(controller.conferenceNumber, isEmpty);
+    expect(controller.conferenceBusy, isFalse);
     controller.dispose();
   });
 

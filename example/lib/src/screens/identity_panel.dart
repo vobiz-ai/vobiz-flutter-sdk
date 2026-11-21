@@ -58,7 +58,9 @@ class _IdentityPanelState extends State<IdentityPanel> {
 
   Future<void> _editWebhook() async {
     final c = widget.controller;
-    final field = TextEditingController(text: c.webhookUrl);
+    // No controller to dispose: the dialog's field still rebuilds while it
+    // animates out, after showDialog has returned.
+    var text = c.webhookUrl;
     final result = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
@@ -75,11 +77,13 @@ class _IdentityPanelState extends State<IdentityPanel> {
               style: TextStyle(fontSize: 12, height: 1.4, color: context.pg.muted),
             ),
             const SizedBox(height: 12),
-            TextField(
-              controller: field,
+            TextFormField(
+              key: const Key('webhookField'),
+              initialValue: text,
               autofocus: true,
               keyboardType: TextInputType.url,
               decoration: const InputDecoration(hintText: 'https://abc.ngrok-free.app'),
+              onChanged: (v) => text = v,
             ),
           ],
         ),
@@ -91,13 +95,12 @@ class _IdentityPanelState extends State<IdentityPanel> {
           TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
           FilledButton(
             style: FilledButton.styleFrom(minimumSize: const Size(80, 40)),
-            onPressed: () => Navigator.of(context).pop(field.text.trim()),
+            onPressed: () => Navigator.of(context).pop(text.trim()),
             child: const Text('Save'),
           ),
         ],
       ),
     );
-    field.dispose();
     if (result != null && result.isNotEmpty) c.update(() => c.webhookUrl = result);
   }
 
@@ -128,7 +131,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
                 const SizedBox(height: 18),
                 PushPanel(controller: c),
                 const SizedBox(height: 28),
-                _faq(pg),
+                _faq(c, pg),
               ],
             ),
           ),
@@ -150,7 +153,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
         ),
         child: Row(
           children: <Widget>[
-            _tab('Zero-Config Setup', Icons.code, zero, () => c.setAuthTab(AuthTab.zeroConfig), pg),
+            if (c.demoTools) _tab('Zero-Config Setup', Icons.code, zero, () => c.setAuthTab(AuthTab.zeroConfig), pg),
             _tab('SIP Direct', Icons.call_outlined, c.authTab == AuthTab.sipDirect,
                 () => c.setAuthTab(AuthTab.sipDirect), pg),
             _tab('Access token', Icons.key_outlined, token, () => c.setAuthTab(AuthTab.accessToken), pg),
@@ -224,8 +227,9 @@ class _IdentityPanelState extends State<IdentityPanel> {
             trailing: InfoTip(
                 title: 'Auth Token',
                 message: 'On your Vobiz Console Dashboard, next to the Auth ID. It is not your '
-                    'login password. It is sent once to the webhook server to set up your '
-                    'endpoint, and kept only in memory for transfers.')),
+                    'login password. It is sent to the webhook server at each sign-in and each '
+                    'transfer. With Remember me on, it is also saved in this phone\'s secure storage '
+                    'until you sign out.')),
         TextField(
           key: const Key('authToken'),
           controller: _authToken,
@@ -310,7 +314,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
         const SizedBox(height: 8),
         Text(
           'An endpoint from Vobiz Console → Voice → Endpoints. Nothing is provisioned, and no '
-          'account credentials reach this device. Transfer needs Zero-Config.',
+          'account credentials reach this device.${c.demoTools ? ' Transfer needs Zero-Config.' : ''}',
           style: TextStyle(fontSize: 11, height: 1.4, color: pg.faint),
         ),
       ],
@@ -320,10 +324,10 @@ class _IdentityPanelState extends State<IdentityPanel> {
           Checkbox(
             key: const Key('rememberMe'),
             value: c.rememberMe,
-            onChanged: (v) => c.update(() => c.rememberMe = v ?? false),
+            onChanged: (v) => c.setRememberMe(v ?? false),
           ),
           GestureDetector(
-            onTap: () => c.update(() => c.rememberMe = !c.rememberMe),
+            onTap: () => c.setRememberMe(!c.rememberMe),
             child: Text('Remember me', style: TextStyle(fontSize: 12, color: pg.muted)),
           ),
         ],
@@ -471,7 +475,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
     );
   }
 
-  Widget _faq(PlaygroundColors pg) {
+  Widget _faq(PlaygroundController c, PlaygroundColors pg) {
     Widget qa(String q, String a) => Padding(
           padding: const EdgeInsets.only(bottom: 14),
           child: Column(
@@ -493,13 +497,15 @@ class _IdentityPanelState extends State<IdentityPanel> {
               style: TextStyle(fontSize: 10, letterSpacing: 1.6, fontWeight: FontWeight.w700, color: pg.faint)),
         ]),
         const SizedBox(height: 12),
-        qa('Where do I find my credentials?',
-            'Auth ID and Auth Token are both on your Vobiz Console Dashboard. The Auth Token is not your login password.'),
+        if (c.demoTools)
+          qa('Where do I find my credentials?',
+              'Auth ID and Auth Token are both on your Vobiz Console Dashboard. The Auth Token is not your login password.'),
         qa('Why do I need a Caller ID?',
             'Carriers require an E.164 CLI to bridge calls to mobile or landlines. Use a number purchased from Vobiz or your assigned trial number.'),
-        qa('What does Zero-Config Setup create?',
-            'An application named "Vobiz WebRTC Playground" and an endpoint aliased "Vobiz WebRTC Playground Endpoint" on your account — '
-            'the same ones the web Playground uses, so signing in here gives that endpoint a new password.'),
+        if (c.demoTools)
+          qa('What does Zero-Config Setup create?',
+              'An application named "Vobiz WebRTC Playground" and an endpoint aliased "Vobiz WebRTC Playground Endpoint" on your account — '
+              'the same ones the web Playground uses, so signing in here gives that endpoint a new password.'),
         qa('What is access-token sign-in?',
             'Your server mints a short-lived JWT with POST /api/v1/Account/{auth_id}/JWT/Token/ and the '
             'app signs in with it as <sub>_<Auth ID>. The token\'s "app" picks the application whose '

@@ -4,18 +4,28 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import com.hiennv.flutter_callkit_incoming.CallkitConstants
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import java.lang.ref.WeakReference
 
 class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        showOverLockScreenWhenAnswering(intent)
+        current = WeakReference(this)
+        // Re-created (after Android killed the process, say), the activity is
+        // handed its first intent again: that is not a new Accept.
+        showOverLockScreen(savedInstanceState == null && isCallAccept(intent))
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        showOverLockScreenWhenAnswering(intent)
+        showOverLockScreen(isCallAccept(intent))
+    }
+
+    override fun onDestroy() {
+        if (current?.get() === this) current = null
+        super.onDestroy()
     }
 
     /**
@@ -25,17 +35,38 @@ class MainActivity : FlutterActivity() {
      */
     override fun provideFlutterEngine(context: Context): FlutterEngine = CallEngine.obtain(context)
 
+    // This activity is exported. FlutterActivity reads its engine choices from
+    // the launch intent's extras (cached_engine_id, cached_engine_group_id,
+    // destroy_engine_with_activity); no intent may pick another engine or have
+    // the call engine destroyed with the activity.
+    override fun getCachedEngineId(): String? = null
+
+    override fun getCachedEngineGroupId(): String? = null
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
+    /** Accept on the incoming-call screen: the plugin opens the app with this action. */
+    private fun isCallAccept(intent: Intent?): Boolean = intent?.action == CallkitConstants.ACTION_CALL_ACCEPT
+
     /**
-     * Accept on the incoming-call screen opens the app with the call screen's
-     * ACTION_CALL_ACCEPT. Only then does the app show over the lock screen,
-     * so the call can be seen without unlocking; opened any other way, it
-     * stays behind the lock screen as usual.
+     * Accept on the incoming-call screen opens the app over the lock screen,
+     * so the call can be seen without unlocking, until that call ends
+     * ([leaveLockScreen]). Opened any other way, it stays behind the lock
+     * screen as usual.
      */
-    private fun showOverLockScreenWhenAnswering(intent: Intent?) {
-        val answering = intent?.action?.endsWith("ACTION_CALL_ACCEPT") == true
+    private fun showOverLockScreen(on: Boolean) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            setShowWhenLocked(answering)
-            setTurnScreenOn(answering)
+            setShowWhenLocked(on)
+            setTurnScreenOn(on)
+        }
+    }
+
+    companion object {
+        private var current: WeakReference<MainActivity>? = null
+
+        /** The call is over: the app goes back behind the lock screen. Main thread only. */
+        fun leaveLockScreen() {
+            current?.get()?.showOverLockScreen(false)
         }
     }
 }

@@ -25,6 +25,43 @@ class _PushPanelState extends State<PushPanel> {
   bool _showServer = false;
   String? _error;
 
+  // The controller's values each field was last filled from. init() reads
+  // secure storage after the first frame, and a sign-out clears the server
+  // line: a field takes the controller's new value then, but never
+  // overwrites what the user is typing.
+  late String _serverFrom;
+  late String _pushAuthIdFrom;
+  late String _pushAuthTokenFrom;
+  late String _callFromFrom;
+  late String _callAnswerUrlFrom;
+
+  @override
+  void initState() {
+    super.initState();
+    final c = widget.controller;
+    _serverFrom = c.pushServer;
+    _pushAuthIdFrom = c.pushAuthId;
+    _pushAuthTokenFrom = c.pushAuthToken;
+    _callFromFrom = c.vobizCallFrom;
+    _callAnswerUrlFrom = c.vobizCallAnswerUrl;
+  }
+
+  @override
+  void didUpdateWidget(PushPanel old) {
+    super.didUpdateWidget(old);
+    final c = widget.controller;
+    _serverFrom = _follow(_server, _serverFrom, c.pushServer);
+    _pushAuthIdFrom = _follow(_pushAuthId, _pushAuthIdFrom, c.pushAuthId);
+    _pushAuthTokenFrom = _follow(_pushAuthToken, _pushAuthTokenFrom, c.pushAuthToken);
+    _callFromFrom = _follow(_callFrom, _callFromFrom, c.vobizCallFrom);
+    _callAnswerUrlFrom = _follow(_callAnswerUrl, _callAnswerUrlFrom, c.vobizCallAnswerUrl);
+  }
+
+  String _follow(TextEditingController field, String from, String now) {
+    if (now != from) field.text = now;
+    return now;
+  }
+
   @override
   void dispose() {
     _server.dispose();
@@ -120,7 +157,8 @@ class _PushPanelState extends State<PushPanel> {
           action: c.fullScreenAllowed == false ? c.requestCallPermissions : null),
       _check(pg, 'Remember me', c.rememberMe,
           'Lets the app sign itself in to answer when it was closed'),
-      if (c.vobizPush) ...<Widget>[
+      // Demo and test-only tools: never in a release build unless it asks for them.
+      if (c.vobizPush && c.demoTools) ...<Widget>[
         const SizedBox(height: 8),
         Text(
           'TEST ONLY: without a sample server line, signing this phone up takes the account\'s Auth ID '
@@ -192,22 +230,24 @@ class _PushPanelState extends State<PushPanel> {
                   height: 1.4,
                   color: c.vobizPushState == PushState.failed ? pg.danger : pg.muted)),
         ),
-      OutlinedButton.icon(
-        key: const Key('vobizTestCall'),
-        onPressed: c.vobizPushState == PushState.ready && c.client.isConnected && !c.vobizCallPlacing
-            ? c.callThisPhoneThroughVobiz
-            : null,
-        icon: const Icon(Icons.phone_callback_outlined, size: 16),
-        label: const Text('Call this phone through Vobiz'),
-      ),
-      Padding(
-        padding: const EdgeInsets.only(top: 4),
-        child: Text(
-          'Drops the connection without signing off, as when Android closes the app, then places a real '
-          'call: Vobiz should push this phone, and the app sign back in to take it.',
-          style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.faint),
+      if (c.demoTools) ...<Widget>[
+        OutlinedButton.icon(
+          key: const Key('vobizTestCall'),
+          onPressed: c.vobizPushState == PushState.ready && c.client.isConnected && !c.vobizCallPlacing
+              ? c.callThisPhoneThroughVobiz
+              : null,
+          icon: const Icon(Icons.phone_callback_outlined, size: 16),
+          label: const Text('Call this phone through Vobiz'),
         ),
-      ),
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            'Drops the connection without signing off, as when Android closes the app, then places a real '
+            'call: Vobiz should push this phone, and the app sign back in to take it.',
+            style: TextStyle(fontSize: 10.5, height: 1.35, color: pg.faint),
+          ),
+        ),
+      ],
     ];
   }
 
@@ -238,6 +278,7 @@ class _PushPanelState extends State<PushPanel> {
         keyboardType: TextInputType.url,
         style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
         decoration: InputDecoration(
+          labelText: 'Sample server',
           hintText: 'https://….trycloudflare.com#key=…',
           errorText: _error,
           suffixIcon: Row(

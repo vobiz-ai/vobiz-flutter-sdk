@@ -52,8 +52,14 @@ class _DialerPanelState extends State<DialerPanel> {
             children: <Widget>[
               Text('DIALER TERMINAL',
                   style: TextStyle(fontSize: 11, letterSpacing: 1.8, fontWeight: FontWeight.w600, color: pg.faint)),
-              const Spacer(),
-              StatusPill(status: c.status, text: c.statusText),
+              const SizedBox(width: 8),
+              // All the room the title leaves; a long status is cut short.
+              Expanded(
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: StatusPill(status: c.status, text: c.statusText),
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 16),
@@ -119,7 +125,7 @@ class _DialerPanelState extends State<DialerPanel> {
               const SizedBox(height: 10),
               RecentCallsPanel(controller: c),
               const SizedBox(height: 14),
-              Keypad(onKey: c.pressKey, compact: true),
+              Keypad(onKey: c.pressKey),
               const SizedBox(height: 8),
             ],
           ),
@@ -166,23 +172,7 @@ class _DialerPanelState extends State<DialerPanel> {
             textAlign: TextAlign.center, style: TextStyle(fontSize: 18, color: pg.muted)),
         const SizedBox(height: 20),
         if (headers.isNotEmpty)
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: pg.field,
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: pg.accent.withValues(alpha: 0.3)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text('# SIP HEADERS ON THIS CALL',
-                    style: TextStyle(fontSize: 9, letterSpacing: 1.4, fontWeight: FontWeight.w700, color: pg.accent)),
-                const SizedBox(height: 6),
-                HeaderTable(headers),
-              ],
-            ),
-          )
+          _headersBox(pg, headers, highlight: true)
         else
           Text('No custom SIP headers on this call',
               textAlign: TextAlign.center,
@@ -274,33 +264,16 @@ class _DialerPanelState extends State<DialerPanel> {
               ],
               if (headers != null && headers.headers.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 16),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: pg.field,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: pg.border),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Row(children: <Widget>[
-                        Text('# SIP HEADERS ON THIS CALL',
-                            style: TextStyle(
-                                fontSize: 9, letterSpacing: 1.4, fontWeight: FontWeight.w700, color: pg.faint)),
-                        const SizedBox(width: 6),
-                        Chip2(headers.direction == CallDirection.inbound ? 'RECEIVED' : 'SENT',
-                            color: headers.direction == CallDirection.inbound ? pg.success : pg.info),
-                      ]),
-                      const SizedBox(height: 6),
-                      HeaderTable(headers.headers),
-                    ],
-                  ),
+                _headersBox(
+                  pg,
+                  headers.headers,
+                  chip: Chip2(headers.direction == CallDirection.inbound ? 'RECEIVED' : 'SENT',
+                      color: headers.direction == CallDirection.inbound ? pg.success : pg.info),
                 ),
               ],
               if (_showDtmf && live) ...<Widget>[
                 const SizedBox(height: 16),
-                Keypad(onKey: c.pressKey, compact: true),
+                Keypad(onKey: c.pressKey),
               ],
             ],
           ),
@@ -313,6 +286,7 @@ class _DialerPanelState extends State<DialerPanel> {
               icon: c.isMuted ? Icons.mic_off : Icons.mic,
               label: c.isMuted ? 'Unmute' : 'Mute',
               active: c.isMuted,
+              toggle: true,
               onTap: live ? c.toggleMute : null,
               pg: pg,
             ),
@@ -320,6 +294,7 @@ class _DialerPanelState extends State<DialerPanel> {
               icon: Icons.dialpad,
               label: 'Keypad',
               active: _showDtmf,
+              toggle: true,
               onTap: live ? () => setState(() => _showDtmf = !_showDtmf) : null,
               pg: pg,
             ),
@@ -327,6 +302,7 @@ class _DialerPanelState extends State<DialerPanel> {
               icon: c.speakerOn ? Icons.volume_up : Icons.volume_down,
               label: 'Speaker',
               active: c.speakerOn,
+              toggle: true,
               onTap: c.toggleSpeaker,
               pg: pg,
             ),
@@ -358,34 +334,70 @@ class _DialerPanelState extends State<DialerPanel> {
     );
   }
 
+  /// The SIP headers of the ringing or connected call.
+  Widget _headersBox(PlaygroundColors pg, Map<String, String> headers, {bool highlight = false, Widget? chip}) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: pg.field,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: highlight ? pg.accent.withValues(alpha: 0.3) : pg.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(children: <Widget>[
+            Text('# SIP HEADERS ON THIS CALL',
+                style: TextStyle(
+                    fontSize: 9, letterSpacing: 1.4, fontWeight: FontWeight.w700, color: highlight ? pg.accent : pg.faint)),
+            if (chip != null) ...<Widget>[const SizedBox(width: 6), chip],
+          ]),
+          const SizedBox(height: 6),
+          HeaderTable(headers),
+        ],
+      ),
+    );
+  }
+
+  /// One in-call button: a round icon with its caption, read out as one
+  /// button (with its on/off state when it is a [toggle]).
   Widget _control({
     required IconData icon,
     required String label,
     required bool active,
     required VoidCallback? onTap,
     required PlaygroundColors pg,
+    bool toggle = false,
   }) {
     final enabled = onTap != null;
-    return Opacity(
-      opacity: enabled ? 1 : 0.4,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          Material(
-            color: active ? pg.accent : pg.field,
-            shape: const CircleBorder(),
-            child: InkWell(
-              customBorder: const CircleBorder(),
-              onTap: onTap,
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Icon(icon, color: active ? Colors.white : pg.text, size: 22),
+    return MergeSemantics(
+      child: Semantics(
+        button: true,
+        enabled: enabled,
+        toggled: toggle ? active : null,
+        label: label,
+        child: Opacity(
+          opacity: enabled ? 1 : 0.4,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Material(
+                color: active ? pg.accent : pg.field,
+                shape: const CircleBorder(),
+                child: InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: onTap,
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Icon(icon, color: active ? Colors.white : pg.text, size: 22),
+                  ),
+                ),
               ),
-            ),
+              const SizedBox(height: 6),
+              ExcludeSemantics(child: Text(label, style: TextStyle(fontSize: 11, color: pg.muted))),
+            ],
           ),
-          const SizedBox(height: 6),
-          Text(label, style: TextStyle(fontSize: 11, color: pg.muted)),
-        ],
+        ),
       ),
     );
   }

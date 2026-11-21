@@ -123,12 +123,25 @@ class PlaygroundController extends ChangeNotifier {
     CallScreenApi? callScreen,
     CallPlatform? platform,
     http.Client? httpClient,
-  })  : client = client ?? createPlaygroundClient(),
+    this.demoTools = kDemoTools,
+    this.allowHttp = kAllowHttp,
+  })  : client = client ?? createPlaygroundClient(demoTools: demoTools),
         _http = httpClient,
         _secure = secureStorage ?? const FlutterSecureStorage(),
         push = push ?? PushService.unavailable('Push is not set up in this build.'),
         callScreen = callScreen ?? const CallScreenApi(),
-        platform = platform ?? CallPlatform();
+        platform = platform ?? CallPlatform(),
+        authTab = demoTools ? AuthTab.zeroConfig : AuthTab.sipDirect;
+
+  /// Whether this build has the demo and test-only tools ([kDemoTools]):
+  /// Zero-Config sign-in, typing account credentials for Vobiz push sign-up,
+  /// and "Call this phone through Vobiz". Without them nothing sends the
+  /// account's Auth ID or Auth Token anywhere.
+  final bool demoTools;
+
+  /// Whether a plain http:// sample server or token server is accepted
+  /// ([kAllowHttp]: not in release builds).
+  final bool allowHttp;
 
   final VobizClient client;
   final FlutterSecureStorage _secure;
@@ -152,7 +165,8 @@ class PlaygroundController extends ChangeNotifier {
   void Function(int tab)? onTabRequest;
 
   // ── Sign-in form ────────────────────────────────────────────────────────────
-  AuthTab authTab = AuthTab.zeroConfig;
+  /// Zero-Config only with [demoTools].
+  AuthTab authTab;
   String authId = '';
   String authToken = '';
   String sipUsername = '';
@@ -310,8 +324,6 @@ class PlaygroundController extends ChangeNotifier {
   /// Android 14+ permission to take over the lock screen; null while unknown.
   bool? fullScreenAllowed;
 
-  bool _inForeground = true;
-
   /// The call screen showing the current call, and whether Accept was
   /// tapped there (it then becomes the ongoing-call notification).
   String? _callScreenId;
@@ -326,7 +338,13 @@ class PlaygroundController extends ChangeNotifier {
   /// its active calls); each call is taken once.
   final Set<String> _takenCalls = <String>{};
 
-  PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer);
+  /// Calls Vobiz holds that were turned away before their INVITE arrived
+  /// (Decline, or Hang up after Accept), by the push's call id. The SDK
+  /// rejects the INVITE and forgets the push as it arrives, so the app must
+  /// know it by itself: it is not a new call to ring.
+  final Set<String> _turnedAway = <String>{};
+
+  PushBridgeConfig? get bridgeConfig => PushBridgeConfig.parse(pushServer, allowHttp: allowHttp);
 
   // ── Incoming calls (Vobiz push) ─────────────────────────────────────────────
   /// Sign this phone up with Vobiz's push service after signing in. A call
@@ -362,15 +380,12 @@ class PlaygroundController extends ChangeNotifier {
   /// This install's id with Vobiz push, made once and kept.
   String? _pushDeviceId;
 
-  /// The app's package name: Vobiz pushes with the Firebase key saved for it.
-  static const String appBundleId = 'ai.vobiz.vobiz_webrtc_example';
-
   /// Calls Vobiz pushed, still ringing, by the push's call id (the SIP
   /// Call-ID of the held INVITE).
   final Map<String, PushCall> _ringingPushes = <String, PushCall>{};
 
-  /// Pushes handled already: one push can arrive both through Firebase's
-  /// onMessage (app open) and through the app's own receiver.
+  /// Pushes handled already: Firebase can deliver one message more than
+  /// once.
   final Set<String> _seenPushes = <String>{};
 
   /// The inbound call ringing or connected here, until its outcome is logged.
@@ -440,7 +455,6 @@ class PlaygroundController extends ChangeNotifier {
     _subs.add(client.callEvents.listen(_onCall));
     _subs.add(client.errorEvents.listen(_onError));
     _subs.add(callScreen.events.listen(_onCallScreenEvent, onError: (Object _) {}));
-    _subs.add(push.foregroundCalls.listen(_onPush));
     _subs.add(platform.pushes.listen(_onPushData));
     _subs.add(platform.hangUpRequests.listen((_) => hangup()));
     _subs.add(push.tokenRefresh.listen((_) => _registerWithVobizPush(quiet: true)));
@@ -486,6 +500,7 @@ class PlaygroundController extends ChangeNotifier {
   // ── Sign in / out ───────────────────────────────────────────────────────────
 
   void setAuthTab(AuthTab tab) {
+    if (tab == AuthTab.zeroConfig && !demoTools) return;
     authTab = tab;
     notifyListeners();
   }
@@ -534,9 +549,10 @@ class PlaygroundController extends ChangeNotifier {
     }
     if (token && tokenServerUrl.trim().isNotEmpty) {
       final url = Uri.tryParse(tokenServerUrl.trim());
-      if (url == null || url.host.isEmpty || (url.scheme != 'https' && url.scheme != 'http')) {
+      if (url == null || url.host.isEmpty || !(url.scheme == 'https' || (allowHttp && url.scheme == 'http'))) {
         missingFields = <String>{'tokenServer'};
-        return _connectFailed('The token server must be an http(s) URL, such as https://<your server>/token');
+        return _connectFailed('The token server must be an ${allowHttp ? 'http(s)' : 'https'} URL, such as '
+            'https://<your server>/token');
       }
     }
 
@@ -599,6 +615,16 @@ class PlaygroundController extends ChangeNotifier {
       connectedAs = null;
       await _stopTokenSession();
       connectError = token ? 'Access token error: ${e.message}' : 'API Setup Error: ${e.message}';
+      log(connectError!, LogType.error);
+      _setStatus(PhoneStatus.offline, 'Error');
+    } on ArgumentError catch (e) {
+      // Refused before anything was sent (a SIP username with a space, say).
+      if (session_ != _session) return;
+      _loginTimeout?.cancel();
+      connectedAs = null;
+      await _stopTokenSession();
+      connectError = 'Sign-in refused: ${e.message}';
+      if (sip) missingFields = <String>{'sipUsername'};
       log(connectError!, LogType.error);
       _setStatus(PhoneStatus.offline, 'Error');
     } catch (e) {
@@ -678,20 +704,40 @@ class PlaygroundController extends ChangeNotifier {
     await client.disconnect();
   }
 
-  /// Signs out, and forgets the saved Auth Token and SIP password: after a
-  /// sign-out nothing on this device can sign in as this account again.
-  Future<void> disconnect() async {
+  /// The sign-out in progress, so a second Disconnect joins it.
+  Future<void>? _disconnecting;
+
+  /// Signs out on this device first (the registration, the access-token
+  /// session, every saved secret: after a sign-out nothing on this device
+  /// can sign in as this account again), then takes the phone off Vobiz
+  /// push. A second call while one runs joins it.
+  Future<void> disconnect() {
+    final running = _disconnecting;
+    if (running != null) return running;
+    final attempt = _disconnect();
+    _disconnecting = attempt;
+    return attempt.whenComplete(() {
+      if (identical(_disconnecting, attempt)) _disconnecting = null;
+    });
+  }
+
+  Future<void> _disconnect() async {
     _session++;
     _connecting = null;
     _loginTimeout?.cancel();
     _reconnecting = false;
     connectError = null;
     log('Logging out...', LogType.info);
-    // Signing out means "stop ringing this phone"; closing the app does not.
-    await _logoutFromVobizPush();
-    // Stop renewing the access token before the client lets go of it.
-    await _stopTokenSession();
-    await client.disconnect();
+    // Made now, while the SIP user (and, without a sample server, the
+    // account's credentials) are still known; sent once signed out here.
+    final pushLogout = _vobizPushLogout();
+    try {
+      // Stop renewing the access token before the client lets go of it.
+      await _stopTokenSession();
+      await client.disconnect();
+    } catch (e) {
+      log('⚠️ Sign-out: $e', LogType.warning);
+    }
     connectedAs = null;
     authToken = '';
     sipPassword = '';
@@ -699,17 +745,40 @@ class PlaygroundController extends ChangeNotifier {
     _stopCallService();
     _resetCallState(registered: false);
     _setStatus(PhoneStatus.offline, 'Disconnected');
+    // Signing out means "stop ringing this phone"; closing the app does not.
+    await pushLogout?.call();
   }
 
+  /// Removes every secret this app saved: the sign-in credentials, the push
+  /// account, and the sample server line (its key mints access tokens).
   Future<void> _forgetCredentials() async {
+    pushAuthToken = '';
+    pushServer = '';
+    await _deleteSaved(<String>[..._signInKeys, _kPushServer]);
+  }
+
+  /// What "Remember me" keeps in secure storage.
+  static const List<String> _signInKeys = <String>[
+    _kAuthId, _kAuthToken, _kSipUser, _kSipPass, _kPushAuthId, _kPushAuthToken,
+  ];
+
+  Future<void> _deleteSaved(List<String> keys) async {
     try {
-      for (final key in <String>[_kAuthId, _kAuthToken, _kSipUser, _kSipPass, _kPushAuthId, _kPushAuthToken]) {
+      for (final key in keys) {
         await _secure.delete(key: key);
       }
-      pushAuthToken = '';
     } catch (e) {
       log('Could not remove the saved credentials: $e', LogType.warning);
     }
+  }
+
+  /// Ticks or unticks "Remember me". Unticked, what was saved earlier is
+  /// removed at once, not at the next sign-in.
+  Future<void> setRememberMe(bool on) async {
+    rememberMe = on;
+    notifyListeners();
+    await _prefs?.setBool(_kRemember, on);
+    if (!on) await _deleteSaved(_signInKeys);
   }
 
   void _startLoginTimeout() {
@@ -760,7 +829,7 @@ class PlaygroundController extends ChangeNotifier {
     if (destNumber.trim().isEmpty) return log('Please enter a destination', LogType.error);
     if (!client.isConnected) return log('Login first', LogType.error);
     final cli = callerId;
-    if (cli.isEmpty || !RegExp(r'^\+?\d{7,15}$').hasMatch(cli)) {
+    if (cli.isEmpty || !RegExp(r'^\+\d{7,15}$').hasMatch(cli)) {
       return log('⚠️ Caller ID is required for PSTN calls. Enter a verified number '
           '(e.g. +919876543210)', LogType.error);
     }
@@ -817,7 +886,34 @@ class PlaygroundController extends ChangeNotifier {
 
   Future<void> hangup() async {
     log('Hanging up...', LogType.info);
+    if (_turnAwayAcceptedHeldCall()) return;
     await client.hangup();
+  }
+
+  /// Hang up after Accept on a call Vobiz holds whose INVITE has not arrived
+  /// yet: there is no call to hang up, and the SDK would answer the INVITE
+  /// when it comes. Turn it away instead. Returns whether that was the case.
+  bool _turnAwayAcceptedHeldCall() {
+    final screen = _callScreenId;
+    final pushed = screen == null ? null : _ringingPushes[screen];
+    final sdk = pushed?.sdkPush;
+    if (!_callScreenAccepted || pushed == null || sdk == null || client.callState != CallStateStatus.idle) {
+      return false;
+    }
+    log('📵 Hung up before the call from ${pushed.displayCaller} arrived: turning it away', LogType.warning);
+    _turnedAway.add(pushed.callId);
+    _ringingPushes.remove(pushed.callId);
+    client.reportCallScreenDeclined(sdk);
+    _logCall(CallRecord(
+      id: pushed.callId,
+      inbound: true,
+      party: pushed.displayCaller,
+      at: DateTime.now(),
+      outcome: CallOutcome.declined,
+    ));
+    _endCallScreen();
+    _stopCallService();
+    return true;
   }
 
   Future<void> answer() async {
@@ -943,7 +1039,8 @@ class PlaygroundController extends ChangeNotifier {
         number: transferTarget == TransferTarget.number ? transferDestination : null,
         sipUser: transferTarget == TransferTarget.user ? user : null,
         leg: transferLeg,
-        callerId: callerId,
+        // `+` and digits, as the SDK requires, or none (the account's default).
+        callerId: callerId.isEmpty ? null : callerId,
         sipHeaders: built.headers,
       );
       transferStatus = TransferStatus.accepted;
@@ -1079,18 +1176,14 @@ class PlaygroundController extends ChangeNotifier {
   // headless when the app was closed, see CallEngine.kt), which shows the
   // system call screen and signs in at once to claim the call Vobiz holds.
 
-  /// The app moved to or from the foreground.
-  void setForeground(bool foreground) => _inForeground = foreground;
-
-  /// Whether the app is on screen.
-  bool get inForeground => _inForeground;
-
   /// Saves the line the sample server printed. Returns a problem to show, or
   /// null.
   Future<String?> setPushServer(String value) async {
     final text = value.trim();
-    if (text.isNotEmpty && PushBridgeConfig.parse(text) == null) {
-      return 'Paste the whole line the server printed: https://…#key=…';
+    if (text.isNotEmpty && PushBridgeConfig.parse(text, allowHttp: allowHttp) == null) {
+      return PushBridgeConfig.parse(text, allowHttp: true) != null
+          ? 'This build takes an https:// server line only: https://…#key=…'
+          : 'Paste the whole line the server printed: https://…#key=…';
     }
     pushServer = text;
     try {
@@ -1195,6 +1288,7 @@ class PlaygroundController extends ChangeNotifier {
         if (!ringingHere) {
           log('📵 Accept on a call screen whose call is not ringing here: closed it', LogType.warning);
           await _closeCallScreen(callKitParams.id);
+          unawaited(platform.leaveLockScreen());
           return;
         }
         _callScreenId = callKitParams.id;
@@ -1215,8 +1309,9 @@ class PlaygroundController extends ChangeNotifier {
             // Still ringing (the caller gave up): decline it; a call that was
             // never answered cannot be hung up.
             await client.rejectCall();
-          } else if (client.callState != CallStateStatus.idle) {
-            // "Hang up" on the ongoing-call notification.
+          } else if (client.callState != CallStateStatus.idle || _callScreenAccepted) {
+            // "Hang up" on the ongoing-call notification, also for an
+            // accepted call that has not arrived yet.
             await hangup();
           }
         }
@@ -1247,15 +1342,10 @@ class PlaygroundController extends ChangeNotifier {
     ));
   }
 
-  /// A push's raw data, from Android (any app state).
+  /// A push's raw data, from Android (any app state), handled once.
   void _onPushData(Map<String, String> data) {
     final call = PushCall.fromData(data);
-    if (call != null) _onPush(call);
-  }
-
-  /// An incoming-call push, once however many routes it arrives by.
-  void _onPush(PushCall call) {
-    if (!_seenPushes.add(call.callId)) return;
+    if (call == null || !_seenPushes.add(call.callId)) return;
     if (!call.isVobiz) {
       log('📲 Ignored a call push that is not a call Vobiz holds', LogType.info);
       return;
@@ -1303,6 +1393,11 @@ class PlaygroundController extends ChangeNotifier {
           LogType.info);
       return;
     }
+    if (_sdkReconnecting) {
+      log('📲 Vobiz push: a call from ${call.displayCaller}. Reconnecting already: the claim rides on it',
+          LogType.info);
+      return;
+    }
     if (!_hasSavedSignIn) {
       log('📲 Call from ${call.displayCaller}. Sign in to take it (no saved sign-in).', LogType.warning);
       return;
@@ -1325,9 +1420,12 @@ class PlaygroundController extends ChangeNotifier {
     // Accept is the user's tap: the moment Android allows the call's
     // microphone service to start.
     _startCallService(outbound: false, caller: call.displayCaller);
+    // Read before the report: when the held call's INVITE rings here already,
+    // the SDK answers it at once and the state moves on from incoming.
+    final ringingHere = client.callState == CallStateStatus.incoming;
     client.reportCallScreenAccepted(sdk);
-    if (client.isConnected || status == PhoneStatus.connecting) {
-      if (client.callState != CallStateStatus.incoming) log('Waiting for the call Vobiz is holding...', LogType.info);
+    if (client.isConnected || status == PhoneStatus.connecting || _sdkReconnecting) {
+      if (!ringingHere) log('Waiting for the call Vobiz is holding...', LogType.info);
       return;
     }
     if (!_hasSavedSignIn) {
@@ -1348,6 +1446,7 @@ class PlaygroundController extends ChangeNotifier {
     final sdk = call.sdkPush;
     if (sdk == null) return;
     _ringingPushes.remove(call.callId);
+    _turnedAway.add(call.callId);
     log('📵 Declined the call from ${call.displayCaller}', LogType.warning);
     _logCall(CallRecord(
       id: call.callId,
@@ -1357,11 +1456,16 @@ class PlaygroundController extends ChangeNotifier {
       outcome: CallOutcome.declined,
     ));
     client.reportCallScreenDeclined(sdk);
-    if (!client.isConnected && status != PhoneStatus.connecting && _hasSavedSignIn) {
+    if (!client.isConnected && status != PhoneStatus.connecting && !_sdkReconnecting && _hasSavedSignIn) {
       log('Signing in to turn the call away...', LogType.info);
       await connect();
     }
   }
+
+  /// The SDK is signed in but between connections: it reconnects with its
+  /// own sign-in, and its REGISTER carries a pending claim. A new sign-in
+  /// would tear that reconnect down.
+  bool get _sdkReconnecting => client.connectionState == ConnectionStateStatus.reconnecting;
 
   /// What became of a call Vobiz held: claimed, arrived, or never came.
   void _onPushCallUpdate(VobizPushCallUpdate update) {
@@ -1380,6 +1484,7 @@ class PlaygroundController extends ChangeNotifier {
       case VobizPushCallStatus.expired:
         final id = update.push.callId;
         final call = _ringingPushes.remove(id);
+        _turnedAway.remove(id);
         final accepted = _callScreenAccepted && _callScreenId == id;
         log('📵 The call Vobiz held did not arrive before the push expired'
             '${accepted ? ' (it was accepted on the call screen)' : ''}', LogType.warning);
@@ -1417,7 +1522,7 @@ class PlaygroundController extends ChangeNotifier {
         notifyListeners();
       }
     } else {
-      await _logoutFromVobizPush();
+      await _vobizPushLogout(force: true)?.call();
       notifyListeners();
     }
   }
@@ -1425,12 +1530,17 @@ class PlaygroundController extends ChangeNotifier {
   /// Saves the account Auth ID and Auth Token used to register this phone
   /// with Vobiz push (test only), with "Remember me".
   Future<void> setPushAccount({required String authId, required String authToken}) async {
+    if (!demoTools) return;
     pushAuthId = authId.trim();
     pushAuthToken = authToken.trim();
     try {
       if (rememberMe && pushAuthId.isNotEmpty && pushAuthToken.isNotEmpty) {
         await _secure.write(key: _kPushAuthId, value: pushAuthId);
         await _secure.write(key: _kPushAuthToken, value: pushAuthToken);
+      } else {
+        // Not remembered, or a field emptied: nothing old stays behind.
+        await _secure.delete(key: _kPushAuthId);
+        await _secure.delete(key: _kPushAuthToken);
       }
     } catch (e) {
       log('Could not save the push account on this device: $e', LogType.warning);
@@ -1449,12 +1559,13 @@ class PlaygroundController extends ChangeNotifier {
   }
 
   /// The account's headers for Vobiz's API (test only): the push account
-  /// fields, else the Zero-Config ones.
+  /// fields, else the Zero-Config ones. Null without [demoTools].
   Map<String, String>? _vobizPushHeaders() {
+    if (!demoTools) return null;
     final id = pushAuthId.trim().isNotEmpty ? pushAuthId.trim() : authId.trim();
     final token = pushAuthToken.trim().isNotEmpty ? pushAuthToken.trim() : authToken.trim();
     if (id.isEmpty || token.isEmpty) return null;
-    return VobizPushDevices.accountHeaders(id, token);
+    return <String, String>{'X-Auth-ID': id, 'X-Auth-Token': token};
   }
 
   /// This install's id with Vobiz push: made once, then kept.
@@ -1496,8 +1607,11 @@ class PlaygroundController extends ChangeNotifier {
     final viaServer = bridgeConfig != null;
     if (!viaServer && _vobizPushHeaders() == null) {
       vobizPushState = PushState.failed;
-      vobizPushDetail = 'Paste the sample server line under Sample server, so this phone signs up through '
-          'it, or enter the account Auth ID and Auth Token below (test only).';
+      vobizPushDetail = demoTools
+          ? 'Paste the sample server line under Sample server, so this phone signs up through it, or '
+              'enter the account Auth ID and Auth Token below (test only).'
+          : 'This phone signs up for Vobiz push through the sample server: paste the line it prints under '
+              'Sample server.';
       log('❌ Vobiz push: $vobizPushDetail', LogType.error);
       notifyListeners();
       return;
@@ -1511,9 +1625,14 @@ class PlaygroundController extends ChangeNotifier {
     vobizPushState = PushState.registering;
     notifyListeners();
     final token = await push.token();
-    if (token == null) {
+    // The application id Android runs this app as: Vobiz pushes with the
+    // Firebase credential saved for it.
+    final bundleId = await platform.packageName();
+    if (token == null || bundleId == null || bundleId.isEmpty) {
       vobizPushState = PushState.failed;
-      vobizPushDetail = 'Firebase gave no push token (no network, or Google Play services missing).';
+      vobizPushDetail = token == null
+          ? 'Firebase gave no push token (no network, or Google Play services missing).'
+          : 'Could not read this app\'s package name from Android.';
       log('❌ Vobiz push: $vobizPushDetail', LogType.error);
       notifyListeners();
       return;
@@ -1530,7 +1649,7 @@ class PlaygroundController extends ChangeNotifier {
         deviceId: await _installId(),
         pushToken: token,
         sipUsername: user,
-        appBundleId: appBundleId,
+        appBundleId: bundleId,
         appVersion: 'example',
         sdkVersion: VobizClient.sdkVersion,
       );
@@ -1553,26 +1672,34 @@ class PlaygroundController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _logoutFromVobizPush() async {
+  /// Takes this phone off Vobiz push: made now (it reads the SIP user and,
+  /// without a sample server, the account's credentials), sent when called.
+  /// Null when there is nothing to remove. With [force] it is also made when
+  /// this run of the app has not signed the phone up (the switch turned off
+  /// after a restart, before signing in); a phone never signed up has no
+  /// install id, so nothing is sent for it.
+  Future<void> Function()? _vobizPushLogout({bool force = false}) {
     final id = _pushDeviceId ?? _prefs?.getString(_kPushInstallId);
     final wasOn = vobizPushState != PushState.off;
     vobizPushState = PushState.off;
     vobizPushDetail = '';
-    if (!wasOn || id == null) return;
+    if ((!wasOn && !force) || id == null) return null;
     final devices = _vobizPushDevices(user: client.sipUsername);
     if (devices == null) {
-      log('⚠️ Vobiz push: no sample server and no account Auth ID and Auth Token to remove this phone '
-          'with; it may still be pushed until Firebase replaces its token', LogType.warning);
-      return;
+      log('⚠️ Vobiz push: no sample server${demoTools ? ' and no account Auth ID and Auth Token' : ''} to '
+          'remove this phone with; it may still be pushed until Firebase replaces its token', LogType.warning);
+      return null;
     }
-    try {
-      await devices.logout(id);
-      log('📴 Vobiz push: this phone is no longer pushed for calls', LogType.info);
-    } on VobizException catch (e) {
-      log('⚠️ Vobiz push: ${e.message}', LogType.warning);
-    } finally {
-      devices.close();
-    }
+    return () async {
+      try {
+        await devices.logout(id);
+        log('📴 Vobiz push: this phone is no longer pushed for calls', LogType.info);
+      } on VobizException catch (e) {
+        log('⚠️ Vobiz push: ${e.message}', LogType.warning);
+      } finally {
+        devices.close();
+      }
+    };
   }
 
   /// A real call to this phone's SIP user through Vobiz's Call API, to try the
@@ -1587,7 +1714,7 @@ class PlaygroundController extends ChangeNotifier {
   /// push sign-up. Vobiz keeps the registration until it expires (the SDK
   /// asks for an hour), and the call follows a moment later.
   Future<void> callThisPhoneThroughVobiz() async {
-    if (vobizCallPlacing) return;
+    if (!demoTools || vobizCallPlacing) return;
     final user = client.sipUsername;
     if (user == null || vobizPushState != PushState.ready || !client.isConnected) {
       log('Connect, and turn on "Receive calls through Vobiz push", first', LogType.error);
@@ -1668,6 +1795,7 @@ class PlaygroundController extends ChangeNotifier {
       final expires = pushed.expiresAt;
       if (!pushed.isVobiz || (expires != null && DateTime.now().isAfter(expires.add(const Duration(seconds: 30))))) {
         await _closeCallScreen(active.id);
+        unawaited(platform.leaveLockScreen());
         continue;
       }
       await _acceptVobizHeldCall(pushed, active.id);
@@ -1799,6 +1927,7 @@ class PlaygroundController extends ChangeNotifier {
       // Signed out meanwhile: a late registration must not sign back in.
       if (status == PhoneStatus.offline && statusText == 'Disconnected') return;
       _loginTimeout?.cancel();
+      final wasReconnecting = _reconnecting;
       _reconnecting = false;
       connectError = null;
       missingFields = <String>{};
@@ -1806,9 +1935,17 @@ class PlaygroundController extends ChangeNotifier {
           status != PhoneStatus.inCall &&
           status != PhoneStatus.ringing;
       if (wasConnecting) {
-        log('Registered successfully as ${client.sipUsername ?? connectedAs}', LogType.success);
+        log(wasReconnecting
+            ? 'Reconnected: registered again as ${client.sipUsername ?? connectedAs}'
+            : 'Registered successfully as ${client.sipUsername ?? connectedAs}', LogType.success);
         _setStatus(PhoneStatus.online, 'Registered');
-        onTabRequest?.call(1);
+        if (!wasReconnecting) {
+          // A reconnect leaves the user where they are.
+          onTabRequest?.call(1);
+          // Also a sign-in whose first attempt threw but that the SDK then
+          // completed by itself, which skipped the save in _connect.
+          unawaited(_saveCredentials());
+        }
         _registerWithVobizPush();
       }
       return;
@@ -1824,15 +1961,35 @@ class PlaygroundController extends ChangeNotifier {
       _setStatus(PhoneStatus.error, 'Auth Failed');
       return;
     }
+    // The socket dropped while idle. The SDK reconnects by itself (the
+    // Playground keeps autoReconnect on) and reports `reconnecting`; it ends
+    // in `registered`, or in a `reconnect_failed` error when it gives up
+    // (_onError). Without autoReconnect it reports `disconnected`, and nothing
+    // follows unless the sign-in timeout ends it.
     final message = e.message ?? '';
-    if (e.connectionState == ConnectionStateStatus.disconnected &&
-        message.startsWith('Socket error') &&
-        status == PhoneStatus.online) {
+    final reconnecting = e.connectionState == ConnectionStateStatus.reconnecting;
+    final dropped = e.connectionState == ConnectionStateStatus.disconnected && message.startsWith('Socket error');
+    if ((reconnecting || dropped) && status == PhoneStatus.online) {
       log('Connection lost — reconnecting ($message)', LogType.warning);
       _reconnecting = true;
       _setStatus(PhoneStatus.connecting, 'Reconnecting...');
-      _startLoginTimeout();
+      if (dropped) _startLoginTimeout();
     }
+  }
+
+  /// The SDK stopped reconnecting: the phone is offline until the user
+  /// connects again (or the app comes back to the foreground, or the network
+  /// changes, which make the SDK try again).
+  void _onReconnectGaveUp(String message) {
+    if (status != PhoneStatus.connecting && status != PhoneStatus.online) {
+      log('⚠️ reconnect_failed: $message', LogType.warning);
+      return;
+    }
+    _loginTimeout?.cancel();
+    _reconnecting = false;
+    connectError = 'Connection lost: $message. Connect again.';
+    log(connectError!, LogType.error);
+    _setStatus(PhoneStatus.error, 'Connection lost');
   }
 
   void _onCall(CallEvent e) {
@@ -1846,6 +2003,14 @@ class PlaygroundController extends ChangeNotifier {
         activeHeaders = null;
         _recordHeaders('incoming call', e);
         final ref = pushRefFromHeaders(e.headers);
+        final sipCallId = e.sipCallId;
+        if (sipCallId != null && _turnedAway.remove(sipCallId)) {
+          // Declined (or hung up) before it arrived: the SDK turns it away.
+          // It is logged already, and must not ring again.
+          log('📵 The call turned away on the call screen arrived: the SDK declines it', LogType.info);
+          _inbound = _Inbound(id: sipCallId, party: remoteParty, pushId: sipCallId)..declinedHere = true;
+          break;
+        }
         // A call Vobiz held while its push woke this phone: the push's call
         // screen is already showing (and may have been accepted).
         final held = client.isPushedCall(e.callId) ? _ringingPushes[e.sipCallId ?? ''] : null;
@@ -1970,14 +2135,14 @@ class PlaygroundController extends ChangeNotifier {
         _endCallScreen();
         _resetCallState();
         break;
-      case CallStateStatus.idle:
-      case CallStateStatus.outgoing:
-      case CallStateStatus.held:
+      // idle, held: nothing to show.
+      default:
         break;
     }
   }
 
   void _onError(ErrorEvent e) {
+    if (e.code == 'reconnect_failed') return _onReconnectGaveUp(e.message);
     // Call failures and setup failures are already reported, with more detail.
     const shown = <String>{
       'call_failed', 'setup_failed', 'registration_failed', 'transfer_failed',
@@ -2071,6 +2236,10 @@ class PlaygroundController extends ChangeNotifier {
     transferError = '';
     transferNumber = '';
     transferUser = '';
+    conferenceBusy = false;
+    conferenceError = '';
+    conferenceNumber = '';
+    conferenceUser = '';
     if (registered && client.isConnected) {
       _setStatus(PhoneStatus.online, 'Registered');
     } else if (registered &&
@@ -2080,7 +2249,8 @@ class PlaygroundController extends ChangeNotifier {
       // end's BYE arrived as it dropped, or an outgoing call was still
       // ringing). Leave the call screen and show the reconnect: registering
       // again (_onConnection) leaves a call screen alone, but shows
-      // Registered from here.
+      // Registered from here. Still signed in: Disconnect stays reachable.
+      _reconnecting = true;
       _setStatus(PhoneStatus.connecting, 'Reconnecting...');
     } else {
       notifyListeners();
@@ -2159,7 +2329,7 @@ class PlaygroundController extends ChangeNotifier {
     authTab = switch (prefs.getString(_kMode)) {
       'sip' => AuthTab.sipDirect,
       'token' => AuthTab.accessToken,
-      _ => AuthTab.zeroConfig,
+      _ => demoTools ? AuthTab.zeroConfig : AuthTab.sipDirect,
     };
     webhookUrl = prefs.getString(_kWebhook) ?? SdkConfig.defaultWebhookUrl;
     tokenServerUrl = prefs.getString(_kTokenServer) ?? '';
@@ -2219,10 +2389,12 @@ class PlaygroundController extends ChangeNotifier {
   Future<void> _loadSavedCredentials() async {
     if (!rememberMe) return;
     try {
-      authId = await _secure.read(key: _kAuthId) ?? '';
-      authToken = await _secure.read(key: _kAuthToken) ?? '';
       sipUsername = await _secure.read(key: _kSipUser) ?? '';
       sipPassword = await _secure.read(key: _kSipPass) ?? '';
+      // The account's credentials are for the demo tools only.
+      if (!demoTools) return;
+      authId = await _secure.read(key: _kAuthId) ?? '';
+      authToken = await _secure.read(key: _kAuthToken) ?? '';
       pushAuthId = await _secure.read(key: _kPushAuthId) ?? '';
       pushAuthToken = await _secure.read(key: _kPushAuthToken) ?? '';
     } catch (e) {
@@ -2244,13 +2416,8 @@ class PlaygroundController extends ChangeNotifier {
     await prefs?.setString(_kTokenServer, tokenServerUrl.trim());
     await prefs?.setString(_kTokenUser, tokenUser.trim());
     if (callerId.isNotEmpty) await prefs?.setString(_kCallerId, callerId);
+    if (!rememberMe) return _deleteSaved(_signInKeys);
     try {
-      if (!rememberMe) {
-        for (final key in <String>[_kAuthId, _kAuthToken, _kSipUser, _kSipPass]) {
-          await _secure.delete(key: key);
-        }
-        return;
-      }
       if (authTab == AuthTab.zeroConfig) {
         await _secure.write(key: _kAuthId, value: authId.trim());
         await _secure.write(key: _kAuthToken, value: authToken.trim());
