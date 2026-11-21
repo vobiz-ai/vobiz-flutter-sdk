@@ -17,10 +17,6 @@ class FakePeerConnection extends Fake implements RTCPeerConnection {
   final FakePeer peer;
 
   @override
-  Future<RTCIceGatheringState?> getIceGatheringState() async =>
-      RTCIceGatheringState.RTCIceGatheringStateComplete;
-
-  @override
   Future<RTCSessionDescription?> getLocalDescription() {
     final gate = peer.localDescriptionGate;
     if (gate != null) return gate.future;
@@ -86,6 +82,26 @@ class FakePeer extends PeerService {
   @override
   Future<void> abortIceRestart() async => iceRestarts.add('abort');
 
+  /// The hold steps the client took: 'begin:hold', 'begin:resume',
+  /// 'complete', 'abort'. Set [beginHoldError] to make building the offer
+  /// fail.
+  final List<String> holds = <String>[];
+  Object? beginHoldError;
+
+  @override
+  Future<String> beginHold(bool hold) async {
+    holds.add('begin:${hold ? 'hold' : 'resume'}');
+    final error = beginHoldError;
+    if (error != null) throw error;
+    return 'v=0\r\na=${hold ? 'sendonly' : 'sendrecv'}\r\n';
+  }
+
+  @override
+  Future<void> completeHold(String answerSdp) async => holds.add('complete');
+
+  @override
+  Future<void> abortHold() async => holds.add('abort');
+
   @override
   Future<void> disposeCall(String callId) async => _pc = null;
 
@@ -105,6 +121,7 @@ class Harness {
   Harness({
     Duration setupTimeout = const Duration(seconds: 30),
     Duration networkLossGrace = const Duration(seconds: 12),
+    Duration mediaRestartDelay = const Duration(seconds: 3),
   }) {
     sip = SIPService(wsUrl: 'wss://example.invalid', sipServer: sipServer)
       ..debugOnSend = sent.add
@@ -115,6 +132,7 @@ class Harness {
       peer: peer,
       setupTimeout: setupTimeout,
       networkLossGrace: networkLossGrace,
+      mediaRestartDelay: mediaRestartDelay,
     );
     client.callEvents.listen(events.add);
     client.errorEvents.listen(errors.add);
@@ -228,8 +246,11 @@ class Harness {
 }
 
 /// An inbound call, answered: the client is active and the 200 OK is sent.
-Future<Harness> answeredCall({Duration grace = const Duration(seconds: 12)}) async {
-  final h = Harness(networkLossGrace: grace);
+Future<Harness> answeredCall({
+  Duration grace = const Duration(seconds: 12),
+  Duration mediaRestartDelay = const Duration(seconds: 3),
+}) async {
+  final h = Harness(networkLossGrace: grace, mediaRestartDelay: mediaRestartDelay);
   h.invite('in-1');
   await h.client.acceptCall();
   expect(h.client.callState, CallStateStatus.active);

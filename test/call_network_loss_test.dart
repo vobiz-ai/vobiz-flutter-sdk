@@ -127,7 +127,7 @@ void main() {
     });
 
     test('re-registering after a socket drop restarts ICE in a re-INVITE, and the call survives', () async {
-      final h = await answeredCall(grace: const Duration(milliseconds: 200));
+      final h = await answeredCall(grace: const Duration(milliseconds: 600));
       final id = h.client.currentCallId!;
       h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateDisconnected);
       h.sip.onSocketError!('SIP socket closed unexpectedly');
@@ -148,13 +148,13 @@ void main() {
       h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateConnected);
       await h.settle();
       expect(h.events.last.reason, 'reconnected');
-      await h.settle(300);
+      await h.settle(800);
       expect(h.client.callState, CallStateStatus.active);
       await h.dispose();
     });
 
     test('a refused ICE restart is rolled back, and the call ends as network_lost', () async {
-      final h = await answeredCall(grace: const Duration(milliseconds: 100));
+      final h = await answeredCall(grace: const Duration(milliseconds: 500));
       final id = h.client.currentCallId!;
       h.peer.ice(id, RTCIceConnectionState.RTCIceConnectionStateDisconnected);
       h.sip.onSocketError!('SIP socket closed unexpectedly');
@@ -166,7 +166,7 @@ void main() {
       await h.settle();
       expect(h.peer.iceRestarts, <String>['begin', 'abort']);
       expect(h.client.callState, CallStateStatus.active);
-      await h.settle(200);
+      await h.settle(900);
       expect(h.client.callState, CallStateStatus.idle);
       expect(h.lastEnded.reason, 'network_lost');
       await h.dispose();

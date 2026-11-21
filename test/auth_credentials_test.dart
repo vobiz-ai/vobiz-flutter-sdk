@@ -287,10 +287,17 @@ void main() {
   });
 
   group('TokenConfig', () {
-    test('is documented as a SIP password, not token auth', () {
+    test('connect(TokenConfig) registers as displayName, with the token as the SIP password', () async {
+      final registrar = _FakeRegistrar(<String>{'u'});
+      await registrar.start();
+      final client = VobizClient(config: SdkConfig(wsUrl: registrar.wsUrl, autoReconnect: false));
       // ignore: deprecated_member_use_from_same_package
-      const config = TokenConfig(token: 't', displayName: 'u');
-      expect(config.token, 't');
+      await client.connect(const TokenConfig(token: 't', displayName: 'u'));
+      await _until(() => client.isConnected);
+      expect(registrar.attempts, <String>['u']);
+      expect(client.authMode, VobizAuthMode.sipDirect);
+      await client.dispose();
+      await registrar.stop();
     });
   });
 }

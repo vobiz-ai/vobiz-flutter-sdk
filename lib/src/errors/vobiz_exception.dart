@@ -23,8 +23,26 @@ abstract final class VobizErrorCode {
   /// The WebSocket to the SIP registrar could not be opened.
   static const String connectFailed = 'connect_failed';
 
-  /// The registrar refused the SIP credentials (401/403).
+  /// The registrar refused the sign-in: wrong credentials (401, 403, 407),
+  /// a refused access token, or another final refusal. With
+  /// `SdkConfig.autoReconnect`, a REGISTER the registrar could not take for
+  /// now (no answer, 408, 480, 5xx) is retried instead and does not report
+  /// this.
   static const String registrationFailed = 'registration_failed';
+
+  /// Reconnecting gave up after the reconnect policy's last attempt. Call
+  /// `VobizClient.reconnect()` to try again; a network change does too.
+  static const String reconnectFailed = 'reconnect_failed';
+
+  /// A call was ended because its network did not come back within the
+  /// grace period.
+  static const String networkLost = 'network_lost';
+
+  /// The far end refused to put the call on hold; the call carries on.
+  static const String holdFailed = 'hold_failed';
+
+  /// The far end refused to take the call off hold; it stays held.
+  static const String resumeFailed = 'resume_failed';
 
   /// The WebSocket dropped.
   static const String socketError = 'socket_error';
@@ -53,6 +71,10 @@ abstract final class VobizErrorCode {
   /// A conference request failed: your conference server could not be
   /// reached, or it refused (see [VobizException.statusCode]).
   static const String conferenceFailed = 'conference_failed';
+
+  /// Registering or removing this phone for Vobiz push failed: the push
+  /// service refused it or could not be reached (`VobizPushDevices`).
+  static const String pushDeviceFailed = 'push_device_failed';
 }
 
 /// An SDK operation failed.

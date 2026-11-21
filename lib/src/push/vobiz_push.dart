@@ -1,3 +1,5 @@
+import '../utils/sip_text.dart';
+
 /// What became of a call push handed to `VobizClient.handleIncomingPush`.
 enum VobizPushCallStatus {
   /// The REGISTER that claims the held call is on its way, or waits for the
@@ -50,12 +52,13 @@ class VobizPushHold {
   });
 
   /// Reads the hold reference from a push's data map. Null unless `index`,
-  /// `label` and `registrar` are all there.
+  /// `label` and `registrar` are all there, and none holds a control
+  /// character: each goes into a REGISTER header line as it is.
   static VobizPushHold? tryParse(Map<String, Object?> data) {
     final index = '${data['index'] ?? ''}'.trim();
     final label = '${data['label'] ?? ''}'.trim();
     final registrar = '${data['registrar'] ?? ''}'.trim();
-    if (index.isEmpty || label.isEmpty || registrar.isEmpty) return null;
+    if (<String>[index, label, registrar].any((v) => v.isEmpty || hasControlCharacter(v))) return null;
     return VobizPushHold(index: index, label: label, registrar: registrar);
   }
 
@@ -115,7 +118,8 @@ class VobizIncomingPush {
   /// `index`, `label` and `registrar` are all there ([hold]).
   ///
   /// `expires_at` is read as Unix seconds, or as milliseconds when it is too
-  /// large to be seconds ([epochToDateTime]).
+  /// large to be seconds ([epochToDateTime]). One outside the range a
+  /// [DateTime] can hold is taken as no expiry.
   static VobizIncomingPush? tryParse(Map<String, Object?> data) {
     if ('${data['type'] ?? ''}' != 'incoming_call') return null;
     final callId = '${data['call_id'] ?? ''}';
@@ -123,12 +127,13 @@ class VobizIncomingPush {
     final hold = VobizPushHold.tryParse(data);
     if (hold == null) return null;
     final expires = int.tryParse('${data['expires_at'] ?? ''}');
+    final expiresMs = expires == null ? null : (expires < 100000000000 ? expires * 1000 : expires);
     return VobizIncomingPush(
       callId: callId,
       hold: hold,
       caller: '${data['caller'] ?? ''}',
       callee: '${data['callee'] ?? ''}',
-      expiresAt: expires == null ? null : epochToDateTime(expires),
+      expiresAt: expiresMs == null || expiresMs.abs() > _maxEpochMs ? null : epochToDateTime(expires!),
       callUuid: '${data['call_uuid'] ?? ''}',
       callerNumber: '${data['caller_number'] ?? ''}',
     );
@@ -140,6 +145,9 @@ class VobizIncomingPush {
   static DateTime epochToDateTime(int value) => value < 100000000000
       ? DateTime.fromMillisecondsSinceEpoch(value * 1000)
       : DateTime.fromMillisecondsSinceEpoch(value);
+
+  /// The largest time from the epoch a [DateTime] holds, in milliseconds.
+  static const int _maxEpochMs = 8640000000000000;
 
   /// The SIP Call-ID of the INVITE Vobiz's registrar is holding.
   final String callId;
@@ -174,14 +182,4 @@ class VobizIncomingPush {
   /// [callId]. Only an exact match counts: matching by phone number could
   /// auto-answer a different call from the same caller.
   bool matchesIncomingCall({required String? sipCallId}) => sipCallId != null && sipCallId == callId;
-
-  /// Two numbers are the same when their last ten digits match (at least six
-  /// digits each), so `+91 98765 43210` matches `09876543210`.
-  static bool samePhoneNumber(String a, String b) {
-    final x = a.replaceAll(RegExp(r'\D'), '');
-    final y = b.replaceAll(RegExp(r'\D'), '');
-    if (x.length < 6 || y.length < 6) return false;
-    String tail(String s) => s.length > 10 ? s.substring(s.length - 10) : s;
-    return tail(x) == tail(y);
-  }
 }

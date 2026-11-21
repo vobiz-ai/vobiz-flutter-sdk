@@ -62,9 +62,6 @@ export 'src/events/sdk_event.dart';
 // ── Models ────────────────────────────────────────────────────────────────────
 export 'src/models/call/call_direction.dart';
 export 'src/models/call/call_stats.dart';
-export 'src/models/call/dtmf_tone.dart';
-export 'src/models/call/incoming_call.dart';
-export 'src/models/call/outgoing_call.dart';
 export 'src/models/call/recording.dart';
 export 'src/models/call/transfer_leg.dart';
 

@@ -161,9 +161,17 @@ void main() {
       ..background()
       ..foreground();
     await eventually(() => server.registers.length == 2);
+    // Past the 2 s debounce, so only the was-already-in-the-foreground guard
+    // can hold this one back.
+    await Future<void>.delayed(const Duration(milliseconds: 2100));
     lifecycle.foreground();
     await quiet();
     expect(server.registers, hasLength(2));
+    // The control: a real return from the background does re-register.
+    lifecycle
+      ..background()
+      ..foreground();
+    await eventually(() => server.registers.length == 3);
   });
 
   test('signed out: nothing is sent and the lifecycle is not watched', () async {

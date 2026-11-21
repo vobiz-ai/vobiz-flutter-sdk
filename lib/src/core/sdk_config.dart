@@ -34,7 +34,6 @@ class SdkConfig {
     this.sipServer = 'registrar.vobiz.ai',
     this.backendUrl = defaultWebhookUrl,
     this.voiceApiUrl = defaultVoiceApiUrl,
-    this.answerUrl,
     this.autoReconnect = true,
     this.debug = false,
     this.iceConfig = const IceConfig(),
@@ -64,30 +63,21 @@ class SdkConfig {
   /// The default, [defaultWebhookUrl], is the shared Vobiz demo server. It is
   /// only used in demo mode ([unsafeDemoZeroConfig]): its recordings list is
   /// shared by everyone who uses it, so the SDK will not read it otherwise.
-  /// Production apps that use transfers or recordings set this to their own
-  /// server.
+  /// A server of your own here must implement the Playground server's
+  /// routes. Its recordings list is read with no authentication, so anyone
+  /// who finds the URL can read it too: keep recording URLs behind your own
+  /// API in production instead.
   ///
   /// Zero-Config Setup points the account's application at `<backendUrl>/api/answer`,
   /// so Vobiz must be able to reach it over HTTPS. Transfers and the recordings
   /// list also go through it. Defaults to [defaultWebhookUrl]; point it at your
   /// own deployment of the Playground server (or a tunnel to it while
   /// developing) to use your own.
-  ///
-  /// The legacy call-control methods (`hold`, `resume`, `transfer(String)`,
-  /// `addCall`, `swapCalls`, `mergeCalls` and friends) call routes such as
-  /// `/hold-start` on this same URL. Only the Node reference server
-  /// implements those; the Playground server does not.
   final String backendUrl;
 
   /// The Vobiz REST API base URL that the webhook server calls on the
   /// account's behalf. Defaults to [defaultVoiceApiUrl].
   final String voiceApiUrl;
-
-  /// Public answer webhook URL sent to Vobiz during login.
-  ///
-  /// Vobiz calls this URL when routing an inbound PSTN call to this client.
-  /// Must be publicly reachable (e.g. your ngrok URL + `/answer`).
-  final String? answerUrl;
 
   /// Reconnect automatically when the WebSocket drops.
   final bool autoReconnect;

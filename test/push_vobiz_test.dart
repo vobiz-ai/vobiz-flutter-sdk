@@ -6,6 +6,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -13,6 +14,7 @@ import 'package:vobiz_webrtc/vobiz_webrtc.dart';
 import 'package:vobiz_webrtc/src/signaling/sip_service.dart';
 
 import 'call_harness.dart' as harness;
+import 'network_fakes.dart';
 import 'sip_test_support.dart';
 
 const String _challenge = 'WWW-Authenticate: Digest realm="registrar.vobiz.ai", nonce="n1", qop="auth"';
@@ -262,10 +264,11 @@ void main() {
       expect(h.client.isPushedCall(h.events.last.callId), isFalse);
     });
 
-    test('no INVITE by the push\'s expiry: expired, and the claim is dropped', () async {
-      final soon = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 1;
+    test('no INVITE by the push\'s expiry plus the clock margin: expired, and the claim is dropped', () async {
+      // expires_at 28 s ago by this clock: still awaited, for 1 to 2 s more.
+      final lately = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 28;
       h.sip.connectionState.value = SipConnectionState.disconnected;
-      h.client.handleIncomingPush(push(expiresAt: soon));
+      expect(h.client.handleIncomingPush(push(expiresAt: lately)), isTrue);
       expect(h.sip.hasPendingClaim, isTrue);
       await h.settle(2100);
       expect(statuses().last, VobizPushCallStatus.expired);
@@ -273,11 +276,107 @@ void main() {
       expect(h.client.pushedCall, isNull);
     });
 
+    test('a phone whose clock runs ahead: a push 20 s past its expiry by this clock is still claimed', () async {
+      final skewed = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 20;
+      expect(h.client.handleIncomingPush(push(expiresAt: skewed)), isTrue);
+      expect(headerOf(h.sent.single, 'X-Index'), '4211');
+      await h.settle();
+      expect(statuses(), <VobizPushCallStatus>[VobizPushCallStatus.claiming]);
+    });
+
     test('a push without a hold does not parse, and a stale one is not acted on', () {
       expect(VobizIncomingPush.tryParse(<String, Object?>{'type': 'incoming_call', 'call_id': 'c-1'}), isNull);
       expect(h.client.handleIncomingPush(push(expiresAt: 1000)), isFalse);
       expect(h.sent, isEmpty);
       expect(updates, isEmpty);
+    });
+  });
+
+  group('how long a pushed call is awaited', () {
+    List<VobizPushCallStatus> awaitPush(Map<String, Object?> data, Duration first, Duration then) {
+      late List<VobizPushCallStatus> seen;
+      fakeAsync((FakeAsync async) {
+        final h = harness.Harness();
+        h.sip.connectionState.value = SipConnectionState.disconnected;
+        final updates = <VobizPushCallUpdate>[];
+        h.client.pushCallUpdates.listen(updates.add);
+        expect(h.client.handleIncomingPush(VobizIncomingPush.tryParse(data)!), isTrue);
+        async.elapse(first);
+        expect(updates.map((u) => u.status), isNot(contains(VobizPushCallStatus.expired)));
+        async.elapse(then);
+        seen = updates.map((u) => u.status).toList();
+        h.dispose();
+        async.elapse(const Duration(seconds: 1));
+      });
+      return seen;
+    }
+
+    test('an expiry far in the future is awaited 60 s at most', () {
+      final farFuture = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 3600;
+      expect(awaitPush(vobizPush(expiresAt: farFuture), const Duration(seconds: 59), const Duration(seconds: 2)).last,
+          VobizPushCallStatus.expired);
+    });
+
+    test('a push without an expiry is awaited for the registrar\'s 30 s hold', () {
+      expect(
+          awaitPush(vobizPush()..remove('expires_at'), const Duration(seconds: 29), const Duration(seconds: 2)).last,
+          VobizPushCallStatus.expired);
+    });
+
+    test('an expiry outside what a DateTime holds reads as none instead of throwing', () {
+      final push = VobizIncomingPush.tryParse(<String, Object?>{...vobizPush(), 'expires_at': '9223372036854775807'});
+      expect(push, isNotNull);
+      expect(push!.expiresAt, isNull);
+    });
+  });
+
+  group('claiming against a registrar', () {
+    late FakeSipServer server;
+    late VobizClient client;
+    late List<VobizPushCallStatus> updates;
+
+    setUp(() async {
+      server = FakeSipServer();
+      await server.start();
+      updates = <VobizPushCallStatus>[];
+      client = VobizClient.withServices(
+        sip: SIPService(wsUrl: server.url, sipServer: 'registrar.vobiz.ai'),
+        peer: harness.FakePeer(),
+        config: SdkConfig(
+            wsUrl: server.url,
+            reconnectPolicy: const ReconnectPolicy(
+                initialDelay: Duration(milliseconds: 20), maxDelay: Duration(milliseconds: 40), jitter: 0, maxAttempts: 2)),
+        connectivityMonitor: FakeConnectivityMonitor(),
+      );
+      client.pushCallUpdates.listen((u) => updates.add(u.status));
+    });
+
+    tearDown(() async {
+      await client.dispose();
+      await server.stop();
+    });
+
+    Future<void> signIn() => client.connectWithCredentials(const CredentialConfig(username: 'play1', password: 'secret'));
+
+    test('a closed app: the push first, then the sign-in, whose REGISTER claims the call', () async {
+      expect(client.handleIncomingPush(VobizIncomingPush.tryParse(vobizPush())!), isTrue);
+      await signIn();
+      await eventually(() => updates.contains(VobizPushCallStatus.claimed));
+      expect(headerOf(server.registers.first, 'X-Index'), '4211');
+      expect(updates.first, VobizPushCallStatus.claiming);
+    });
+
+    test('after reconnecting gave up, a push reconnects at once and claims the call', () async {
+      await signIn();
+      await eventually(() => client.isConnected);
+      server.acceptConnections = false;
+      await server.dropAll();
+      await eventually(() => client.connectionState == ConnectionStateStatus.failed, reason: 'gave up');
+
+      server.acceptConnections = true;
+      expect(client.handleIncomingPush(VobizIncomingPush.tryParse(vobizPush())!), isTrue);
+      await eventually(() => updates.contains(VobizPushCallStatus.claimed));
+      expect(server.registers.where((m) => headerOf(m, 'X-Index') == '4211'), isNotEmpty);
     });
   });
 
@@ -315,7 +414,7 @@ void main() {
       status = 200;
       reply = '{"status":"ok"}';
       devices = VobizPushDevices(
-        authHeaders: () => VobizPushDevices.accountHeaders(' MA_TESTACCT ', 'tok'),
+        authHeaders: () => VobizPushDevices.accountHeaders(' MA_TESTACCT ', 'tok', unsafeDemo: true),
         httpClient: MockClient((request) async {
           requests.add(request);
           return http.Response(reply, status);
@@ -346,7 +445,7 @@ void main() {
         'push_type': 'voip',
         'app_bundle_id': 'ai.vobiz.vobiz_webrtc_example',
         'app_version': '1.0.0',
-        'sdk_version': '0.2.0',
+        'sdk_version': VobizClient.sdkVersion,
         'sip_username': 'play1',
       });
     });
@@ -377,6 +476,51 @@ void main() {
             deviceId: 'd', pushToken: 't', sipUsername: ' ', appBundleId: 'b')),
         throwsArgumentError,
       );
+    });
+
+    test('the account headers need the explicit demo opt-in', () {
+      expect(() => VobizPushDevices.accountHeaders('MA_TESTACCT', 'tok', unsafeDemo: false),
+          throwsA(isA<VobizDemoModeRequiredException>()));
+    });
+
+    test('a path on baseUrl is kept in front of the prefix', () async {
+      final proxied = VobizPushDevices(
+        baseUrl: Uri.parse('https://api.example.com/vobiz/'),
+        pathPrefix: 'push/devices/',
+        authHeaders: () => const <String, String>{'Authorization': 'Bearer s'},
+        httpClient: MockClient((request) async {
+          requests.add(request);
+          return http.Response('{}', 200);
+        }),
+      );
+      await proxied.register(device);
+      expect(requests.single.url.toString(), 'https://api.example.com/vobiz/push/devices/register');
+      // The sample server's form: an origin and an absolute prefix.
+      final sample = VobizPushDevices(
+        baseUrl: Uri.parse('https://bridge.example.com'),
+        pathPrefix: '/push/devices',
+        authHeaders: () => const <String, String>{},
+        httpClient: MockClient((request) async {
+          requests.add(request);
+          return http.Response('{}', 200);
+        }),
+      );
+      await sample.logout('install-1');
+      expect(requests.last.url.toString(), 'https://bridge.example.com/push/devices/logout');
+    });
+
+    test('a reply that stalls after its headers times out too', () async {
+      final stalled = VobizPushDevices(
+        authHeaders: () => const <String, String>{},
+        timeout: const Duration(milliseconds: 50),
+        httpClient: MockClient.streaming(
+            (_, __) async => http.StreamedResponse(StreamController<List<int>>().stream, 200)),
+      );
+      await expectLater(
+          stalled.register(device).timeout(const Duration(seconds: 2)),
+          throwsA(isA<VobizException>()
+              .having((e) => e.code, 'code', VobizErrorCode.pushDeviceFailed)
+              .having((e) => e.message, 'message', contains('did not answer'))));
     });
 
     test('a timeout is a failure, not a hang', () async {

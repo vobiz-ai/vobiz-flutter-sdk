@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -36,19 +35,28 @@ import '../state/call_state.dart';
 import '../state/connection_state.dart';
 import '../state/registration_state.dart';
 import '../utils/logger.dart';
+import '../utils/sip_text.dart';
 import '../utils/stream_extensions.dart';
+import '../webrtc/ice_config.dart';
 import '../webrtc/peer_service.dart';
 import 'sdk_config.dart';
 import 'sip_headers.dart';
 
 /// Makes and receives Vobiz calls.
 ///
-/// Sign in one of two ways, the same two the Vobiz WebRTC Playground offers:
+/// Sign in with credentials that your own backend hands each user; the
+/// account Auth Token never belongs on a device:
 ///
-/// - **Zero-Config Setup** — [connectWithAuthToken] with the account's Auth ID
-///   and Auth Token. The webhook server provisions the SIP endpoint.
-/// - **SIP Direct** — [connectWithCredentials] with an existing endpoint's
-///   SIP username and password.
+/// - `connectWithCredentialsProvider`: a SIP endpoint's username and
+///   password from your backend, fetched again whenever the registrar
+///   refuses them.
+/// - [connectWithAccessToken] or `connectWithAccessTokenProvider`: an access
+///   token (JWT) your backend minted; the provider renews it.
+/// - [connectWithCredentials] (SIP Direct): an endpoint's username and
+///   password you already hold.
+/// - [connectWithAuthToken] (Zero-Config Setup): **demo only**. It sends the
+///   account Auth ID and Auth Token to the webhook server and throws unless
+///   [SdkConfig.unsafeDemoZeroConfig] is set.
 ///
 /// No credentials are compiled in: whoever uses the app supplies them.
 class VobizClient {
@@ -77,6 +85,7 @@ class VobizClient {
     http.Client? httpClient,
     Duration setupTimeout = _defaultSetupTimeout,
     Duration networkLossGrace = _defaultNetworkLossGrace,
+    Duration mediaRestartDelay = _defaultMediaRestartDelay,
     ConnectivityMonitor? connectivityMonitor,
     AppLifecycleMonitor lifecycleMonitor = const NoAppLifecycleMonitor(),
   }) : this._(
@@ -89,6 +98,7 @@ class VobizClient {
           peer: peer,
           setupTimeout: setupTimeout,
           networkLossGrace: networkLossGrace,
+          mediaRestartDelay: mediaRestartDelay,
         );
 
   VobizClient._({
@@ -99,6 +109,7 @@ class VobizClient {
     PeerService? peer,
     Duration setupTimeout = _defaultSetupTimeout,
     Duration networkLossGrace = _defaultNetworkLossGrace,
+    Duration mediaRestartDelay = _defaultMediaRestartDelay,
     ConnectivityMonitor? connectivityMonitor,
     AppLifecycleMonitor? lifecycleMonitor,
   })  : _config = config,
@@ -121,6 +132,7 @@ class VobizClient {
         _ownsHttp = httpClient == null,
         _setupTimeout = setupTimeout,
         _networkLossGrace = networkLossGrace,
+        _mediaRestartDelay = mediaRestartDelay,
         backendUrl = config.backendUrl {
     _api = WebhookServerApi(
         client: _http, allowAccountCredentials: config.unsafeDemoZeroConfig);
@@ -156,6 +168,11 @@ class VobizClient {
   /// (ICE failed/disconnected) before it is ended as `network_lost`.
   static const Duration _defaultNetworkLossGrace = Duration(seconds: 12);
 
+  /// How long ICE may stay disconnected, with signalling up, before the
+  /// call's audio is moved with an ICE restart. A short disconnection often
+  /// heals by itself; a failed one never does, and is restarted at once.
+  static const Duration _defaultMediaRestartDelay = Duration(seconds: 3);
+
   final SdkConfig _config;
   final Logger _logger;
   final SIPService _sip;
@@ -165,6 +182,7 @@ class VobizClient {
   late final WebhookServerApi _api;
   final Duration _setupTimeout;
   final Duration _networkLossGrace;
+  final Duration _mediaRestartDelay;
   late final ConnectionSupervisor _supervisor;
   final AppLifecycleMonitor _lifecycle;
   StreamSubscription<bool>? _lifecycleSub;
@@ -207,6 +225,14 @@ class VobizClient {
   bool get _hasSignIn =>
       _username != null && (_password != null || _accessToken != null);
 
+  /// Bumped by every sign-in and sign-out, so a sign-in still connecting
+  /// when it is replaced stops quietly instead of reporting on the new one.
+  int _signInEpoch = 0;
+
+  /// The registrar could not take a REGISTER during a call (no answer, 408,
+  /// 480, 5xx): reconnect once the call is over, as the socket closes then.
+  bool _reconnectWhenCallEnds = false;
+
   // Inbound call state
   String? _pendingInboundCaller;
   String? _pendingInboundSdp;
@@ -221,10 +247,19 @@ class VobizClient {
   bool _signalingLost = false;
   bool _mediaLost = false;
 
+  // Lost media with signalling up: one ICE restart per loss, after
+  // [_mediaRestartDelay] for a disconnection, at once for a failure.
+  Timer? _mediaRestartTimer;
+  bool _mediaRestartTried = false;
+
   // The current call's details
   CallDirection? _direction;
   String? _callUuid;
   String? _lastCallUuid;
+
+  // The current call's SIP Call-ID, kept here for its failed and ended
+  // events: the SIP layer forgets it before it reports the end.
+  String? _sipCallId;
   Map<String, String> _callHeaders = const <String, String>{};
 
   // Event streams
@@ -278,6 +313,11 @@ class VobizClient {
   /// [AudioRouteController.bluetoothPermissionRequester] so Bluetooth
   /// headsets work on Android 12+.
   AudioRouteController get audioRoutes => _peer.audioRoutes;
+
+  /// Replaces the STUN and TURN servers (fresh TURN credentials, say). Applies
+  /// from the next call; a call in progress keeps the servers it started
+  /// with.
+  void updateIceConfig(IceConfig config) => _peer.iceConfig = config;
 
   /// Turns the screen off at the ear while a call is on the earpiece. The SDK
   /// has no platform code, so the app supplies the switch; see
@@ -337,15 +377,13 @@ class VobizClient {
       callId: id,
       remoteIdentity: _pendingInboundCaller ?? _activeCallDestination ?? '',
       isIncoming: _direction == CallDirection.inbound,
-      answerUrl: null,
       state: _callState,
       callUuid: _callUuid,
       headers: _callHeaders,
+      muted: isMuted,
+      speakerEnabled: isSpeakerOn,
     );
   }
-
-  Iterable<CallSession> get calls =>
-      currentCall != null ? <CallSession>[currentCall!] : const [];
 
   // ---------------------------------------------------------------------------
   // Sign in / out
@@ -383,8 +421,10 @@ class VobizClient {
     if (!_config.unsafeDemoZeroConfig) {
       throw const VobizDemoModeRequiredException('Zero-Config Setup');
     }
+    _checkHttpsForAccountCredentials();
 
     _closeExistingConnection();
+    final epoch = _signInEpoch;
     _connectionState = ConnectionStateStatus.connecting;
     _connectionEvents.addIfOpen(ConnectionEvent(
       connectionState: _connectionState,
@@ -400,17 +440,26 @@ class VobizClient {
         authId: id,
         authToken: token,
       );
+      if (!_isSipUsername(session.sipUsername)) {
+        throw const VobizException(VobizErrorCode.setupFailed,
+            'The webhook server returned a SIP username that cannot be used');
+      }
     } on VobizException catch (e) {
       final explained = _explainSetupFailure(e);
+      // Signed out, or in again, meanwhile: that sign-in owns the state.
+      if (epoch != _signInEpoch) throw explained;
       _connectionState = ConnectionStateStatus.failed;
       _connectionEvents.addIfOpen(ConnectionEvent(
         connectionState: _connectionState,
         registrationState: _registrationState,
         message: 'Setup failed: ${explained.message}',
       ));
-      _emitError('setup_failed', explained.message, e);
+      _emitError(VobizErrorCode.setupFailed, explained.message, e);
       throw explained;
     }
+    // Signed out, or in again, while the server was provisioning: do not
+    // sign in as this endpoint over that.
+    if (epoch != _signInEpoch) return session;
 
     _authMode = VobizAuthMode.zeroConfig;
     _authId = id;
@@ -421,16 +470,20 @@ class VobizClient {
 
   /// SIP Direct with a [CredentialConfig], or a [TokenConfig] whose token is
   /// the endpoint password.
+  @Deprecated('Use connectWithCredentials for an endpoint, or connectWithAccessToken '
+      'for a JWT.')
   Future<void> connect(Object credentials) async {
     if (credentials is CredentialConfig) {
+      _checkSipUsername(credentials.username);
       _beginSipDirect();
       await _connectWithCredentials(credentials.username, credentials.password);
       return;
     }
     if (credentials is TokenConfig) {
+      final username = credentials.displayName ?? 'token-user';
+      _checkSipUsername(username);
       _beginSipDirect();
-      await _connectWithCredentials(
-          credentials.displayName ?? 'token-user', credentials.token);
+      await _connectWithCredentials(username, credentials.token);
       return;
     }
     throw ArgumentError(
@@ -439,7 +492,12 @@ class VobizClient {
 
   /// SIP Direct: sign in as an existing endpoint with its SIP username and
   /// password (Vobiz Console → Voice → Endpoints).
+  ///
+  /// Throws [ArgumentError], before touching the current connection, when
+  /// the username is empty or holds a space, a line break or any of
+  /// `< > " @`.
   Future<void> connectWithCredentials(CredentialConfig config) {
+    _checkSipUsername(config.username);
     _beginSipDirect();
     return _connectWithCredentials(config.username, config.password);
   }
@@ -468,6 +526,7 @@ class VobizClient {
   /// [VobizAccessTokenException] carrying the registrar's reason.
   Future<void> connectWithAccessToken(String accessToken) async {
     final token = VobizAccessToken.parse(accessToken);
+    _checkAccessTokenText(token);
     _closeExistingConnection();
     _authMode = VobizAuthMode.accessToken;
     _authId = null;
@@ -493,6 +552,7 @@ class VobizClient {
       throw StateError('Not signed in with an access token: call connectWithAccessToken first');
     }
     final next = VobizAccessToken.parse(accessToken);
+    _checkAccessTokenText(next);
     if (next.accountId != current.accountId || next.subject != current.subject) {
       throw ArgumentError.value(next.sipUsername, 'accessToken',
           'is for another user than ${current.sipUsername}; sign in with connectWithAccessToken to switch');
@@ -530,9 +590,10 @@ class VobizClient {
   /// The client claims the call: a REGISTER carries the push's hold
   /// reference ([VobizIncomingPush.hold]), and the registrar then sends the
   /// held INVITE to this registration. Signed in and registered, that
-  /// REGISTER goes at once. Otherwise sign in now ([connectWithCredentials],
-  /// [connectWithAccessToken], and so on), and the sign-in's REGISTER carries
-  /// it.
+  /// REGISTER goes at once. Signed in but between connections, or after
+  /// reconnecting gave up, the client reconnects at once and that REGISTER
+  /// carries it. Signed out, sign in now ([connectWithCredentials],
+  /// [connectWithAccessToken], and so on): the sign-in's REGISTER carries it.
   ///
   /// The INVITE arrives as a normal incoming call whose `CallEvent.sipCallId`
   /// is the push's `call_id`; [isPushedCall] tells it apart. Report the call
@@ -540,33 +601,69 @@ class VobizClient {
   /// [reportCallScreenDeclined]: a call accepted, or declined, before its
   /// INVITE arrives is answered, or declined, as soon as it does.
   /// [pushCallUpdates] reports each step, and `expired` when no INVITE came
-  /// by the push's expiry: take the call screen down then.
+  /// in time: take the call screen down then. In time means by the push's
+  /// `expires_at` plus 30 s (this phone's clock may run ahead of Vobiz's),
+  /// and never more than 60 s after the push was handed over (30 s for a
+  /// push without an expiry).
   ///
-  /// Returns false and does nothing for a push that has expired. A repeat of
-  /// the push being handled returns true and does nothing more.
+  /// Returns false and does nothing for a push whose `expires_at` passed
+  /// more than 30 s ago by this phone's clock, or whose hold reference cannot
+  /// go into a REGISTER (an empty value, or a control character). A repeat
+  /// of the push being handled returns true and does nothing more.
   bool handleIncomingPush(VobizIncomingPush push) {
     final hold = push.hold;
-    if (push.isExpired()) return false;
+    final now = DateTime.now();
+    if (_isStalePush(push, now)) return false;
+    if (hold.registerHeaders.values.any((v) => v.isEmpty || hasControlCharacter(v))) {
+      _logger.warn('Ignored the push for ${push.callId}: its hold reference cannot go into a REGISTER');
+      return false;
+    }
     final current = _pushed;
     if (current != null && current.push.callId == push.callId) return true;
     _forgetPushedCall();
-    final pushed = _PushedCall(push);
+    final pushed = _PushedCall(push, _pushDeadline(push, now));
     _pushed = pushed;
-    final expiresAt = push.expiresAt;
-    if (expiresAt != null) {
-      pushed.expiry = Timer(expiresAt.difference(DateTime.now()), () => _expirePushedCall(pushed));
-    }
+    pushed.expiry = Timer(pushed.deadline.difference(now), () => _expirePushedCall(pushed));
     _emitPushUpdate(pushed, VobizPushCallStatus.claiming);
     final sentNow = _sip.claimHeldCall(hold.registerHeaders);
     _logger.info(sentNow
         ? 'Claiming the call ${push.callId} that Vobiz holds: REGISTER sent with its hold reference'
         : 'Claiming the call ${push.callId} that Vobiz holds: the next REGISTER carries its hold reference');
-    // Signed in but between connections: reconnect now rather than at the
-    // next backoff step, so the claim is made while the call is still held.
-    if (!sentNow && _connectionState == ConnectionStateStatus.reconnecting) {
-      _supervisor.reconnectNow();
+    // Signed in but between connections, or given up on reconnecting:
+    // reconnect now, so the claim is made while the call is still held.
+    // reconnectNow does nothing after a sign-out or a refused sign-in.
+    if (!sentNow &&
+        _hasSignIn &&
+        (_connectionState == ConnectionStateStatus.reconnecting ||
+            _connectionState == ConnectionStateStatus.failed)) {
+      _supervisor.reconnectNow(reason: 'A pushed call is waiting to be claimed');
     }
     return true;
+  }
+
+  /// How far past its `expires_at` a push is still acted on: Vobiz's clock
+  /// sets it, this phone's clock reads it, and a phone a few seconds (or
+  /// tens of seconds) fast would otherwise drop every pushed call.
+  static const Duration _pushClockMargin = Duration(seconds: 30);
+
+  /// The longest a pushed call is awaited, whatever its `expires_at` says:
+  /// Vobiz holds a call for up to 30 s, plus the clock margin.
+  static const Duration _pushMaxWait = Duration(seconds: 60);
+
+  /// How long a push without an `expires_at` is awaited: Vobiz's hold.
+  static const Duration _pushDefaultWait = Duration(seconds: 30);
+
+  static bool _isStalePush(VobizIncomingPush push, DateTime now) {
+    final at = push.expiresAt;
+    return at != null && !now.isBefore(at.add(_pushClockMargin));
+  }
+
+  static DateTime _pushDeadline(VobizIncomingPush push, DateTime now) {
+    final at = push.expiresAt;
+    if (at == null) return now.add(_pushDefaultWait);
+    final late = at.add(_pushClockMargin);
+    final cap = now.add(_pushMaxWait);
+    return late.isAfter(cap) ? cap : late;
   }
 
   /// The user tapped Accept on the call screen for [push]. Answers its call
@@ -620,7 +717,7 @@ class VobizClient {
     final sipCallId = _sip.activeSipCallId;
     if (!pushed.push.matchesIncomingCall(sipCallId: sipCallId)) {
       final number = pushed.push.callerNumber.isNotEmpty ? pushed.push.callerNumber : pushed.push.caller;
-      if (VobizIncomingPush.samePhoneNumber(callerId, number)) {
+      if (_samePhoneNumber(callerId, number)) {
         _logger.warn('A call from $callerId arrived while the pushed call ${pushed.push.callId} was '
             'awaited, with another Call-ID ($sipCallId): not taken for the pushed call');
       }
@@ -639,11 +736,21 @@ class VobizClient {
     }
   }
 
+  /// Two numbers are the same when their last ten digits match (at least six
+  /// digits each), so `+91 98765 43210` matches `09876543210`.
+  static bool _samePhoneNumber(String a, String b) {
+    final x = a.replaceAll(RegExp(r'\D'), '');
+    final y = b.replaceAll(RegExp(r'\D'), '');
+    if (x.length < 6 || y.length < 6) return false;
+    String tail(String s) => s.length > 10 ? s.substring(s.length - 10) : s;
+    return tail(x) == tail(y);
+  }
+
   /// A pushed call that no REGISTER has claimed yet rides on the next one.
   void _claimPushedCallOnRegister() {
     final pushed = _pushed;
     if (pushed == null || pushed.claimed || pushed.callId != null) return;
-    if (pushed.push.isExpired()) return;
+    if (!DateTime.now().isBefore(pushed.deadline)) return;
     _sip.claimHeldCall(pushed.push.hold.registerHeaders);
   }
 
@@ -680,12 +787,14 @@ class VobizClient {
   ///
   /// [unregister] false closes the connection without a REGISTER
   /// `Expires: 0`, as when Android kills the app: Vobiz keeps this phone's
-  /// registration until its keep-alive finds the socket gone (a few
-  /// seconds), and a call in that time takes Vobiz's push-to-wake path: the
-  /// registrar holds it and pushes the devices registered for this SIP user
+  /// registration until it expires (the SDK asks for an hour), and a call
+  /// in that time takes Vobiz's push-to-wake path: the registrar holds it
+  /// and pushes the devices registered for this SIP user
   /// ([VobizPushDevices]). For testing that path; a sign-out leaves it true.
   Future<void> disconnect({bool unregister = true}) async {
+    final epoch = ++_signInEpoch;
     _supervisor.stop();
+    _reconnectWhenCallEnds = false;
     _stopWatchingLifecycle();
     _clearCallSetupTimer();
     _forgetPushedCall();
@@ -697,6 +806,8 @@ class VobizClient {
     // Unregisters (REGISTER Expires: 0, at most ~2 s) before the socket
     // closes, unless asked not to.
     await _sip.disconnect(unregister: unregister);
+    // A newer sign-in during that wait has set its own.
+    if (epoch == _signInEpoch) _sip.forgetCredentials();
     await _peer.disposeAllCalls();
     _callId = null;
     _callState = CallStateStatus.idle;
@@ -737,8 +848,9 @@ class VobizClient {
   /// Calls [destination], a phone number in E.164 format such as
   /// `+919876543210`.
   ///
-  /// - [callerId]: the number to present, sent as `X-VH-Caller-ID`. Carriers
-  ///   need a number the account owns (purchased or trial) to reach a phone.
+  /// - [callerId]: the number to present, sent as `X-VH-Caller-ID`, in E.164
+  ///   format with its plus (`+919876543210`). Carriers need a number the
+  ///   account owns (purchased or trial) to reach a phone.
   /// - [headers]: custom `X-VH-` headers. Vobiz passes each one to the answer
   ///   webhook as a parameter.
   /// - [record]: record the whole call (`X-VH-Record: true`). The recording
@@ -748,7 +860,9 @@ class VobizClient {
   ///   it is what gets the call to the webhook.
   ///
   /// Throws [ArgumentError] naming every invalid header before anything is
-  /// dialled, where the web SDK would silently drop it.
+  /// dialled, where the web SDK would silently drop it, and for a
+  /// [destination] with a space, a line break or any of `" < > @ ; : ? ,`
+  /// (it goes into the INVITE's Request-URI and To as it is).
   Future<String> makeCall(
     String destination, {
     String? callerId,
@@ -774,6 +888,10 @@ class VobizClient {
     }
     final target = destination.trim();
     if (target.isEmpty) throw ArgumentError('A destination is required');
+    if (_unsafeInDestination.hasMatch(target)) {
+      throw ArgumentError.value(destination, 'destination',
+          'must be a phone number or a SIP username, with no spaces, line breaks or any of " < > @ ; : ? ,');
+    }
     final outgoing = buildCallHeaders(
       headers: headers,
       callerId: callerId,
@@ -797,15 +915,17 @@ class VobizClient {
       await _peer.initialize(callId);
       final offer = await _peer.createOffer();
       await _waitForIceGathering(callId);
-      // Hung up while the call was being prepared: send nothing.
+      final local = await _peer.peerConnection?.getLocalDescription();
+      // Hung up while the call was being prepared: send nothing. Checked
+      // after the last await, so nothing can slip in before the INVITE.
       if (_callId != callId) {
         _logger.info('Call $callId ended before it was placed');
         await _peer.disposeCall(callId);
         return callId;
       }
-      final local = await _peer.peerConnection?.getLocalDescription();
       final sdp = local?.sdp ?? offer.sdp ?? '';
       _sip.call(target, sdp, extraHeaders: outgoing);
+      _sipCallId = _sip.activeSipCallId;
       _callState = CallStateStatus.ringing;
       _emitCallEvent(callId, CallStateStatus.ringing, 'Invite sent');
       _startCallSetupTimer(callId);
@@ -820,7 +940,7 @@ class VobizClient {
       // Ends the reservation, and the INVITE if it already went out.
       if (_callId == callId) _sip.hangup();
       await _cleanupCall(callId);
-      _emitError('make_call_failed', 'Could not start the call', e);
+      _emitError(VobizErrorCode.makeCallFailed, 'Could not start the call', e);
       rethrow;
     }
   }
@@ -837,7 +957,7 @@ class VobizClient {
     final all = <String, String>{...headers};
     final cli = callerId?.trim() ?? '';
     if (cli.isNotEmpty) {
-      if (!_callerIdPattern.hasMatch(cli)) {
+      if (!e164Number.hasMatch(cli)) {
         throw ArgumentError(
             'Caller ID must be a phone number in E.164 format, such as +919876543210');
       }
@@ -860,15 +980,53 @@ class VobizClient {
     return raw.replaceFirst(RegExp('^sip:', caseSensitive: false), '').split('@').first;
   }
 
-  static final RegExp _callerIdPattern = RegExp(r'^\+?\d{7,15}$');
+  /// What cannot be in the user part of the INVITE's Request-URI and To: a
+  /// space or control character (CR LF would add header lines), or a
+  /// character that ends the user part or the URI.
+  static final RegExp _unsafeInDestination = RegExp(r'[\s\x00-\x1f\x7f"<>@;:?,]');
+
+  /// What cannot be in a SIP username, which goes into From, To and the
+  /// digest answer: a space or control character, or `< > " @`. Endpoint
+  /// names with any other character sign in as they are.
+  static final RegExp _unsafeInSipUsername = RegExp(r'[\s\x00-\x1f\x7f<>"@]');
+
+  static bool _isSipUsername(String username) =>
+      username.isNotEmpty && !_unsafeInSipUsername.hasMatch(username);
+
+  static void _checkSipUsername(String username) {
+    if (!_isSipUsername(username)) {
+      throw ArgumentError.value(username, 'username',
+          'must be a SIP username, with no spaces, line breaks or any of < > " @');
+    }
+  }
+
+  /// A JWT is base64url text in three dot-separated parts; anything else in
+  /// it would go into the `X-Vobiz-Jwt` header line as it is.
+  static void _checkAccessTokenText(VobizAccessToken token) {
+    if (!RegExp(r'^[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+$').hasMatch(token.token)) {
+      throw const VobizAccessTokenException(
+          'Invalid access token: only base64url text and dots can go into the X-Vobiz-Jwt header',
+          tokenError: VobizAccessTokenException.invalidToken);
+    }
+    if (!_isSipUsername(token.sipUsername)) {
+      throw const VobizAccessTokenException(
+          'Invalid access token: its sub and iss do not make a SIP username (no spaces, line '
+          'breaks or any of < > " @)',
+          tokenError: VobizAccessTokenException.invalidToken);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Inbound call
   // ---------------------------------------------------------------------------
 
+  /// Answers the ringing call. Does nothing when no call is ringing, or when
+  /// [callId] is given and is not the ringing call's (a late tap on an older
+  /// call's screen).
   Future<void> acceptCall([String? callId]) async {
-    final id = callId ?? _callId;
+    final id = _callId;
     if (id == null || _callState != CallStateStatus.incoming) return;
+    if (callId != null && callId != id) return;
     await _answerInvite(id);
   }
 
@@ -894,10 +1052,18 @@ class VobizClient {
   /// Mutes the microphone on the current call. Asked while the call is still
   /// connecting, it applies as soon as the microphone opens; it survives
   /// hold and resume. A new call starts unmuted. Each change is a
-  /// [MuteChangedEvent].
-  Future<void> mute([String? callId]) => _peer.setMuted(true);
+  /// [MuteChangedEvent]. Does nothing when [callId] is given and is not the
+  /// current call's.
+  Future<void> mute([String? callId]) async {
+    if (callId != null && callId != _callId) return;
+    await _peer.setMuted(true);
+  }
 
-  Future<void> unmute([String? callId]) => _peer.setMuted(false);
+  /// Unmutes the microphone; see [mute].
+  Future<void> unmute([String? callId]) async {
+    if (callId != null && callId != _callId) return;
+    await _peer.setMuted(false);
+  }
 
   /// Whether the current call's microphone is muted. False between calls.
   bool get isMuted => _peer.isMuted;
@@ -954,9 +1120,10 @@ class VobizClient {
   /// [number] (blind) or a SIP endpoint [sipUser], carrying [sipHeaders] on
   /// the new `<Dial>`.
   ///
-  /// [leg] picks what moves: [TransferLeg.aLeg] moves you onto the target and
-  /// drops the other party; [TransferLeg.bLeg] moves the other party and
-  /// drops you.
+  /// [leg] picks what moves, named the way Vobiz names a call's legs:
+  /// [TransferLeg.aLeg] is the side that started the call, [TransferLeg.bLeg]
+  /// the side its `<Dial>` reached. On a call this client placed, aLeg is
+  /// this client; on a call that rang it, aLeg is the caller.
   ///
   /// Needs Zero-Config Setup, because the redirect is made with the
   /// account's Auth ID and Auth Token. Returns the server's confirmation.
@@ -967,6 +1134,10 @@ class VobizClient {
     String? callerId,
     Map<String, String> sipHeaders = const <String, String>{},
   }) async {
+    final cli = callerId?.trim() ?? '';
+    if (cli.isNotEmpty && !e164Number.hasMatch(cli)) {
+      throw ArgumentError('Caller ID must be a phone number in E.164 format, such as +919876543210');
+    }
     if (_callState != CallStateStatus.active) {
       throw StateError('Transfer is only available once the call is answered');
     }
@@ -976,6 +1147,7 @@ class VobizClient {
       throw StateError(
           'Transfer needs Zero-Config Setup (Auth ID and Auth Token), not SIP Direct');
     }
+    _checkHttpsForAccountCredentials();
     final uuid = _callUuid ?? _sip.callUuid;
     if (uuid == null) {
       throw StateError('Vobiz has not reported a CallUUID for this call yet');
@@ -985,10 +1157,10 @@ class VobizClient {
     if (user.isEmpty == phone.isEmpty) {
       throw ArgumentError('Give either a phone number or a SIP user to transfer to');
     }
-    if (user.isNotEmpty && !RegExp(r'^[a-zA-Z0-9_.\-+]{1,120}$').hasMatch(user)) {
+    if (user.isNotEmpty && !sipUserName.hasMatch(user)) {
       throw ArgumentError('Transfer target must be a SIP endpoint username, such as play123');
     }
-    if (phone.isNotEmpty && !RegExp(r'^\+\d{7,15}$').hasMatch(phone)) {
+    if (phone.isNotEmpty && !e164Number.hasMatch(phone)) {
       throw ArgumentError('Transfer number must be in E.164 format, such as +919876543210');
     }
     final check = VobizSipHeaders.check(sipHeaders);
@@ -1009,12 +1181,12 @@ class VobizClient {
         leg: leg,
         number: phone.isEmpty ? null : phone,
         sipUser: user.isEmpty ? null : user,
-        callerId: callerId?.trim(),
+        callerId: cli.isEmpty ? null : cli,
         sipHeaders: xml.value,
       );
       return '${reply['message'] ?? 'Transfer accepted'}';
     } on VobizException catch (e) {
-      _emitError('transfer_failed', e.message, e);
+      _emitError(VobizErrorCode.transferFailed, e.message, e);
       rethrow;
     }
   }
@@ -1028,7 +1200,7 @@ class VobizClient {
     try {
       return await _api.recordings(webhookUrl: backendUrl);
     } on VobizException catch (e) {
-      _emitError('recordings_failed', e.message, e);
+      _emitError(VobizErrorCode.recordingsFailed, e.message, e);
       rethrow;
     }
   }
@@ -1036,11 +1208,19 @@ class VobizClient {
   /// Waits for the recording of the call with [callUuid] (usually
   /// [lastCallUuid]) to be reported, polling like the web Playground: every
   /// [interval], up to [attempts] times. Returns null if it never arrives.
+  ///
+  /// Throws [VobizException] ([VobizErrorCode.recordingsFailed]) at once,
+  /// without polling, when [backendUrl] is the shared demo server and demo
+  /// mode is off: that list is never read then.
   Future<VobizRecording?> waitForRecording(
     String callUuid, {
     Duration interval = const Duration(milliseconds: 2500),
     int attempts = 12,
   }) async {
+    if (WebhookServerApi.isDemoServer(backendUrl) && !_config.unsafeDemoZeroConfig) {
+      // Refused before any request is made: this throws the explanation.
+      await _api.recordings(webhookUrl: backendUrl);
+    }
     for (var i = 0; i < attempts; i++) {
       await Future<void>.delayed(interval);
       try {
@@ -1068,7 +1248,8 @@ class VobizClient {
   ///
   /// Throws [StateError] without a connected call, and [VobizException]
   /// (`hold_failed`) when the far end refuses; the call then carries on as
-  /// it was.
+  /// it was, unless the refusal is a 481 (the far end no longer has the
+  /// call), which ends the call.
   Future<void> hold([String? callId]) async {
     final id = _requireCurrentCall(callId);
     if (_callState != CallStateStatus.active) {
@@ -1114,35 +1295,6 @@ class VobizClient {
   Future<void> audioInterruptionEnded({bool shouldResume = true}) =>
       _interruptions.ended(shouldResume: shouldResume);
 
-  // ---------------------------------------------------------------------------
-  // Legacy call control — Node reference backend only
-  // ---------------------------------------------------------------------------
-  //
-  // These call routes such as /add-call on [backendUrl]. The Node reference
-  // server (Vobiz-RTC-demo in the vobiz_inbound monorepo) implements them;
-  // the Playground server does not, so against it they throw
-  // UnsupportedError rather than appear to work. For a transfer that works
-  // with the Playground server, use transferCall().
-
-  Future<void> transfer(String to) =>
-      _backend('/transfer', body: {'to': to});
-
-  Future<void> warmTransferStart(String to) =>
-      _backend('/warm-transfer/start', body: {'to': to});
-
-  Future<void> warmTransferComplete() async {
-    final id = _callId;
-    if (id != null) await _terminate(id, message: 'Call ended');
-  }
-
-  Future<void> addCall(String to) => _backend('/add-call', body: {'to': to});
-  Future<void> startSecondCall(String to) =>
-      _backend('/second-call', body: {'to': to});
-  Future<void> swapCalls() => _backend('/swap-calls');
-  Future<void> mergeCalls() => _backend('/merge-calls');
-  Future<void> endSecondCall() => _backend('/end-second-call');
-  Future<void> removeAddedCall() => _backend('/remove-added-call');
-
   String _requireCurrentCall(String? callId) {
     final id = _callId;
     if (id == null || (callId != null && callId != id)) {
@@ -1157,16 +1309,28 @@ class VobizClient {
     }
     _reInviteInProgress = true;
     try {
-      final offer = await _peer.beginHold(hold);
       try {
+        // Inside the try: building the offer can fail too (the far end's own
+        // re-INVITE is being answered), and the microphone must come back.
+        final offer = await _peer.beginHold(hold);
         final answer = await _sip.reInvite(offer);
         if (_callId != id) return;
         await _peer.completeHold(answer);
       } catch (e) {
         if (_callId != id) return; // the call ended meanwhile
-        await _peer.abortHold();
-        final code = hold ? 'hold_failed' : 'resume_failed';
-        final message = 'Could not ${hold ? 'hold' : 'resume'} the call: $e';
+        final code = hold ? VobizErrorCode.holdFailed : VobizErrorCode.resumeFailed;
+        final gone = e is SipRequestFailed && e.statusCode == 481;
+        if (gone) {
+          // Vobiz no longer has this call (its BYE was lost): end it here
+          // too, with no BYE, which would only be refused (RFC 3261
+          // 12.2.1.2).
+          _sip.abandonCall();
+        } else {
+          await _peer.abortHold();
+        }
+        final message = gone
+            ? 'Could not ${hold ? 'hold' : 'resume'} the call: it no longer exists'
+            : 'Could not ${hold ? 'hold' : 'resume'} the call: $e';
         _emitError(code, message, e);
         throw VobizException(code, message,
             statusCode: e is SipRequestFailed ? e.statusCode : null);
@@ -1184,6 +1348,7 @@ class VobizClient {
     _sip.onRegistered = () {
       _registrationState = RegistrationState.registered;
       _connectionState = ConnectionStateStatus.connected;
+      _reconnectWhenCallEnds = false;
       _supervisor.connected();
       final onForeground = _reregisteringOnForeground;
       _reregisteringOnForeground = false;
@@ -1207,6 +1372,10 @@ class VobizClient {
 
     _sip.onRegistrationFailed = (reason) {
       _reregisteringOnForeground = false;
+      if (_sip.registrationFailureTemporary && _config.autoReconnect && _supervisor.isRunning) {
+        _onTemporaryRegistrationFailure(reason);
+        return;
+      }
       // Wrong credentials are not a network problem: retrying cannot help.
       _supervisor.stop();
       _registrationState = RegistrationState.failed;
@@ -1218,7 +1387,7 @@ class VobizClient {
       ));
       // A refused access token carries the registrar's reason (10001-10010).
       _emitError(
-          'registration_failed',
+          VobizErrorCode.registrationFailed,
           reason,
           _accessToken == null
               ? null
@@ -1238,6 +1407,29 @@ class VobizClient {
     _wireSipCalls();
   }
 
+  /// The registrar could not take the REGISTER now (no answer, 408, 480,
+  /// 5xx): not a refusal of the credentials, so keep trying with the
+  /// reconnect backoff. The SIP layer has closed the socket, or closes it
+  /// when the call on it ends; the reconnect waits for that.
+  void _onTemporaryRegistrationFailure(String reason) {
+    _logger.warn('Registration failed for now, trying again: $reason');
+    // Already reported as given up: a network change or reconnect() starts
+    // again.
+    if (_supervisor.hasGivenUp) return;
+    _registrationState = RegistrationState.unregistered;
+    _connectionState = ConnectionStateStatus.reconnecting;
+    _connectionEvents.addIfOpen(ConnectionEvent(
+      connectionState: _connectionState,
+      registrationState: _registrationState,
+      message: 'Registration failed: $reason. Trying again',
+    ));
+    if (_callId != null) {
+      _reconnectWhenCallEnds = true;
+      return;
+    }
+    _scheduleReconnect('Registration failed: $reason');
+  }
+
   /// The signalling socket is gone. A connected call rides it out (its
   /// dialog is kept across the reconnect); anything else ends.
   void _onSocketLost(String reason, {bool immediately = false}) {
@@ -1250,7 +1442,7 @@ class VobizClient {
       registrationState: _registrationState,
       message: 'Socket error: $reason',
     ));
-    _emitError('socket_error', reason, null);
+    _emitError(VobizErrorCode.socketError, reason, null);
     _onSignalingLost();
     if (!_config.autoReconnect) return;
     if (immediately) {
@@ -1316,7 +1508,7 @@ class VobizClient {
         _logger.error('Failed to apply remote answer: $e');
         await _terminate(id,
             message: 'Could not connect audio', reason: 'answer_failed');
-        _emitError('answer_failed', 'Could not connect audio', e);
+        _emitError(VobizErrorCode.answerFailed, 'Could not connect audio', e);
       }
     };
 
@@ -1335,6 +1527,7 @@ class VobizClient {
       _pendingInboundSdp = sdp;
       _direction = CallDirection.inbound;
       _callUuid = _sip.callUuid;
+      _sipCallId = _sip.activeSipCallId;
       _callHeaders = Map<String, String>.unmodifiable(headers);
       _callState = CallStateStatus.incoming;
       _emitCallEvent(callId, CallStateStatus.incoming, callerId);
@@ -1373,11 +1566,21 @@ class VobizClient {
           if (_callState == CallStateStatus.active ||
               _callState == CallStateStatus.held) {
             _startNetworkLossTimer(callId);
+            if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+              _restartIceForLostMedia(callId);
+            } else {
+              _mediaRestartTimer ??= Timer(_mediaRestartDelay, () {
+                _mediaRestartTimer = null;
+                if (_mediaLost) _restartIceForLostMedia(callId);
+              });
+            }
           }
           break;
         case RTCIceConnectionState.RTCIceConnectionStateConnected:
         case RTCIceConnectionState.RTCIceConnectionStateCompleted:
           _mediaLost = false;
+          _mediaRestartTried = false;
+          _cancelMediaRestartTimer();
           _checkNetworkRecovered();
           break;
         default:
@@ -1398,9 +1601,18 @@ class VobizClient {
   }
 
   /// A new sign-in replaces the old connection rather than opening a second
-  /// socket next to it.
+  /// socket next to it. Until it signs in, nothing describes the old one.
   void _closeExistingConnection() {
+    _signInEpoch++;
     _supervisor.stop();
+    _reconnectWhenCallEnds = false;
+    _registrationState = RegistrationState.unregistered;
+    _authMode = VobizAuthMode.none;
+    _authId = null;
+    _authToken = null;
+    _username = null;
+    _password = null;
+    _accessToken = null;
     final callId = _callId;
     if (callId != null) {
       unawaited(_terminate(callId,
@@ -1428,9 +1640,15 @@ class VobizClient {
 
   /// Opens the socket and sends the first REGISTER with whatever this client
   /// signs in with: a password, or an access token.
+  ///
+  /// A sign-in or sign-out that comes while it connects replaces it: it then
+  /// stops without reporting anything. A reconnect attempt that fails is
+  /// rethrown to the supervisor, which counts it and reports when it gives
+  /// up, so the state stays `reconnecting` meanwhile.
   Future<void> _connectAndRegister({required bool reconnecting}) async {
     final username = _username;
     if (username == null) return;
+    final epoch = _signInEpoch;
     _registrationState = RegistrationState.registering;
     _connectionState = reconnecting
         ? ConnectionStateStatus.reconnecting
@@ -1445,8 +1663,10 @@ class VobizClient {
     try {
       if (_config.autoReconnect && !_supervisor.isRunning) {
         await _supervisor.start();
+        if (epoch != _signInEpoch) return;
       }
       await _sip.connect();
+      if (epoch != _signInEpoch) return;
       // A pushed call not claimed yet rides on this sign-in's REGISTER.
       _claimPushedCallOnRegister();
       final token = _accessToken;
@@ -1455,7 +1675,16 @@ class VobizClient {
       } else {
         _sip.register(username, _password ?? '');
       }
+    } on SipConnectSuperseded {
+      // A sign-out, or a newer connection, replaced this one.
+      return;
     } catch (e) {
+      if (epoch != _signInEpoch) return;
+      if (reconnecting) {
+        _registrationState = RegistrationState.unregistered;
+        _logger.warn('Reconnect attempt failed: $e');
+        rethrow;
+      }
       _registrationState = RegistrationState.failed;
       _connectionState = ConnectionStateStatus.failed;
       _connectionEvents.addIfOpen(ConnectionEvent(
@@ -1463,11 +1692,22 @@ class VobizClient {
         registrationState: _registrationState,
         message: 'Connection failed: $e',
       ));
-      _emitError('connect_failed', 'Could not connect', e);
-      // SIPService no longer calls onSocketError on connect failure, so we
-      // schedule the reconnect here for both initial and retry code paths.
+      _emitError(VobizErrorCode.connectFailed, 'Could not connect', e);
+      // SIPService does not call onSocketError when connect fails, so a
+      // first sign-in schedules its reconnect here.
       if (_config.autoReconnect) _scheduleReconnect('Could not connect: $e');
       rethrow;
+    }
+  }
+
+  /// The account Auth ID and Auth Token go to [backendUrl] only over HTTPS,
+  /// or to this device itself (a local server, or an emulator's host).
+  void _checkHttpsForAccountCredentials() {
+    final uri = Uri.tryParse(WebhookServerApi.normalizeBase(backendUrl));
+    const local = <String>{'localhost', '127.0.0.1', '::1', '[::1]', '10.0.2.2'};
+    if (uri == null || (uri.scheme != 'https' && !(uri.scheme == 'http' && local.contains(uri.host)))) {
+      throw ArgumentError.value(backendUrl, 'backendUrl',
+          'must be https: it receives the account Auth ID and Auth Token');
     }
   }
 
@@ -1502,6 +1742,12 @@ class VobizClient {
   /// with the password or the current access token.
   Future<void> _reconnectOnce() async {
     if (!_hasSignIn) return;
+    // The socket is replaced even when nothing reported it dead (the network
+    // came back, reconnect(), the app returned to the foreground): treat a
+    // call's signalling as lost. A call still being set up ends (its INVITE
+    // transaction goes with the socket); a connected one gets the grace
+    // period, and its ICE restart once registered tells Vobiz where it is.
+    _onSignalingLost();
     // Keep a connected call's dialog: once registered again it can still
     // be hung up, and the far end's BYE still matches it.
     // Not a sign-out: no unregistration, the REGISTER below replaces it.
@@ -1535,7 +1781,7 @@ class VobizClient {
           registrationState: _registrationState,
           message: event.reason ?? 'Reconnect failed',
         ));
-        _emitError('reconnect_failed', event.reason ?? 'Reconnect failed', null);
+        _emitError(VobizErrorCode.reconnectFailed, event.reason ?? 'Reconnect failed', null);
         break;
       case NetworkEventType.online:
       case NetworkEventType.networkChanged:
@@ -1587,7 +1833,8 @@ class VobizClient {
   /// The network changed during a call. The signalling socket is left alone
   /// (replacing it would drop the dialog). When the socket died with the
   /// old network, the reconnect's REGISTER triggers the ICE restart
-  /// ([_restartIce]); a socket that survived keeps its media path too.
+  /// ([_restartIce]); when it survived but the audio did not, ICE reports
+  /// the loss and [_restartIceForLostMedia] moves it.
   void _onNetworkHandover(NetworkStatus from, NetworkStatus to) {
     _logger.warn('Network changed during a call: $from -> $to');
   }
@@ -1653,7 +1900,7 @@ class VobizClient {
           reason: 'answer_failed',
           declineCode: declineCode,
           declinePhrase: declinePhrase);
-      _emitError('answer_failed', why, e);
+      _emitError(VobizErrorCode.answerFailed, why, e);
     }
   }
 
@@ -1673,7 +1920,7 @@ class VobizClient {
         _logger.warn('Call setup timeout for $callId');
         await _terminate(callId,
             message: 'Call setup timed out', reason: 'setup_timeout');
-        _emitError('call_timeout', 'Call setup timed out', null);
+        _emitError(VobizErrorCode.callTimeout, 'Call setup timed out', null);
       }
     });
   }
@@ -1687,8 +1934,9 @@ class VobizClient {
   // Private — network loss during a call
   // ---------------------------------------------------------------------------
 
-  /// The socket dropped. A connected call's media may well still be flowing,
-  /// so it gets [_networkLossGrace] to reconnect and re-register. A call
+  /// The socket dropped, or is being replaced. A connected call's media may
+  /// well still be flowing, so it gets [_networkLossGrace] to reconnect and
+  /// re-register. A call
   /// still being set up cannot be completed over a new connection (its
   /// INVITE transaction belonged to the old one), so it ends now.
   void _onSignalingLost() {
@@ -1715,7 +1963,7 @@ class VobizClient {
       _logger.warn('Call $callId did not recover; ending it');
       await _terminate(callId,
           message: 'Network connection lost', reason: 'network_lost');
-      _emitError('network_lost', 'The call was lost with the network', null);
+      _emitError(VobizErrorCode.networkLost, 'The call was lost with the network', null);
     });
   }
 
@@ -1731,6 +1979,26 @@ class VobizClient {
   void _clearNetworkLossTimer() {
     _networkLossTimer?.cancel();
     _networkLossTimer = null;
+  }
+
+  void _cancelMediaRestartTimer() {
+    _mediaRestartTimer?.cancel();
+    _mediaRestartTimer = null;
+  }
+
+  /// The call's audio is gone (ICE failed, or disconnected for
+  /// [_mediaRestartDelay]) while signalling is up: NAT rebinding, a lost
+  /// TURN allocation, a network change the socket survived. ICE cannot
+  /// recover from that alone, so restart it once for this loss; the
+  /// network-loss timer still ends the call if the audio does not return.
+  /// With signalling lost too, the reconnect's REGISTER restarts ICE.
+  void _restartIceForLostMedia(String callId) {
+    if (_callId != callId || _mediaRestartTried || _signalingLost || !isConnected) return;
+    // A hold or resume is renegotiating: leave the one restart for the next
+    // report of the loss.
+    if (_reInviteInProgress) return;
+    _mediaRestartTried = true;
+    unawaited(_restartIce('the call lost its audio while signalling is up'));
   }
 
   /// Moves the call's audio to the network the phone has now: an ICE
@@ -1877,8 +2145,10 @@ class VobizClient {
     _callId = null;
     _clearCallSetupTimer();
     _clearNetworkLossTimer();
+    _cancelMediaRestartTimer();
     _signalingLost = false;
     _mediaLost = false;
+    _mediaRestartTried = false;
     _callUuid = _sip.callUuid ?? _callUuid;
     _callState = CallStateStatus.ended;
     _emitCallEvent(
@@ -1890,53 +2160,17 @@ class VobizClient {
     _activeCallDestination = null;
     _direction = null;
     _callUuid = null;
+    _sipCallId = null;
     _callHeaders = const <String, String>{};
     _callState = CallStateStatus.idle;
     _interruptions.reset();
     _reInviteInProgress = false;
-    await _peer.disposeCall(callId);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Private — backend HTTP calls (legacy routes)
-  // ---------------------------------------------------------------------------
-
-  static const Duration _backendTimeout = Duration(seconds: 10);
-
-  Future<void> _backend(
-    String path, {
-    String method = 'POST',
-    Map<String, String>? body,
-  }) async {
-    final url = Uri.parse('${WebhookServerApi.normalizeBase(backendUrl)}$path');
-    try {
-      final response = body != null
-          ? await _http
-              .post(url,
-                  headers: {'Content-Type': 'application/json'},
-                  body: jsonEncode(body))
-              .timeout(_backendTimeout)
-          : method == 'DELETE'
-              ? await _http.delete(url).timeout(_backendTimeout)
-              : await _http.post(url).timeout(_backendTimeout);
-      final status = response.statusCode;
-      if (status == 404 || status == 405 || status == 501) {
-        throw UnsupportedError(
-            'The webhook server at $backendUrl does not implement $path '
-            '(HTTP $status). Only the Node reference server has the legacy '
-            'call-control routes; use transferCall() for transfers.');
-      }
-      if (status >= 400) {
-        throw VobizException('backend_failed',
-            'The webhook server refused $path', statusCode: status);
-      }
-    } on UnsupportedError {
-      rethrow;
-    } on VobizException {
-      rethrow;
-    } catch (e) {
-      throw VobizException('backend_failed', 'Could not reach $path: $e');
+    if (_reconnectWhenCallEnds) {
+      // The SIP layer closes the socket now that the call is over.
+      _reconnectWhenCallEnds = false;
+      _scheduleReconnect('Registration failed during the call');
     }
+    await _peer.disposeCall(callId);
   }
 
   // ---------------------------------------------------------------------------
@@ -1955,7 +2189,7 @@ class VobizClient {
       headers: _callHeaders,
       sipCode: sipCode,
       reason: reason,
-      sipCallId: _sip.activeSipCallId,
+      sipCallId: _sipCallId,
     ));
   }
 
@@ -1982,9 +2216,13 @@ class _AlwaysOnlineMonitor implements ConnectivityMonitor {
 /// A call a Vobiz push announced, from [VobizClient.handleIncomingPush] until
 /// its call ends or the push expires.
 class _PushedCall {
-  _PushedCall(this.push);
+  _PushedCall(this.push, this.deadline);
 
   final VobizIncomingPush push;
+
+  /// When it stops being awaited: [VobizClient.handleIncomingPush] says how
+  /// that is worked out.
+  final DateTime deadline;
 
   /// The call's `CallEvent.callId`, once its INVITE has arrived.
   String? callId;

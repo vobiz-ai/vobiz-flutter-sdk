@@ -1,9 +1,14 @@
-/// Which leg of a live call a transfer moves.
+/// Which leg of a live call a transfer moves, named the way Vobiz names a
+/// call's legs: by who started the call, not by who is transferring.
 enum TransferLeg {
-  /// Moves your own leg onto the transfer target. The other party is dropped.
+  /// Moves the side that started the call onto the transfer target, and
+  /// drops the other side. On a call this client placed that is this
+  /// client; on a call that rang this client it is the caller.
   aLeg('aleg'),
 
-  /// Moves the other party onto the transfer target. Your leg is dropped.
+  /// Moves the side the call's `<Dial>` reached onto the transfer target,
+  /// and drops the other side. On a call that rang this client that is this
+  /// client; on a call this client placed it is the party called.
   bLeg('bleg'),
 
   /// Moves both legs: each runs the transfer XML on its own (for example,

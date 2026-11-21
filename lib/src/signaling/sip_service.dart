@@ -11,6 +11,7 @@ import '../core/sip_headers.dart';
 import '../errors/vobiz_exception.dart';
 import '../network/keep_alive.dart';
 import '../utils/logger.dart';
+import '../utils/sip_text.dart';
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -64,7 +65,12 @@ class SipMessage {
 
   bool get isRequest => !firstLine.startsWith('SIP/');
   String get method => firstLine.split(' ').first;
-  int get statusCode => int.tryParse(firstLine.split(' ')[1]) ?? 0;
+
+  /// The response's status code; 0 when the status line has none.
+  int get statusCode {
+    final parts = firstLine.split(' ');
+    return parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0;
+  }
 
   String? header(String name) {
     final key = name.toLowerCase();
@@ -306,7 +312,6 @@ class SipBuilder {
   static String ok200({
     required SipMessage invite,
     required String contactUri,
-    required String sipServer,
     required String localTag,
     required String sdp,
   }) {
@@ -488,8 +493,14 @@ class SipBuilder {
   }
 
   static String _branch() =>
-      Random().nextInt(0x7fffffff).toRadixString(16).padLeft(8, '0');
+      sipRandom.nextInt(0x7fffffff).toRadixString(16).padLeft(8, '0');
 }
+
+/// Where branches, tags, Call-IDs, the Contact user and the digest cnonce
+/// come from: unpredictable, as RFC 3261 19.3 and 8.1.1.4 ask, so they
+/// cannot be guessed from earlier ones.
+@visibleForTesting
+final Random sipRandom = Random.secure();
 
 // ---------------------------------------------------------------------------
 // SIP Digest Auth
@@ -547,7 +558,7 @@ class SipDigestAuth {
       md5.convert(utf8.encode(input)).toString();
 
   static String _rand() =>
-      List.generate(8, (_) => Random().nextInt(16).toRadixString(16)).join();
+      List.generate(16, (_) => sipRandom.nextInt(16).toRadixString(16)).join();
 
   static String? _extract(String header, String key) =>
       RegExp('\\b$key\\s*=\\s*"([^"]*)"', caseSensitive: false).firstMatch(header)?.group(1);
@@ -809,7 +820,6 @@ class SIPService {
   String? _accessToken;
   int? _accessTokenError;
   int? _accessTokenExpiresIn;
-  int? _accessTokenExpiresAt;
   int _cseq = 1;
   bool _manualDisconnect = false;
 
@@ -818,7 +828,6 @@ class SIPService {
   Map<String, String>? _pendingClaim;
 
   String? _activeCallId;
-  String? _activeRemoteTag;
   String? _activeToUser;
   String? _activeRemoteTarget;
   String? _activeRemotePartyHeader;
@@ -943,31 +952,73 @@ class SIPService {
   /// answered without it.
   Future<String?> Function(String offerSdp)? onSessionOffer;
 
+  /// Opens the WebSocket. Throws when it cannot be opened, and
+  /// [SipConnectSuperseded] when [disconnect] or another [connect] replaced
+  /// it before its handshake finished: that socket is closed, and the state
+  /// is left to whatever replaced it.
+  ///
+  /// A socket still open from before is closed first. Throws [ArgumentError]
+  /// in a release build for a cleartext `ws:` URL to anything but this
+  /// device ([refusesCleartext]): the REGISTER carries the digest answer or
+  /// the access token.
   Future<void> connect() async {
+    final uri = Uri.parse(wsUrl);
+    if (refusesCleartext(uri)) {
+      throw ArgumentError.value(wsUrl, 'wsUrl', 'must be wss: in a release build');
+    }
+    if (uri.scheme == 'ws' && !_isLoopback(uri.host)) {
+      _logger.warn('SIP over cleartext ws: to ${uri.host}; a release build refuses it');
+    }
+    final previous = _socket;
+    if (previous != null) {
+      _socket = null;
+      _dropRegistersSentOn(previous);
+      _closeQuietly(previous);
+    }
     _manualDisconnect = false;
     _connectionState.value = SipConnectionState.connecting;
+    WebSocketChannel? socket;
     try {
-      _socket = IOWebSocketChannel.connect(
-        Uri.parse(wsUrl),
+      socket = IOWebSocketChannel.connect(
+        uri,
         protocols: const <String>['sip'],
         pingInterval: keepAlive.pingInterval,
         connectTimeout: const Duration(seconds: 20),
       );
+      _socket = socket;
       // Await the actual TCP/TLS/WebSocket handshake. Without this, the
       // TimeoutException from connectTimeout escapes into an unguarded async
       // zone and becomes an Unhandled Exception in the Flutter error handler.
-      await _socket!.ready;
-      _connectionState.value = SipConnectionState.connected;
-      _logger.info('SIP WebSocket connected to $wsUrl');
-      _listenToSocket();
+      await socket.ready;
     } catch (e) {
+      if (socket != null && !identical(socket, _socket)) {
+        throw const SipConnectSuperseded();
+      }
       _connectionState.value = SipConnectionState.disconnected;
       _logger.error('SIP WebSocket connection failed: $e');
       // Don't call onSocketError here — the exception propagates to VobizClient
       // which emits the error event and schedules reconnects in its own catch.
       rethrow;
     }
+    if (!identical(socket, _socket)) {
+      _logger.info('SIP WebSocket to $wsUrl replaced before it opened; closing it');
+      _closeQuietly(socket);
+      throw const SipConnectSuperseded();
+    }
+    _connectionState.value = SipConnectionState.connected;
+    _logger.info('SIP WebSocket connected to $wsUrl');
+    _listenToSocket(socket);
   }
+
+  /// Whether [connect] refuses [uri]: a cleartext `ws:` URL to another
+  /// host, in a release build ([release]). Debug builds allow it, for a
+  /// registrar on the LAN while developing.
+  @visibleForTesting
+  static bool refusesCleartext(Uri uri, {bool release = kReleaseMode}) =>
+      release && uri.scheme == 'ws' && !_isLoopback(uri.host);
+
+  static bool _isLoopback(String host) =>
+      host == 'localhost' || host == '127.0.0.1' || host == '::1' || host == '[::1]';
 
   void register(String username, String password) {
     _username = username;
@@ -983,6 +1034,8 @@ class SIPService {
     _username = username;
     _password = null;
     _accessToken = accessToken;
+    // What the registrar said about the last token is not about this one.
+    _accessTokenExpiresIn = null;
     _startRegistration();
   }
 
@@ -991,11 +1044,23 @@ class SIPService {
   void updateAccessToken(String accessToken) {
     if (_password != null) return;
     _accessToken = accessToken;
+    _accessTokenExpiresIn = null;
   }
 
-  /// Whether this client signs in with an access token rather than a
-  /// password.
-  bool get usesAccessToken => _accessToken != null;
+  /// Drops the user name, password and access token, after a sign-out has
+  /// finished with them (its unregistration, a call's BYE). The next sign-in
+  /// sets them again.
+  void forgetCredentials() {
+    _username = null;
+    _password = null;
+    _accessToken = null;
+    _accessTokenExpiresIn = null;
+    _accessTokenError = null;
+  }
+
+  /// Whether a user name with a password or access token is held.
+  @visibleForTesting
+  bool get debugHasCredentials => _hasCredentials;
 
   /// The registrar's reason for its last refusal of the access token (10001
   /// to 10010, from `X-vobiz-Jwt-Error-Code`), until the next REGISTER is
@@ -1003,9 +1068,21 @@ class SIPService {
   int? get accessTokenError => _accessTokenError;
 
   /// From the registrar's last 200 OK (`X-vobiz-Jwt: expires=<s>;epoch-exp=<t>`):
-  /// seconds the token had left by the server's clock, and its expiry.
+  /// seconds the token had left by the server's clock. Null until a 200 OK
+  /// for the current token says so.
   int? get accessTokenExpiresIn => _accessTokenExpiresIn;
-  int? get accessTokenExpiresAt => _accessTokenExpiresAt;
+
+  /// Whether the registration failure just reported to [onRegistrationFailed]
+  /// was temporary: no answer, or a 408, 480 or 5xx without an access-token
+  /// error. Registering again later may work. False for a refusal of the
+  /// credentials (401, 403, 407, a token error code) and any other answer.
+  bool get registrationFailureTemporary => _registrationFailureTemporary;
+  bool _registrationFailureTemporary = false;
+
+  /// A REGISTER answer, or no answer at all ([code] null), that says the
+  /// registrar could not take the registration now rather than refused it.
+  static bool _isTemporaryRegisterFailure(int? code) =>
+      code == null || code == 408 || code == 480 || (code >= 500 && code < 600);
 
   bool get _hasCredentials =>
       _username != null && (_password != null || _accessToken != null);
@@ -1032,8 +1109,16 @@ class SIPService {
   /// REGISTER: the sign-in's ([register], [registerWithAccessToken]), a
   /// reconnect's, or another right after the one in flight is answered. Only
   /// that one REGISTER carries them; refreshes after it do not.
+  ///
+  /// Headers that cannot go on a header line as they are (a name that is not
+  /// a SIP token, a control character in a name or value) are refused: this
+  /// returns false and nothing is sent or kept.
   bool claimHeldCall(Map<String, String> headers) {
     if (headers.isEmpty) return false;
+    if (!headers.entries.every((h) => _headerToken.hasMatch(h.key) && !hasControlCharacter(h.value))) {
+      _logger.warn('Not claiming the held call: its hold reference cannot go into a SIP header');
+      return false;
+    }
     final registered = _connectionState.value == SipConnectionState.connected &&
         _registrationState.value == SipRegistrationState.registered;
     final inFlight = _transactions.values.any((tx) => tx.method == 'REGISTER');
@@ -1108,8 +1193,17 @@ class SIPService {
     _reservationTimer = Timer(outgoingReservation, _releaseReservation);
   }
 
+  /// Sends the INVITE for a new outbound call to [toUser]. Throws
+  /// [ArgumentError], sending nothing, when [toUser] or a header in
+  /// [extraHeaders] could not go into the message as it is.
   void call(String toUser, String sdp,
       {Map<String, String> extraHeaders = const <String, String>{}}) {
+    if (toUser.isEmpty || hasControlCharacter(toUser)) {
+      throw ArgumentError.value(toUser, 'toUser', 'cannot go into a SIP Request-URI');
+    }
+    if (!extraHeaders.entries.every((h) => _headerToken.hasMatch(h.key) && !hasControlCharacter(h.value))) {
+      throw ArgumentError.value(extraHeaders.keys.join(', '), 'extraHeaders', 'cannot all go into SIP headers');
+    }
     _releaseReservation();
     // An inbound INVITE that arrived while this call was being prepared was
     // never shown to the app. Give its caller a final answer now rather than
@@ -1173,7 +1267,6 @@ class SIPService {
     _send(SipBuilder.ok200(
       invite: _pendingInvite!,
       contactUri: _contactUri,
-      sipServer: sipServer,
       localTag: _localTag,
       sdp: sdp,
     ));
@@ -1262,6 +1355,17 @@ class SIPService {
     _manualDisconnect = true;
 
     final socket = _socket;
+    final reInvite = _reInvite;
+    if (keepCall && reInvite != null) {
+      // Our own re-INVITE (hold, ICE restart) in flight on this socket can
+      // no longer be answered: fail it now rather than after Timer B, so the
+      // call can renegotiate on the new connection.
+      _reInvite = null;
+      _dropWhere((tx) => tx.method == 'INVITE' && tx.callId == _activeCallId && identical(tx.socket, socket));
+      if (!reInvite.isCompleted) {
+        reInvite.completeError(SipRequestFailed('The connection was replaced before the re-INVITE was answered', null));
+      }
+    }
     final wasRegistered = !keepCall &&
         unregister &&
         _registrationState.value == SipRegistrationState.registered &&
@@ -1286,7 +1390,9 @@ class SIPService {
       await done.future.timeout(unregisterTimeout, onTimeout: () {
         _logger.warn('No answer to the unregistration; closing anyway');
       });
-      _dropTransactions('REGISTER');
+      // Only this socket's: a sign-in on a new socket may have sent its
+      // REGISTER meanwhile.
+      _dropRegistersSentOn(socket);
       if (identical(_closingSocket, socket)) _closingSocket = null;
     }
     _closeQuietly(socket);
@@ -1333,9 +1439,17 @@ class SIPService {
     });
   }
 
-  void _dropTransactions(String method) {
+  void _dropTransactions(String method) => _dropWhere((tx) => tx.method == method);
+
+  /// A socket that closed, or was replaced, never brings the answer to a
+  /// REGISTER sent on it: drop those, so their timeouts cannot fail a later
+  /// registration.
+  void _dropRegistersSentOn(WebSocketChannel? socket) =>
+      _dropWhere((tx) => tx.method == 'REGISTER' && identical(tx.socket, socket));
+
+  void _dropWhere(bool Function(_ClientTransaction tx) test) {
     _transactions.removeWhere((_, tx) {
-      if (tx.method != method) return false;
+      if (!test(tx)) return false;
       tx.timer?.cancel();
       return true;
     });
@@ -1386,7 +1500,8 @@ class SIPService {
           ? onUnregistered
           : auth.refresh
               ? () => _transportDead(sentOn, 'No answer to the REGISTER refresh')
-              : () => _failRegistration('Registration timed out: no answer from the registrar'),
+              : () => _failRegistration('Registration timed out: no answer from the registrar',
+                  temporary: true),
     );
   }
 
@@ -1643,6 +1758,13 @@ class SIPService {
             }
           }
         }
+        if (code == 481 && dialog.callId == _activeCallId) {
+          // The far end no longer has this call (its BYE was lost): end it
+          // here too (RFC 3261 12.2.1.2).
+          _logger.warn('DTMF INFO answered 481: the call no longer exists; ending it');
+          abandonCall();
+          return;
+        }
         if (code >= 300) {
           _logger.warn('DTMF INFO refused: $code ${_reasonPhrase(msg)}');
         }
@@ -1724,6 +1846,22 @@ class SIPService {
           if (!completer.isCompleted) completer.complete(msg.body);
           return;
         }
+        // 300-699: the re-INVITE's own transaction ACKs it, on its branch,
+        // Request-URI, CSeq and routes (RFC 3261 17.1.1.3), before any retry.
+        _send(
+          SipBuilder.ack(
+            requestUri: dialog.remoteTarget,
+            fromUser: username,
+            toHeader: msg.header('To') ?? dialog.remoteParty,
+            sipServer: sipServer,
+            localTag: _localTag,
+            callId: dialog.callId,
+            cseq: cseq,
+            branch: branch,
+            routes: dialog.routes,
+          ),
+          socket: tx.socket,
+        );
         if (code == 401 || code == 407) {
           final challenge = _challenge(msg);
           if (_password != null && challenge.isNotEmpty && auth.allow(challenge)) {
@@ -1760,7 +1898,7 @@ class SIPService {
   _Dialog _currentDialog() => _Dialog(
         callId: _activeCallId!,
         remoteTarget: _inDialogRequestUri(),
-        remoteParty: _activeRemotePartyHeader ?? _buildFallbackToHeader(),
+        remoteParty: _activeRemotePartyHeader!,
         routes: _routeSet,
       );
 
@@ -1796,34 +1934,37 @@ class SIPService {
     _manualDisconnect = false;
     _socket = socket;
     _connectionState.value = SipConnectionState.connected;
-    _listenToSocket();
+    _listenToSocket(socket);
   }
 
   // ---------------------------------------------------------------------------
   // Private — receiving
   // ---------------------------------------------------------------------------
 
-  void _listenToSocket() {
+  void _listenToSocket(WebSocketChannel socket) {
     // Guard so onError + onDone both firing only triggers onSocketError once.
     var errorReported = false;
     // A sign-in replaces the socket. The old one's close arrives later and
     // must not be mistaken for the new connection dropping, which would
     // schedule a reconnect over a healthy session.
-    final socket = _socket!;
     bool isCurrent() => identical(socket, _socket);
 
     socket.stream.listen(
       (raw) {
+        // A binary frame carries the message as bytes: the WebSocket module
+        // sends one when the text is not valid UTF-8 (a Latin-1 caller name).
+        final text = raw is List<int> ? utf8.decode(raw, allowMalformed: true) : raw.toString();
         if (isCurrent()) {
-          _handleMessage(raw.toString());
+          _handleMessage(text);
         } else if (identical(socket, _closingSocket)) {
           // Unregistering: only the answers to our own requests matter.
-          _handleMessage(raw.toString(), responsesOnly: true);
+          _handleMessage(text, responsesOnly: true);
         }
       },
       onError: (Object e) {
         if (!isCurrent()) return;
         _logger.error('SIP WebSocket error: $e');
+        _dropRegistersSentOn(socket);
         _connectionState.value = SipConnectionState.disconnected;
         _registrationState.value = SipRegistrationState.failed;
         _registrationRefreshTimer?.cancel();
@@ -1836,6 +1977,7 @@ class SIPService {
       onDone: () {
         if (!isCurrent()) return;
         _logger.warn('SIP WebSocket closed');
+        _dropRegistersSentOn(socket);
         _connectionState.value = SipConnectionState.disconnected;
         _registrationRefreshTimer?.cancel();
         _crlfKeepAlive?.stop();
@@ -1855,7 +1997,17 @@ class SIPService {
       return;
     }
     _logger.info('SIP << ${_summarize(raw)}');
-    final msg = SipParser.parse(raw);
+    final SipMessage msg;
+    try {
+      msg = SipParser.parse(raw);
+    } catch (e) {
+      _logger.warn('Dropped a SIP message that could not be read: $e');
+      return;
+    }
+    if (!msg.isRequest && (msg.statusCode < 100 || msg.statusCode > 699)) {
+      _logger.warn('Dropped a response with no valid status code: ${_summarize(raw)}');
+      return;
+    }
     if (msg.isRequest) {
       if (!responsesOnly) _handleRequest(msg);
     } else {
@@ -1932,6 +2084,13 @@ class SIPService {
       _handleInviteInDialog(msg);
       return;
     }
+    // A To tag means a request inside a dialog, here one this client no
+    // longer has (a re-INVITE that crossed its BYE, say). It must not ring
+    // as a new call (RFC 3261 12.2.2).
+    if (_hasToTag(msg)) {
+      _send(SipBuilder.response(request: msg, code: 481, reason: 'Call/Transaction Does Not Exist'));
+      return;
+    }
     if (_outgoingReserved || _activeCallId != null || _pendingInvite != null) {
       _send(SipBuilder.busyHere(invite: msg, localTag: _localTag));
       return;
@@ -1945,7 +2104,6 @@ class SIPService {
     final parsedTo = _extractUser(msg.header('To') ?? '');
     _activeToUser = parsedTo == 'Unknown' ? callerId : parsedTo;
     final fromHeader = msg.header('From') ?? '';
-    _activeRemoteTag = _extractTag(fromHeader);
     _activeRemoteTarget = _extractUri(msg.header('Contact') ?? fromHeader);
     _activeRemotePartyHeader = fromHeader;
     _routeSet = msg.headerValues('Record-Route');
@@ -1988,7 +2146,6 @@ class SIPService {
       _send(SipBuilder.ok200(
         invite: answered,
         contactUri: _contactUri,
-        sipServer: sipServer,
         localTag: _localTag,
         sdp: _lastAnsweredSdp!,
       ));
@@ -2170,7 +2327,8 @@ class SIPService {
       }
       final tokenError = _accessTokenErrorIn(msg);
       _accessTokenError = tokenError;
-      _failRegistration(_accessTokenRefusal(code, msg, tokenError));
+      _failRegistration(_accessTokenRefusal(code, msg, tokenError),
+          temporary: tokenError == null && _isTemporaryRegisterFailure(code));
       return;
     }
 
@@ -2258,7 +2416,8 @@ class SIPService {
       _failRegistration('Wrong credentials (403 Forbidden)');
       return;
     }
-    _failRegistration('Registration failed ($code ${_reasonPhrase(msg)})');
+    _failRegistration('Registration failed ($code ${_reasonPhrase(msg)})',
+        temporary: _isTemporaryRegisterFailure(code));
   }
 
   /// The token error code on a refusal (`X-vobiz-Jwt-Error-Code: 10006`).
@@ -2290,7 +2449,6 @@ class SIPService {
     int? param(String name) => int.tryParse(
         RegExp('(?:^|;)\\s*$name\\s*=\\s*(-?\\d+)').firstMatch(value)?.group(1) ?? '');
     _accessTokenExpiresIn = param('expires') ?? _accessTokenExpiresIn;
-    _accessTokenExpiresAt = param('epoch-exp') ?? _accessTokenExpiresAt;
   }
 
   /// The lifetime the registrar granted: our Contact's `expires` parameter
@@ -2317,11 +2475,14 @@ class SIPService {
 
   /// A registration that cannot go on: report it, stop refreshing and
   /// pinging, and close the socket (once any call on it has ended).
-  void _failRegistration(String reason) {
+  /// [temporary] says whether registering again later may work
+  /// ([registrationFailureTemporary]).
+  void _failRegistration(String reason, {bool temporary = false}) {
     _registrationRefreshTimer?.cancel();
     _crlfKeepAlive?.stop();
     _registrationRefreshDelay = null;
     _registrationState.value = SipRegistrationState.failed;
+    _registrationFailureTemporary = temporary;
     onRegistrationFailed?.call(reason);
     if (_activeCallId != null || _pendingInvite != null) {
       _closeWhenCallEnds = true;
@@ -2338,6 +2499,7 @@ class SIPService {
     _logger.warn('$reason: the WebSocket is dead, closing it');
     // Its close, whenever it comes, is no longer the current socket's.
     _socket = null;
+    _dropRegistersSentOn(socket);
     _registrationRefreshTimer?.cancel();
     _crlfKeepAlive?.stop();
     _registrationRefreshDelay = null;
@@ -2567,7 +2729,6 @@ class SIPService {
   }
 
   void _updateDialog(SipMessage msg) {
-    _activeRemoteTag = _extractTag(msg.header('To') ?? '');
     _activeRemoteTarget =
         _extractUri(msg.header('Contact') ?? msg.header('To') ?? '');
     _activeRemotePartyHeader =
@@ -2639,7 +2800,6 @@ class SIPService {
 
   void _clearCallState() {
     _activeCallId = null;
-    _activeRemoteTag = null;
     _activeToUser = null;
     _activeRemoteTarget = null;
     _activeRemotePartyHeader = null;
@@ -2663,6 +2823,13 @@ class SIPService {
     }
   }
 
+  /// Whether [msg]'s To carries a tag: read after the URI, so a `tag=` inside
+  /// it does not count.
+  static bool _hasToTag(SipMessage msg) {
+    final to = msg.header('To') ?? '';
+    return RegExp(r';\s*tag\s*=', caseSensitive: false).hasMatch(to.substring(to.lastIndexOf('>') + 1));
+  }
+
   /// Whether [msg] belongs to the current call. A CANCEL or BYE for some
   /// other call (an earlier attempt, a retry that was turned away) must not
   /// end this one.
@@ -2678,15 +2845,13 @@ class SIPService {
   static String? _topBranch(SipMessage msg) {
     final vias = msg.headerValues('Via');
     if (vias.isEmpty) return null;
-    final top = SipParser.splitAddressList(vias.first).first;
-    return RegExp(r'branch=([^;,\s]+)', caseSensitive: false).firstMatch(top)?.group(1);
+    final top = SipParser.splitAddressList(vias.first);
+    if (top.isEmpty) return null;
+    return RegExp(r'branch=([^;,\s]+)', caseSensitive: false).firstMatch(top.first)?.group(1);
   }
 
   int _extractCSeqNumber(String? header) =>
       int.tryParse((header ?? '').trim().split(' ').first.trim()) ?? 1;
-
-  String _extractTag(String header) =>
-      RegExp(r'tag=([^;>\s]+)').firstMatch(header)?.group(1) ?? '';
 
   String? _extractUri(String header) =>
       RegExp(r'sip:[^>;]+').firstMatch(header)?.group(0);
@@ -2694,20 +2859,16 @@ class SIPService {
   String _extractUser(String header) =>
       RegExp(r'sip:([^@>]+)').firstMatch(header)?.group(1) ?? 'Unknown';
 
-  String _buildFallbackToHeader() {
-    final toUser = _activeToUser;
-    if (toUser == null) return '<sip:unknown@$sipServer>';
-    if (_activeRemoteTag == null || _activeRemoteTag!.isEmpty) {
-      return '<sip:$toUser@$sipServer>';
-    }
-    return '<sip:$toUser@$sipServer>;tag=$_activeRemoteTag';
-  }
-
   String _reasonPhrase(SipMessage msg) {
     final parts = msg.firstLine.split(' ');
     return parts.length > 2 ? parts.sublist(2).join(' ') : 'Unknown error';
   }
 
+  /// Who is calling: from each of P-Asserted-Identity, Remote-Party-ID,
+  /// From and Contact in turn, a phone number that is the whole user part of
+  /// its URI (`sip:`, `sips:` or `tel:`) or the whole quoted display name,
+  /// else that header's SIP user when it is not this client's own. Digits
+  /// elsewhere in a header (inside a user name, a tag) are not a number.
   String _extractCallerId(SipMessage msg) {
     final candidates = <String>[
       msg.header('P-Asserted-Identity') ?? '',
@@ -2716,13 +2877,20 @@ class SIPService {
       msg.header('Contact') ?? '',
     ];
     for (final h in candidates) {
-      final phone = RegExp(r'\+?\d{8,15}').firstMatch(h)?.group(0);
-      if (phone != null) return phone;
+      final uriUser = RegExp(r'(?:sips?|tel):([^@;>\s]+)', caseSensitive: false).firstMatch(h)?.group(1);
+      if (uriUser != null && _phoneNumber.hasMatch(uriUser)) return uriUser;
+      final displayName = RegExp(r'^\s*"([^"]*)"').firstMatch(h)?.group(1)?.trim();
+      if (displayName != null && _phoneNumber.hasMatch(displayName)) return displayName;
       final user = _extractUser(h);
       if (user != 'Unknown' && user != _username) return user;
     }
     return _extractUser(msg.header('From') ?? '');
   }
+
+  static final RegExp _phoneNumber = RegExp(r'^\+?\d{8,15}$');
+
+  /// A SIP header name (RFC 3261 25.1 `token`).
+  static final RegExp _headerToken = RegExp(r"^[A-Za-z0-9\-.!%*_+`'~]+$");
 
   String _summarize(String msg) {
     final first = msg.split(RegExp(r'\r?\n')).first.trim();
@@ -2731,12 +2899,21 @@ class SIPService {
 
   static String _rand(int length) {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    final rand = Random();
+    final rand = sipRandom;
     return List<String>.generate(
       length,
       (_) => chars[rand.nextInt(chars.length)],
     ).join();
   }
+}
+
+/// [SIPService.connect] was overtaken: a sign-out or a newer connect replaced
+/// the socket before its handshake finished. Not a connection failure.
+class SipConnectSuperseded implements Exception {
+  const SipConnectSuperseded();
+
+  @override
+  String toString() => 'The connection was replaced before it opened';
 }
 
 /// A SIP request the far end refused or never answered.

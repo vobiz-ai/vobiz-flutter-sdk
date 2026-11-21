@@ -134,7 +134,7 @@ void main() {
   });
 
   test('wrong credentials are not retried', () async {
-    server.answerRegister = false;
+    server.registerStatus = 403;
     client = VobizClient(
       config: SdkConfig(wsUrl: server.url),
       connectivityMonitor: monitor,
@@ -142,18 +142,6 @@ void main() {
     subs.add(client.networkEvents.listen(net.add));
     await client.connectWithCredentials(
         const CredentialConfig(username: 'play1', password: 'secret'));
-    await eventually(() => server.registers.isNotEmpty);
-    // Nothing answers: a 403 arrives instead.
-    final ws = server.sockets.single;
-    final reg = server.registers.single;
-    String h(String n) => reg
-        .split(RegExp(r'\r?\n'))
-        .firstWhere((l) => l.startsWith('$n:'))
-        .substring(n.length + 1)
-        .trim();
-    ws.add('SIP/2.0 403 Forbidden\r\nVia: ${h('Via')}\r\nFrom: ${h('From')}\r\n'
-        'To: ${h('To')};tag=x\r\nCall-ID: ${h('Call-ID')}\r\nCSeq: ${h('CSeq')}\r\n'
-        'Content-Length: 0\r\n\r\n');
     await eventually(() => client.connectionState == ConnectionStateStatus.failed);
     await Future<void>.delayed(const Duration(seconds: 1));
     expect(server.connections, 1);
