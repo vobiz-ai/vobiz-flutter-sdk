@@ -221,6 +221,18 @@ test('an app can only turn its own SIP user\'s call into a conference', async ()
   }
 });
 
+test('VOBIZ_NUMBER written without its + is still the default caller ID', async () => {
+  const ctx = await startBridge({ env: { VOBIZ_NUMBER: ' 919800000001 ' }, apiHandler: vobiz({ owner: 'alice' }) });
+  try {
+    assert.equal(ctx.bridge.config.number, CALLER_ID);
+    const ok = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, appAuth('alice'));
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal(calls(ctx, 'POST', '/Call/')[0].body.from, CALLER_ID);
+  } finally {
+    await ctx.stop();
+  }
+});
+
 test('the bridge key may manage any live call; bad input is refused', async () => {
   const ctx = await startBridge({ apiHandler: vobiz() });
   try {
@@ -270,6 +282,34 @@ test('an inbound call the bridge rang: the app is the B-leg and hosts', async ()
   }
 });
 
+test('two adds at once for one call share one room: the call is moved once', async () => {
+  const fake = vobiz();
+  const ctx = await startBridge({
+    env: { VOBIZ_NUMBER: CALLER_ID },
+    // Vobiz's answer about the live call takes a while, as over a network.
+    apiHandler: async (method, pathname, body) => {
+      if (method === 'GET') await sleep(50);
+      return fake(method, pathname, body);
+    },
+  });
+  try {
+    const alice = appAuth('alice');
+    const [one, two] = await Promise.all([
+      postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice),
+      postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919822222222' }, alice),
+    ]);
+    assert.equal(one.status, 200, one.text);
+    assert.equal(two.status, 200, two.text);
+    assert.equal(one.json.room, two.json.room, 'one room');
+    assert.equal(calls(ctx, 'POST', `/Call/${CALL}/`).length, 1, 'both sides of the call moved once');
+    assert.equal(calls(ctx, 'POST', '/Call/').length, 2, 'both people dialled');
+    const state = (await postJson(ctx, '/conference/state', { call_uuid: CALL }, alice)).json;
+    assert.deepEqual(state.participants.map((p) => p.role), ['host', 'guest', 'added', 'added']);
+  } finally {
+    await ctx.stop();
+  }
+});
+
 test('room webhooks must be signed and their paths written by the bridge', async () => {
   const c = await startConference();
   try {
@@ -296,8 +336,9 @@ test('in a conference the connection watch does not beep, and a lost host ends t
     const alice = appAuth('alice');
     const added = await postJson(ctx, '/conference/add', { call_uuid: CALL, number: '+919811111111' }, alice);
     assert.equal(added.status, 200);
-    await postJson(ctx, '/call/alive', { call_uuid: CALL }, alice);
+    // Taken before the report: the server's clock for it starts no earlier.
     const lastReport = Date.now();
+    await postJson(ctx, '/call/alive', { call_uuid: CALL }, alice);
     const ended = await until(() => calls(ctx, 'DELETE', `/Conference/${added.json.room}/`)[0], 3000);
     assert.ok(ended, 'the room was ended once the host had been silent for CONF_HOST_LOST_SECONDS');
     assert.ok(Date.now() - lastReport >= 300, 'not before the host had been silent that long');

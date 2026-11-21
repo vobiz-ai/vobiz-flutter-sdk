@@ -11,6 +11,23 @@ export const AUTH_TOKEN = 'test-auth-token-not-a-secret';
 export const AUTH_ID = 'MA_TESTTEST';
 export const BRIDGE_KEY = 'test-bridge-key-0123456789';
 
+/**
+ * The temporary folders the bridges' state files are in. Removed when the
+ * test process exits, not at stop(): some tests start a second bridge on the
+ * first one's state file.
+ */
+const tempDirs = [];
+process.on('exit', () => {
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/** A new temporary folder, removed when the test process exits. */
+export function tempDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-bridge-test-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
 /** The app's headers: the bridge key, and the SIP user it is signed in as when `user` is given. */
 export function appAuth(user) {
   return { 'X-Bridge-Key': BRIDGE_KEY, ...(user === undefined ? {} : { 'X-Bridge-User': user }) };
@@ -21,8 +38,7 @@ export function appAuth(user) {
  * Returns { bridge, base, api, logs, stateFile, stop }.
  */
 export async function startBridge({ env = {}, stateFile, apiHandler, deps = {} } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-bridge-test-'));
-  const file = stateFile || path.join(dir, 'bridge-state.json');
+  const file = stateFile || path.join(tempDir(), 'bridge-state.json');
   const api = [];
   const logs = [];
   const bridge = createBridge({

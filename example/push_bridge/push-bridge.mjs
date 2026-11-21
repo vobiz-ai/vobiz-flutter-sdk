@@ -19,7 +19,7 @@
  * (X-Bridge-Key) and the SIP user it is signed in as (X-Bridge-User).
  * README.md has the app ↔ server protocol.
  *
- * Node 18 or newer, no npm packages. Settings come from a .env file next to
+ * Node 22 or newer, no npm packages. Settings come from a .env file next to
  * this script (see .env.example) or from environment variables.
  *
  *   node push-bridge.mjs
@@ -40,8 +40,8 @@ const CALL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  * Builds a bridge without starting it. `options.env` replaces process.env,
  * `options.stateFile` the state file, and `options.deps` lets tests swap the
  * outside world: `vobizApi(method, path, body)` for the Vobiz REST API,
- * `fetch(url, init)` for the requests the server sends itself (device
- * sign-up), `log(tag, message)`.
+ * `fetch(url, init)` for its other requests (device sign-up, the start-up
+ * tunnel check), `log(tag, message)`.
  */
 export function createBridge(options = {}) {
   const env = options.env || process.env;
@@ -54,7 +54,8 @@ export function createBridge(options = {}) {
     vobizApi: (env.VOBIZ_API_URL || 'https://api.vobiz.ai').trim().replace(/\/+$/, ''),
     authId: (env.VOBIZ_AUTH_ID || '').trim(),
     authToken: (env.VOBIZ_AUTH_TOKEN || '').trim(),
-    number: (env.VOBIZ_NUMBER || '').trim(),
+    // E.164 with its +, also when written as digits only.
+    number: (env.VOBIZ_NUMBER || '').trim().replace(/^(?=\d+$)/, '+'),
     appName: (env.VOBIZ_APP_NAME || 'Vobiz_Flutter_Push_Bridge').trim(),
     forceAttach: env.FORCE_ATTACH === 'true',
     ringSeconds: clampInt(env.RING_SECONDS, 45, 15, 120),
@@ -74,6 +75,9 @@ export function createBridge(options = {}) {
     jwtSub: (env.JWT_SUB || 'flutter-app').trim(),
     jwtTtlSeconds: clampInt(env.JWT_TTL_SECONDS, 3600, 180, 86400),
     jwtAppId: (env.JWT_APP_ID || '').trim(),
+    // The other subs /token may mint (besides JWT_SUB). Empty: any sub, for
+    // anyone with the bridge key.
+    jwtAllowedSubs: String(env.JWT_ALLOWED_SUBS || '').split(',').map((s) => s.trim()).filter((s) => SUB_RE.test(s)),
     callerIdMode: (env.CALLER_ID_MODE || 'number').trim().toLowerCase(),
     headerStyle: (env.SIP_HEADER_STYLE || 'suffix').trim().toLowerCase(),
     alwaysRing: csv(env.ALWAYS_RING),
@@ -93,12 +97,14 @@ export function createBridge(options = {}) {
   }
 
   /**
-   * How long a webhook nonce is remembered. Vobiz nonces are random, not
-   * time-based, and nothing in the request is timestamped, so replay
-   * protection is "never accept the same nonce twice" within this window;
-   * calls are long over by then.
+   * How long a webhook's nonces and signatures are remembered. Vobiz nonces
+   * are random, not time-based, and nothing in the request is timestamped,
+   * so replay protection is "never accept the same nonce or signature twice"
+   * within this window. At most MAX_SEEN are kept (the soonest to expire go
+   * first): the state file holds them and is written on every webhook.
    */
-  const NONCE_TTL_MS = 30 * 60 * 1000;
+  const NONCE_TTL_MS = 24 * 60 * 60 * 1000;
+  const MAX_SEEN = 10000;
   const INSTANCE = crypto.randomBytes(6).toString('hex');
 
   // ── State: the app's key, the webhook secret and seen nonces, kept across restarts ──
@@ -164,7 +170,14 @@ export function createBridge(options = {}) {
   };
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url || '/', 'http://localhost');
+    // A target that is not a URL ("//", "http://[") throws here; outside a
+    // try, one such request would stop the whole server.
+    let url;
+    try {
+      url = new URL(req.url || '/', 'http://localhost');
+    } catch {
+      return sendJson(res, 400, { error: 'Bad request' });
+    }
     const prefix = url.pathname.split('/').slice(0, 2).join('/');
     const handler = routes[`${req.method} ${url.pathname}`]
       || (url.pathname.split('/').length === 3 && routes[`${req.method} ${prefix}/*`]);
@@ -257,6 +270,8 @@ export function createBridge(options = {}) {
       numbers,
       createdAt: Date.now(),
       bridged: false,
+      // The SIP user among `targets` whose leg answered, once Vobiz says.
+      answeredBy: null,
       finished: null,
       // Every endpoint rung is already on a call this server connected.
       lineBusy: targets.length > 0 && targets.every((user) => onCall(user)),
@@ -319,6 +334,9 @@ export function createBridge(options = {}) {
           const by = endpointUsername(params.DialBLegTo || '');
           log('ok', `Call ${short(call.id)}: answered${by ? ` by ${by}` : ''}`);
           call.bridged = true;
+          // Only a user this call rang counts: a phone number, or a name in a
+          // form this server did not write, leaves every target allowed.
+          call.answeredBy = call.targets.find((user) => sameUser(user, by)) || null;
           finish(call, 'answered');
         }
       } else if (action === 'hangup' || event === 'DialHangup') {
@@ -373,12 +391,15 @@ export function createBridge(options = {}) {
    * Metadata on the SIP INVITE of every <User>. PushRef is this call's
    * CallUUID (the caller's leg), which the app sends back as call_uuid to
    * /conference/* and /call/alive; Caller is the real caller's number (with
-   * CALLER_ID_MODE=number every call shows the same number). Vobiz's docs
+   * CALLER_ID_MODE=number every call shows the same number). Caller is left
+   * out when the caller is not a phone number (a plus and 7 to 15 digits): a
+   * call from a SIP user (a PBX extension, another app) has no number to
+   * show, and the digits of its name would read as a made-up one. Vobiz's docs
    * disagree on the key format ("RefX-VH=" on the SIP headers page, "Ref=" in
    * the Dial examples), so it is configurable.
    */
   function sipHeaders(call) {
-    const caller = call.from.replace(/\D/g, '');
+    const caller = /^\+\d{7,15}$/.test(call.from) ? call.from.slice(1) : '';
     const pairs = config.headerStyle === 'plain'
       ? [`PushRef=${call.id}`, caller && `Caller=${caller}`]
       : [`PushRefX-VH=${call.id}`, caller && `CallerX-VH=${caller}`];
@@ -414,8 +435,17 @@ export function createBridge(options = {}) {
 
   /** Whether `user` is on a call this server connected and that has not ended. */
   function onCall(user) {
-    for (const c of calls.values()) if (c.bridged && !c.over && c.targets.includes(user)) return true;
+    for (const c of calls.values()) if (c.bridged && !c.over && isCallOf(c, user)) return true;
     return false;
+  }
+
+  /**
+   * Whether inbound `call` is `user`'s: the user who answered it, once Vobiz
+   * has named one of the users rung; until then, any user it rings.
+   */
+  function isCallOf(call, user) {
+    if (!user) return false;
+    return call.answeredBy ? sameUser(call.answeredBy, user) : call.targets.some((target) => sameUser(target, user));
   }
 
   // ── The app's requests ───────────────────────────────────────────────────────
@@ -457,8 +487,9 @@ export function createBridge(options = {}) {
    * in with it (the SDK's connectWithAccessTokenProvider) as
    * "<sub>_<auth id>", and the token renews itself through this route before
    * it expires. Anyone with the bridge key may ask; `sub` comes from the body
-   * or ?sub=, else JWT_SUB. Same reply shape as the Vobiz WebRTC demo's
-   * /token.
+   * or ?sub=, else JWT_SUB. With JWT_ALLOWED_SUBS set, only those subs and
+   * JWT_SUB are minted; without it, any sub is (a key holder can then sign in
+   * as any user). Same reply shape as the Vobiz WebRTC demo's /token.
    */
   async function onToken(req, res, url) {
     if (!appCaller(req, res)) return;
@@ -466,6 +497,10 @@ export function createBridge(options = {}) {
     const body = await readJson(req);
     const sub = String(body.sub || url.searchParams.get('sub') || config.jwtSub).trim();
     if (!SUB_RE.test(sub)) return sendJson(res, 400, { error: 'sub must be 1 to 50 letters, digits, _ or -' });
+    if (config.jwtAllowedSubs.length && sub !== config.jwtSub && !config.jwtAllowedSubs.includes(sub)) {
+      log('!!', `Refused an access token for ${sub}: not in JWT_ALLOWED_SUBS`);
+      return sendJson(res, 403, { error: `This server does not mint tokens for ${sub}` });
+    }
     // nbf a minute in the past: a registrar whose clock is a second behind
     // this one refuses a token whose nbf has not come yet (10005). The
     // platform's 180 s to 24 h limits apply to exp - nbf.
@@ -656,7 +691,8 @@ export function createBridge(options = {}) {
    * baseUrl + nonce (V2), where baseUrl is the URL it called without the query
    * string (docs: /concepts/validating-callbacks). The body is not signed, so
    * everything that must be trusted (the call a Dial callback is about) is in
-   * the path. A nonce is accepted once only.
+   * the path. A nonce, and a signature, is accepted once only: a V3
+   * signature for nonce N is also a valid V2 signature for nonce ".N".
    */
   function checkSignature(req, url) {
     const baseUrl = `${config.publicUrl}${url.pathname}`;
@@ -674,7 +710,14 @@ export function createBridge(options = {}) {
       sawSignature = true;
       const expected = crypto.createHmac('sha256', config.authToken).update(baseUrl + separator + nonce).digest('base64');
       if (!safeEqual(signature, expected)) continue;
-      if (!rememberNonce(nonce)) return 'nonce already used (replayed request)';
+      // Every nonce and signature the request carries, so that no part of it
+      // can be sent again in another form.
+      const parts = new Set();
+      for (const [sig, non] of checks) {
+        if (req.headers[sig]) parts.add(`sig:${req.headers[sig]}`);
+        if (req.headers[non]) parts.add(String(req.headers[non]));
+      }
+      if (!rememberSeen([...parts])) return 'nonce or signature already used (replayed request)';
       return 'ok';
     }
     return sawSignature
@@ -682,18 +725,31 @@ export function createBridge(options = {}) {
       : 'no X-Vobiz-Signature-V3 / -V2 headers (Vobiz only signs callback URLs that have credentials configured)';
   }
 
-  /** Records a nonce; false when it was seen before inside NONCE_TTL_MS. */
-  function rememberNonce(nonce) {
+  /** Records a request's nonces and signatures; false when one was seen before inside NONCE_TTL_MS. */
+  function rememberSeen(parts) {
     pruneNonces();
-    if (Object.prototype.hasOwnProperty.call(state.nonces, nonce)) return false;
-    state.nonces[nonce] = Date.now() + NONCE_TTL_MS;
-    saveState();
+    if (parts.some((part) => Object.prototype.hasOwnProperty.call(state.nonces, part))) return false;
+    const expires = Date.now() + NONCE_TTL_MS;
+    for (const part of parts) state.nonces[part] = expires;
+    pruneNonces();
+    try {
+      saveState();
+    } catch (error) {
+      // The request is genuine and is remembered in memory, so the call goes
+      // on; only a restart would forget it.
+      log('!!', `Could not save ${config.stateFile}: ${error.message}`);
+    }
     return true;
   }
 
   function pruneNonces() {
     const now = Date.now();
     for (const [nonce, expires] of Object.entries(state.nonces)) if (expires < now) delete state.nonces[nonce];
+    const entries = Object.entries(state.nonces);
+    if (entries.length > MAX_SEEN) {
+      entries.sort((a, b) => a[1] - b[1]);
+      for (const [nonce] of entries.slice(0, entries.length - MAX_SEEN)) delete state.nonces[nonce];
+    }
   }
 
   /** `<call id>.<tag>`: the tag proves the bridge itself wrote this path. */
@@ -767,7 +823,7 @@ export function createBridge(options = {}) {
     }
     if (!app.app_id) throw new Error('Vobiz did not return the new application ID');
 
-    const e164 = config.number.startsWith('+') ? config.number : `+${config.number}`;
+    const e164 = config.number;
     let number = null;
     for (let page = 1; page <= 50 && !number; page += 1) {
       const list = await vobizApi('GET', `/numbers?page=${page}&per_page=100`);
@@ -797,7 +853,7 @@ export function createBridge(options = {}) {
       log('!!', 'PUBLIC_URL is not set. Start a tunnel to this port and put its https address in .env, then restart.');
     } else {
       try {
-        const response = await fetch(`${config.publicUrl}/health`, { signal: AbortSignal.timeout(10000) });
+        const response = await fetchFn(`${config.publicUrl}/health`, { signal: AbortSignal.timeout(10000) });
         const body = await response.json().catch(() => ({}));
         if (body.instance === INSTANCE) {
           log('ok', `Tunnel: ${config.publicUrl} reaches this server`);
@@ -829,6 +885,11 @@ export function createBridge(options = {}) {
       log('!!', 'ROUTES and ALWAYS_RING are empty: inbound calls ring nobody. Set ROUTES=<your number>=<SIP user> in .env.');
     }
     log('..', `Inbound calls ring for ${config.ringSeconds} s`);
+    if (config.jwtAllowedSubs.length) {
+      log('ok', `Access tokens: only for ${[config.jwtSub, ...config.jwtAllowedSubs].join(', ')}`);
+    } else {
+      log('!!', 'Access tokens: /token mints a token for any sub to anyone with the bridge key. Set JWT_ALLOWED_SUBS to limit it.');
+    }
 
     console.log('');
     if (keyIsNew) {
@@ -908,7 +969,7 @@ export function createBridge(options = {}) {
   async function otherPartyLeg(uuid, username) {
     // An inbound call this bridge rang: its UUID is the caller's own leg.
     const own = calls.get(uuid);
-    if (own && own.targets.includes(username)) return 'aleg';
+    if (own && !own.over && isCallOf(own, username)) return 'aleg';
     let live;
     try {
       live = await vobizApi('GET', `/Call/${encodeURIComponent(uuid)}/?status=live`);
@@ -1048,6 +1109,8 @@ export function createBridge(options = {}) {
   /** Conference rooms by name, and the room of every CallUUID in one. Memory only. */
   const rooms = new Map();
   const roomOfCall = new Map();
+  /** Rooms being opened, by the CallUUID they are for (see onConferenceAdd). */
+  const roomOpenings = new Map();
   /** Vobiz's account cap on conference members (max_conf_members). */
   const MAX_CONF_MEMBERS = 20;
   /** A leg on its way into the room that has not entered after this long is gone. */
@@ -1072,20 +1135,23 @@ export function createBridge(options = {}) {
       return sendJson(res, 400, { error: 'caller_id must be one of your Vobiz numbers in E.164 (VOBIZ_NUMBER is the default)' });
     }
 
+    // Another add for this call may be opening its room: wait for it, so the
+    // call is moved into one room only.
+    while (roomOpenings.has(uuid)) await roomOpenings.get(uuid).catch(() => {});
     let room = roomForCall(uuid);
     if (room && !mayControl(room, who)) return sendJson(res, 403, { error: 'Not a conference of this SIP user' });
     if (room?.over) room = null;
     if (!room) {
-      const legs = await conferenceLegs(uuid, who, body);
-      if (!legs) return sendJson(res, 403, { error: 'Not a live call of this SIP user' });
-      room = openRoom(uuid, legs);
+      const opening = openConference(uuid, who, body);
+      roomOpenings.set(uuid, opening);
+      let opened;
       try {
-        await moveIntoRoom(room);
-      } catch (error) {
-        log('!!', `Conference ${room.name}: Vobiz did not move call ${short(uuid)} into it: ${error.message}`);
-        forgetRoom(room);
-        return sendJson(res, 502, { error: 'Vobiz did not move the call into a conference' });
+        opened = await opening;
+      } finally {
+        if (roomOpenings.get(uuid) === opening) roomOpenings.delete(uuid);
       }
+      if (!opened.room) return sendJson(res, opened.status, { error: opened.error });
+      room = opened.room;
     }
     if (room.members.filter((m) => PRESENT.has(m.status)).length >= MAX_CONF_MEMBERS) {
       return sendJson(res, 409, { error: `A conference holds at most ${MAX_CONF_MEMBERS} people`, conference: publicRoom(room) });
@@ -1191,8 +1257,8 @@ export function createBridge(options = {}) {
     // An inbound call this bridge rang: `uuid` is the caller's own leg and
     // the app is the leg the Dial reached.
     const own = calls.get(uuid);
-    if (own && own.bridged && !own.over && (who.operator || own.targets.includes(who.username))) {
-      return { hostLeg: 'bleg', hostUser: who.username || own.targets[0] || '', guestLabel: own.from || 'Caller' };
+    if (own && own.bridged && !own.over && (who.operator || isCallOf(own, who.username))) {
+      return { hostLeg: 'bleg', hostUser: who.username || own.answeredBy || own.targets[0] || '', guestLabel: own.from || 'Caller' };
     }
     let live;
     try {
@@ -1213,6 +1279,21 @@ export function createBridge(options = {}) {
       hostUser: hostLeg === 'aleg' ? from : to,
       guestLabel: displayNumber(hostLeg === 'aleg' ? live.to : live.from) || 'Caller',
     };
+  }
+
+  /** Opens a room for call `uuid` and moves both sides into it: { room }, or { status, error }. */
+  async function openConference(uuid, who, body) {
+    const legs = await conferenceLegs(uuid, who, body);
+    if (!legs) return { status: 403, error: 'Not a live call of this SIP user' };
+    const room = openRoom(uuid, legs);
+    try {
+      await moveIntoRoom(room);
+    } catch (error) {
+      log('!!', `Conference ${room.name}: Vobiz did not move call ${short(uuid)} into it: ${error.message}`);
+      forgetRoom(room);
+      return { status: 502, error: 'Vobiz did not move the call into a conference' };
+    }
+    return { room };
   }
 
   function openRoom(uuid, legs) {
@@ -1706,6 +1787,11 @@ function csv(value) {
 function clampInt(value, fallback, min, max) {
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+/** Whether two SIP user names are the same, ignoring case as the endpoint check does. */
+function sameUser(a, b) {
+  return Boolean(a) && Boolean(b) && String(a).toLowerCase() === String(b).toLowerCase();
 }
 
 /** `sip:play123@registrar.vobiz.ai` → `play123`. */

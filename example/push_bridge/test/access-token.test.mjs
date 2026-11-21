@@ -76,6 +76,22 @@ test('/token takes sub from the body or ?sub=, and JWT_APP_ID as the app claim',
   assert.equal(minted.length, 2);
 });
 
+test('JWT_ALLOWED_SUBS limits the subs /token mints; JWT_SUB is always allowed', async (t) => {
+  const minted = [];
+  const ctx = await startBridge({ apiHandler: tokenApi(minted), env: { JWT_SUB: 'desk', JWT_ALLOWED_SUBS: 'agent42, agent43' } });
+  t.after(ctx.stop);
+  assert.equal(ctx.bridge.config.jwtAllowedSubs.join(','), 'agent42,agent43');
+  const refused = await postJson(ctx, '/token', { sub: 'agent44' }, appAuth());
+  assert.equal(refused.status, 403);
+  assert.match(refused.json.error, /does not mint tokens for agent44/);
+  assert.equal((await postJson(ctx, '/token?sub=boss', {}, appAuth())).status, 403);
+  assert.deepEqual(minted, [], 'nothing was minted for a sub outside the list');
+
+  assert.equal((await postJson(ctx, '/token', { sub: 'agent43' }, appAuth())).json.sub, 'agent43');
+  assert.equal((await postJson(ctx, '/token', {}, appAuth())).json.sub, 'desk');
+  assert.deepEqual(minted.map((c) => c.sub), ['agent43', 'desk']);
+});
+
 test('/token reports a Vobiz refusal as 502', async (t) => {
   const ctx = await startBridge({
     apiHandler: (method, pathname) => {

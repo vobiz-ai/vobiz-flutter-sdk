@@ -126,6 +126,24 @@ for (const style of ['suffix', 'plain']) {
   });
 }
 
+test('a caller that is not a phone number gets no Caller header (no made-up number in the app)', async (t) => {
+  const ctx = await startBridge({ env: { SIP_HEADER_STYLE: 'plain', ROUTES: '+918000000001=alice' } });
+  t.after(ctx.stop);
+  const callers = [
+    'sip:12345678901234567@203.0.113.7', // a SIP user whose name is 17 digits
+    'sip:agent42_MA_TEST0001@registrar.vobiz.ai', // a SIP user with digits in its name
+    '1001', // a PBX extension
+  ];
+  for (const [i, from] of callers.entries()) {
+    const call = await answerCall(ctx, { CallUUID: `sip-caller-${i}`, From: from, To: '+918000000001' });
+    const user = call.text.match(/<User [^>]*>/)[0];
+    assert.equal(xmlAttr(user, 'User', 'sipHeaders'), `PushRef=sip-caller-${i}`, from);
+  }
+  // A national number still counts: 10 digits are read as an Indian number.
+  const call = await answerCall(ctx, { CallUUID: 'national', From: '9800000001', To: '+918000000001' });
+  assert.equal(xmlAttr(call.text.match(/<User [^>]*>/)[0], 'User', 'sipHeaders'), 'PushRef=national,Caller=919800000001');
+});
+
 test('ROUTES: +digits entries become <Number>; old ROUTES still parse', () => {
   assert.deepEqual([...parseRoutes('+918000000001=alice,bob;8000000002=carol')], [
     ['+918000000001', { users: ['alice', 'bob'], numbers: [] }],
