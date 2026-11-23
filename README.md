@@ -44,20 +44,13 @@ your outbound calls. See [CREDENTIALS.md](CREDENTIALS.md#access-tokens-jwt).
 
 ## Quick start
 
-`pub.dev` has version 0.1.0, an older SDK these docs do not describe. Until 0.2.0 is
-published there, depend on the repository and pin a tag or commit, because the default
-branch moves:
-
 ```yaml
 # pubspec.yaml
 dependencies:
-  vobiz_webrtc:
-    git:
-      url: https://github.com/vobiz-ai/vobiz-flutter-sdk.git
-      ref: <a release tag or commit>
+  vobiz_webrtc: ^0.2.0
 ```
 
-Once 0.2.0 is on pub.dev, use `vobiz_webrtc: ^0.2.0` instead.
+Or run `flutter pub add vobiz_webrtc`.
 
 ```dart
 import 'package:vobiz_webrtc/vobiz_webrtc.dart';

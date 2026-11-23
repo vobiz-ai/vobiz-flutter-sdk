@@ -16,14 +16,8 @@ Everything here is taken from the [example app](example), which builds with it.
 
 ```yaml
 dependencies:
-  vobiz_webrtc:
-    git:
-      url: https://github.com/vobiz-ai/vobiz-flutter-sdk.git
-      ref: <a release tag or commit>
+  vobiz_webrtc: ^0.2.0
 ```
-
-Pin a tag or commit: the default branch moves. Once 0.2.0 is on pub.dev, use
-`vobiz_webrtc: ^0.2.0` (pub.dev's 0.1.0 is an older SDK).
 
 The SDK brings `flutter_webrtc ^1.0.0` and `connectivity_plus ^7.0.0` with it; do not
 add an older `flutter_webrtc` yourself. No permission plugin is needed: the microphone
