@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## 0.2.0 (unreleased)
+## 0.2.0 - 2026-11-23
 
-Not published yet: pub.dev has 0.1.0. Compared with 0.1.0, the SDK signs users in with
+Compared with 0.1.0, the SDK signs users in with
 credentials from the app's own backend (an access token or a per-user SIP endpoint),
 receives calls on a closed Android app through Vobiz push, keeps calls up through
 network drops, and adds call options, hold, DTMF, audio routes, call quality,
