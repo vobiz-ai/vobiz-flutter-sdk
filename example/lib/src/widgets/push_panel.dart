@@ -139,22 +139,25 @@ class _PushPanelState extends State<PushPanel> {
       Text(
         'Ring this phone for calls to the SIP user you sign in as, also when the app is closed: Vobiz '
         'holds the call, pushes this phone, and the app claims the call as it signs in. Needs this '
-        "app's Firebase key under Push Notifications in the Vobiz Console. With a sample server line "
-        'below, this phone signs up through the server.',
+        "app's ${c.push.voip ? 'APNs key' : 'Firebase key'} under Push Notifications in the Vobiz "
+        'Console. With a sample server line below, this phone signs up through the server.',
         style: TextStyle(fontSize: 11, height: 1.45, color: pg.muted),
       ),
       Row(children: <Widget>[
         Expanded(child: Text('Receive calls through Vobiz push', style: TextStyle(fontSize: 13, color: pg.text))),
         Switch(key: const Key('vobizPush'), value: c.vobizPush, onChanged: c.setVobizPush),
       ]),
-      _check(pg, 'Firebase push', c.push.available,
+      _check(pg, c.push.name, c.push.available,
           c.push.available ? 'Wakes the app when it is closed' : (c.push.problem ?? '')),
-      _check(pg, 'Notifications', c.notificationsAllowed,
-          'The call screen is a notification',
-          action: c.notificationsAllowed == true ? null : c.requestCallPermissions),
-      _check(pg, 'Full-screen call screen', c.fullScreenAllowed,
-          'Rings over the lock screen',
-          action: c.fullScreenAllowed == false ? c.requestCallPermissions : null),
+      // iOS rings on CallKit, which needs neither.
+      if (!c.push.voip) ...<Widget>[
+        _check(pg, 'Notifications', c.notificationsAllowed,
+            'The call screen is a notification',
+            action: c.notificationsAllowed == true ? null : c.requestCallPermissions),
+        _check(pg, 'Full-screen call screen', c.fullScreenAllowed,
+            'Rings over the lock screen',
+            action: c.fullScreenAllowed == false ? c.requestCallPermissions : null),
+      ],
       _check(pg, 'Remember me', c.rememberMe,
           'Lets the app sign itself in to answer when it was closed'),
       // Demo and test-only tools: never in a release build unless it asks for them.

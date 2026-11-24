@@ -49,6 +49,30 @@ jobs:
       - name: Publish dry run
         run: flutter pub publish --dry-run
 
+  # The example's iOS side (PushKit, CallKit, WebRTC audio) is native Swift
+  # that the Linux job above never compiles.
+  ios:
+    name: Build the example for iOS (no signing)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: example
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.7
+          cache: true
+
+      - name: Example dependencies
+        run: flutter pub get
+
+      - name: flutter build ios
+        run: flutter build ios --debug --no-codesign
+
   push-bridge:
     name: Push bridge (node --test)
     runs-on: ubuntu-latest

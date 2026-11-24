@@ -13,7 +13,17 @@ import 'package:flutter/services.dart';
 ///   connection and the UI, starting it (headless) when the app was closed;
 /// * the missed-call notification.
 ///
-/// Every method is a no-op where that code is missing (tests, iOS, web).
+/// And its iOS code (`ios/Runner/AppDelegate.swift`), on the same channel:
+///
+/// * PushKit, which hands each call push to Dart (`push`, [ready]) after
+///   reporting it to CallKit;
+/// * `startCallService` and `stopCallService`, which start and stop the
+///   call's audio when CallKit does not carry it (outgoing calls, calls
+///   answered in the app);
+/// * the bundle id ([packageName]).
+///
+/// Every method is a no-op where that code is missing (tests, web) or the
+/// platform has no such thing (iOS: [leaveLockScreen], [showMissedCall]).
 class CallPlatform {
   CallPlatform() : _channel = const MethodChannel(channelName) {
     if (_supported) _channel.setMethodCallHandler(_onNativeCall);
@@ -29,9 +39,10 @@ class CallPlatform {
   final StreamController<Map<String, String>> _pushes = StreamController<Map<String, String>>.broadcast();
   final StreamController<void> _hangUps = StreamController<void>.broadcast();
 
-  static bool get _supported => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  static bool get _supported =>
+      !kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS);
 
-  /// Call push data messages, as Android received them. They arrive here
+  /// Call push data messages, as Android (or iOS PushKit) received them. They arrive here
   /// whether the app is open, in the background, or was started by the push
   /// itself.
   Stream<Map<String, String>> get pushes => _pushes.stream;
@@ -49,9 +60,9 @@ class CallPlatform {
     ];
   }
 
-  /// The app's package name (its Android application id), or null where
-  /// there is no Android side. Vobiz pushes with the Firebase credential
-  /// saved for it in the Vobiz Console.
+  /// The app's package name (its Android application id) or iOS bundle id,
+  /// or null where there is no native side. Vobiz pushes with the Firebase
+  /// or APNs credential saved for it in the Vobiz Console.
   Future<String?> packageName() => _invoke<String>('packageName');
 
   /// Starts the foreground service for a call that is now ringing out,
@@ -68,6 +79,10 @@ class CallPlatform {
   /// An accepted call screen led to no call: an app that Accept opened over
   /// the lock screen goes back behind it, unless a call is running.
   Future<void> leaveLockScreen() => _invoke<void>('leaveLockScreen');
+
+  /// iOS: asks for permission to post notifications (missed calls), and says
+  /// whether it was given. CallKit itself rings without it. Null elsewhere.
+  Future<bool?> requestNotifications() => _invoke<bool>('requestNotifications');
 
   /// Posts a "Missed call" notification. One per [id]; a second post for
   /// the same call replaces the first.
