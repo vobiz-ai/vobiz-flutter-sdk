@@ -8,6 +8,10 @@ import UserNotifications
 import flutter_callkit_incoming
 #if canImport(WebRTC)
 import WebRTC
+#else
+// Without WebRTC's RTCAudioSession, CallAudio cannot hand CallKit's audio
+// session to WebRTC, and calls answered on a locked phone can be silent.
+#error("WebRTC (from flutter_webrtc) must be importable in Runner for CallAudio")
 #endif
 
 /// The example's iOS side: Vobiz push over PushKit, the system call screen
@@ -282,8 +286,6 @@ final class CallAudio {
       let session = RTCAudioSession.sharedInstance()
       session.useManualAudio = true
       session.isAudioEnabled = false
-    #else
-      NSLog("CallAudio: WebRTC is not importable here; WebRTC manages its own audio session")
     #endif
   }
 
