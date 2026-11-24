@@ -273,8 +273,9 @@ for that phone.
 The SDK has no Firebase or call-screen dependency: the app receives the push and shows
 the call screen. The example app does all of this (Firebase, `flutter_callkit_incoming`,
 a foreground service per call) and signs up through its sample server; turn it on under
-*Identity → Incoming calls → Receive calls through Vobiz push*. **iOS rings only while
-the app is in the foreground** for now (no PushKit/CallKit yet). The flow and its limits
+*Identity → Incoming calls → Receive calls through Vobiz push*. On iOS the push is a
+PushKit VoIP push and the call screen is CallKit; the example's
+`ios/Runner/AppDelegate.swift` shows how. The flow and its limits
 are in [doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md); the API is in
 [API_REFERENCE.md](API_REFERENCE.md#incoming-calls-to-a-closed-app-vobiz-push).
 
@@ -303,8 +304,8 @@ iOS (`ios/Runner/Info.plist`):
 <array><string>audio</string></array>
 ```
 
-Do not add the `voip` background mode: without PushKit and CallKit it gets the app
-rejected. The microphone permission is requested when the first call starts. The
+Add the `voip` background mode only with PushKit and CallKit, for push: an app that
+declares it without them is rejected. The microphone permission is requested when the first call starts. The
 foreground service, the permissions a call-screen plugin merges in, Firebase, backups
 and the iOS camera purpose string are in [PLATFORM_SETUP.md](PLATFORM_SETUP.md).
 

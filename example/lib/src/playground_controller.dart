@@ -948,6 +948,9 @@ class PlaygroundController extends ChangeNotifier {
       isMuted = true;
       log('🔇 Muted', LogType.warning);
     }
+    // iOS: a call on CallKit shows the same mute state there.
+    final screen = _callScreenAccepted ? _callScreenId : null;
+    if (screen != null) unawaited(callScreen.setMuted(screen, isMuted));
     notifyListeners();
   }
 
@@ -1268,43 +1271,45 @@ class PlaygroundController extends ChangeNotifier {
 
   Future<void> _onCallScreenEvent(ck.CallEvent? event) async {
     // The echo of a screen this app closed itself: not the user's choice.
+    // Screens are known by their key (CallScreen): on iOS the id is a UUID.
     final closedHere = switch (event) {
-      ck.CallEventActionCallDecline(:final callKitParams) => _closingScreens.remove(callKitParams.id),
-      ck.CallEventActionCallEnded(:final callKitParams) => _closingScreens.remove(callKitParams.id),
+      ck.CallEventActionCallDecline(:final callKitParams) => _closingScreens.remove(callScreen.keyOf(callKitParams)),
+      ck.CallEventActionCallEnded(:final callKitParams) => _closingScreens.remove(callScreen.keyOf(callKitParams)),
       _ => false,
     };
     if (closedHere) return;
     switch (event) {
       case ck.CallEventActionCallAccept(:final callKitParams):
+        final key = callScreen.keyOf(callKitParams);
         final pushed = PushCall.fromExtra(callKitParams.extra);
         if (pushed != null && pushed.isVobiz) {
-          await _acceptVobizHeldCall(pushed, callKitParams.id);
+          await _acceptVobizHeldCall(pushed, key);
           return;
         }
         // Answer the SIP call only when it is the call this screen showed.
         final ringingHere = client.callState == CallStateStatus.incoming &&
-            (callKitParams.id == _callScreenId ||
-                pushRefFromHeaders(client.callHeaders) == callKitParams.id);
+            (key == _callScreenId || pushRefFromHeaders(client.callHeaders) == key);
         if (!ringingHere) {
           log('📵 Accept on a call screen whose call is not ringing here: closed it', LogType.warning);
-          await _closeCallScreen(callKitParams.id);
+          await _closeCallScreen(key);
           unawaited(platform.leaveLockScreen());
           return;
         }
-        _callScreenId = callKitParams.id;
+        _callScreenId = key;
         _callScreenAccepted = true;
         log('📲 Accepted on the call screen', LogType.event);
         onTabRequest?.call(1);
         await answer();
       case ck.CallEventActionCallDecline(:final callKitParams):
+        final key = callScreen.keyOf(callKitParams);
         final pushed = PushCall.fromExtra(callKitParams.extra);
-        if (pushed != null && pushed.isVobiz && !_isRingingHere(callKitParams.id)) {
+        if (pushed != null && pushed.isVobiz && !_isRingingHere(key)) {
           await _declineVobizHeldCall(pushed);
           return;
         }
-        if (_isRingingHere(callKitParams.id)) await reject();
+        if (_isRingingHere(key)) await reject();
       case ck.CallEventActionCallEnded(:final callKitParams):
-        if (callKitParams.id == _callScreenId) {
+        if (callScreen.keyOf(callKitParams) == _callScreenId) {
           if (client.callState == CallStateStatus.incoming) {
             // Still ringing (the caller gave up): decline it; a call that was
             // never answered cannot be hung up.
@@ -1316,7 +1321,15 @@ class PlaygroundController extends ChangeNotifier {
           }
         }
       case ck.CallEventActionCallTimeout(:final id):
-        await _onCallScreenTimeout(id);
+        await _onCallScreenTimeout(callScreen.keyOfId(id));
+      case ck.CallEventActionCallToggleMute(:final id, isMuted: final muted):
+        // CallKit's mute button (iOS). The app's own mute tells CallKit too,
+        // which reports it back here: only a change acts.
+        if (callScreen.keyOfId(id) == _callScreenId &&
+            client.callState != CallStateStatus.idle &&
+            muted != isMuted) {
+          await toggleMute();
+        }
       default:
         break;
     }
@@ -1342,20 +1355,27 @@ class PlaygroundController extends ChangeNotifier {
     ));
   }
 
-  /// A push's raw data, from Android (any app state), handled once.
+  /// A push's raw data, from Android or iOS (any app state), handled once.
   void _onPushData(Map<String, String> data) {
     final call = PushCall.fromData(data);
     if (call == null || !_seenPushes.add(call.callId)) return;
     if (!call.isVobiz) {
       log('📲 Ignored a call push that is not a call Vobiz holds', LogType.info);
+      _endNativePushScreen(call);
       return;
     }
     _onVobizHeldCall(call);
   }
 
+  /// iOS reports every call push to CallKit before Dart hears of it (PushKit
+  /// requires it): a pushed call this app will not ring for ends there.
+  void _endNativePushScreen(PushCall call) {
+    if (CallScreen.showsPushedCallsNatively) unawaited(_closeCallScreen(call.callId));
+  }
+
   Future<void> _showPushedCall(PushCall call) async {
     for (final active in await callScreen.active()) {
-      if (active.id == call.callId) return;
+      if (callScreen.keyOf(active) == call.callId) return;
     }
     await callScreen.showIncoming(
       id: call.callId,
@@ -1377,6 +1397,7 @@ class PlaygroundController extends ChangeNotifier {
     // The SDK decides whether the push is still live, and claims the call.
     if (!client.handleIncomingPush(sdk)) {
       log('📲 Ignored a stale push for a call from ${call.displayCaller}', LogType.info);
+      _endNativePushScreen(call);
       return;
     }
     _ringingPushes[call.callId] = call;
@@ -1385,6 +1406,7 @@ class PlaygroundController extends ChangeNotifier {
       // Vobiz does not hold calls for a phone that is registered, so this is a
       // race: the claim goes anyway, and the SDK turns it away busy at once.
       log('📞 ${call.displayCaller} is calling while you are on a call: they hear busy', LogType.warning);
+      _endNativePushScreen(call);
       return;
     }
     unawaited(_showPushedCall(call));
@@ -1625,14 +1647,18 @@ class PlaygroundController extends ChangeNotifier {
     vobizPushState = PushState.registering;
     notifyListeners();
     final token = await push.token();
-    // The application id Android runs this app as: Vobiz pushes with the
-    // Firebase credential saved for it.
+    // The application id Android runs this app as, or its iOS bundle id:
+    // Vobiz pushes with the Firebase or APNs credential saved for it.
     final bundleId = await platform.packageName();
     if (token == null || bundleId == null || bundleId.isEmpty) {
       vobizPushState = PushState.failed;
-      vobizPushDetail = token == null
-          ? 'Firebase gave no push token (no network, or Google Play services missing).'
-          : 'Could not read this app\'s package name from Android.';
+      vobizPushDetail = switch ((token == null, push.voip)) {
+        (true, true) => 'PushKit gave no VoIP token (no network, or the app is not signed with '
+            'the Push Notifications capability).',
+        (true, false) => 'Firebase gave no push token (no network, or Google Play services missing).',
+        (false, true) => 'Could not read this app\'s bundle id from iOS.',
+        (false, false) => 'Could not read this app\'s package name from Android.',
+      };
       log('❌ Vobiz push: $vobizPushDetail', LogType.error);
       notifyListeners();
       return;
@@ -1650,10 +1676,13 @@ class PlaygroundController extends ChangeNotifier {
         pushToken: token,
         sipUsername: user,
         appBundleId: bundleId,
+        platform: push.platform,
         appVersion: 'example',
         sdkVersion: VobizClient.sdkVersion,
       );
       await devices.register(device);
+      // iOS: missed calls are notifications; CallKit rings without them.
+      if (push.voip) unawaited(platform.requestNotifications());
       vobizPushState = PushState.ready;
       vobizPushDetail = 'This phone is signed up with Vobiz push for calls to $user'
           '${viaServer ? ' (through the sample server)' : ''}. With the app closed, a call to $user '
@@ -1792,13 +1821,14 @@ class PlaygroundController extends ChangeNotifier {
     for (final active in await callScreen.active()) {
       final pushed = PushCall.fromExtra(active.extra);
       if (pushed == null || !active.isAccepted) continue;
+      final key = callScreen.keyOf(active);
       final expires = pushed.expiresAt;
       if (!pushed.isVobiz || (expires != null && DateTime.now().isAfter(expires.add(const Duration(seconds: 30))))) {
-        await _closeCallScreen(active.id);
+        await _closeCallScreen(key);
         unawaited(platform.leaveLockScreen());
         continue;
       }
-      await _acceptVobizHeldCall(pushed, active.id);
+      await _acceptVobizHeldCall(pushed, key);
       return;
     }
   }
@@ -2078,7 +2108,16 @@ class PlaygroundController extends ChangeNotifier {
         // answered anywhere. A call screen accepted in the plugin is closed:
         // the plugin's service then stops, and no longer anything else.
         _startCallService(outbound: e.direction != CallDirection.inbound);
-        if (_callScreenId != null && _callScreenAccepted) _endCallScreen();
+        final acceptedScreen = _callScreenAccepted ? _callScreenId : null;
+        if (acceptedScreen != null) {
+          // iOS: a call answered on CallKit stays there (lock screen, the
+          // green indicator, CallKit's audio session) until it ends.
+          if (CallScreen.isIOS) {
+            unawaited(callScreen.connected(acceptedScreen));
+          } else {
+            _endCallScreen();
+          }
+        }
         // A call the sample server rang: report the server's own id for it
         // (PushRef, the caller's leg), which the server can act on. The
         // X-Calluuid on the INVITE to this phone is not a call Vobiz's

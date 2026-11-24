@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## Unreleased
+
+### Added
+
+- Example app: incoming calls on a closed or suspended iOS app, through Vobiz push.
+  PushKit VoIP pushes are reported to CallKit (`flutter_callkit_incoming`) and handed
+  to `VobizClient.handleIncomingPush`. The phone signs up with its VoIP token as
+  `platform: ios`. A call answered on CallKit stays there until it ends. WebRTC's audio
+  waits for CallKit to activate the audio session. The app's one Flutter engine now
+  starts in the AppDelegate, so a push can run it without a window. CallKit's mute
+  button and the app's stay in step, and missed calls are notifications on iOS too.
+- CI builds the example for iOS (`flutter build ios --no-codesign`).
+
+### Changed
+
+- PLATFORM_SETUP.md, README.md and doc/PUSH_DESIGN.md describe iOS push setup in place
+  of "iOS rings only in the foreground".
+
 ## 0.2.0 - 2026-11-23
 
 Compared with 0.1.0, the SDK signs users in with
