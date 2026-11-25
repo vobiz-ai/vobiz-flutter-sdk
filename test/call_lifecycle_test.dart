@@ -100,6 +100,29 @@ void main() {
       await h.dispose();
     });
 
+    test('no microphone permission: 480 at once, without opening the microphone', () async {
+      final h = Harness();
+      h.invite('in-1');
+      h.client.canOpenMicrophone = () async => false;
+      // Opening the microphone would fail differently: it must not be tried.
+      h.peer.initializeError = Exception('opened the microphone');
+      await h.client.acceptCall();
+      await h.settle();
+      expect(h.sentStatus(480), isTrue, reason: 'sent: ${h.firstLines}');
+      expect(h.client.callState, CallStateStatus.idle);
+      expect(h.lastEnded.reason, 'answer_failed');
+      expect(h.errors.last.code, VobizErrorCode.microphonePermissionDenied);
+
+      h.client.canOpenMicrophone = () async => true;
+      h.peer.initializeError = null;
+      h.sent.clear();
+      h.invite('in-2', branch: 'z9hG4bKb');
+      await h.client.acceptCall();
+      await h.settle();
+      expect(h.client.callState, CallStateStatus.active);
+      await h.dispose();
+    });
+
     test('an INVITE without SDP is declined with 488', () async {
       final h = Harness();
       h.invite('in-1', sdp: '');

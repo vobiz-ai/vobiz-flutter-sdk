@@ -149,7 +149,14 @@ class _PushPanelState extends State<PushPanel> {
       ]),
       _check(pg, c.push.name, c.push.available,
           c.push.available ? 'Wakes the app when it is closed' : (c.push.problem ?? '')),
-      // iOS rings on CallKit, which needs neither.
+      // iOS rings on CallKit, which needs neither, but a call answered there
+      // cannot ask for the microphone.
+      if (c.push.voip)
+        _check(pg, 'Microphone', c.microphoneAllowed,
+            c.microphoneAllowed == false
+                ? 'Off: turn it on in Settings → this app → Microphone'
+                : 'Needed to answer a call from the lock screen',
+            action: c.microphoneAllowed == null ? c.requestCallPermissions : null),
       if (!c.push.voip) ...<Widget>[
         _check(pg, 'Notifications', c.notificationsAllowed,
             'The call screen is a notification',

@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../core/vobiz_client.dart';
+import '../errors/vobiz_exception.dart';
 import '../events/call_event.dart';
 import '../models/call/call_direction.dart';
 import '../state/call_state.dart';
@@ -34,6 +35,13 @@ import 'vobiz_push.dart';
 /// engine. [start] is remembered: on the next launches the SDK registers for
 /// PushKit before Flutter runs. [stop] turns it off.
 ///
+/// A call answered from CallKit or the lock screen cannot show the
+/// microphone prompt, so [start] asks for the microphone while the app is on
+/// screen (see [requestsMicrophoneOnStart]), and a call answered without it
+/// ends at once with [VobizErrorCode.microphonePermissionDenied] instead of
+/// hanging on "connecting". Apps that start before showing anything can ask
+/// later, at sign-in, with [requestMicrophonePermission].
+///
 /// On other platforms every method does nothing and [isSupported] is false.
 class VobizIosPush {
   VobizIosPush(
@@ -42,6 +50,7 @@ class VobizIosPush {
     this.iconTemplateImageName,
     this.ringtoneSound,
     this.showCallsOnCallKit = true,
+    this.requestsMicrophoneOnStart = true,
     @visibleForTesting MethodChannel? channel,
     @visibleForTesting bool? supported,
   })  : _channel = channel ?? const MethodChannel(channelName),
@@ -70,6 +79,11 @@ class VobizIosPush {
   /// shows it its own way, and it does not ring when the app is in the
   /// background.
   final bool showCallsOnCallKit;
+
+  /// Whether [start] asks for the microphone when it was never asked and the
+  /// app is on screen. Off, ask with [requestMicrophonePermission] before
+  /// calls can come in.
+  final bool requestsMicrophoneOnStart;
 
   final MethodChannel _channel;
   final bool _supported;
@@ -111,6 +125,7 @@ class VobizIosPush {
     _channel.setMethodCallHandler(_onNative);
     _subs.add(client.callEvents.listen(_onCall));
     _subs.add(client.pushCallUpdates.listen(_onPushUpdate));
+    client.canOpenMicrophone = _canOpenMicrophone;
     final reply = await _channel.invokeMapMethod<String, Object?>('start', <String, Object?>{
       'includesCallsInRecents': includesCallsInRecents,
       'iconTemplateImageName': iconTemplateImageName,
@@ -120,6 +135,31 @@ class VobizIosPush {
     if (token is String && token.isNotEmpty) _setToken(token);
     for (final event in (reply?['events'] as List<Object?>?) ?? const <Object?>[]) {
       if (event is Map) await _onEvent(Map<String, Object?>.from(event));
+    }
+    if (requestsMicrophoneOnStart) await requestMicrophonePermission();
+  }
+
+  /// Whether this app may use the microphone, without asking.
+  Future<VobizMicrophonePermission> microphonePermission() async {
+    if (!_supported) return VobizMicrophonePermission.granted;
+    try {
+      final reply = await _channel.invokeMapMethod<String, Object?>('microphone');
+      return VobizMicrophonePermission._parse(reply?['permission']);
+    } on MissingPluginException {
+      return VobizMicrophonePermission.undetermined;
+    }
+  }
+
+  /// Asks for the microphone if it was never asked, and returns the answer.
+  /// iOS shows the prompt only while the app is on screen: at other times
+  /// this returns the permission as it is. Once denied, only the Settings
+  /// app can allow it.
+  Future<VobizMicrophonePermission> requestMicrophonePermission() async {
+    if (!_supported) return VobizMicrophonePermission.granted;
+    try {
+      return VobizMicrophonePermission._parse(await _channel.invokeMethod<String>('requestMicrophone'));
+    } on MissingPluginException {
+      return VobizMicrophonePermission.undetermined;
     }
   }
 
@@ -172,6 +212,7 @@ class VobizIosPush {
   /// Stops listening. CallKit and PushKit stay on for the next launches
   /// (see [stop]).
   Future<void> dispose() async {
+    if (client.canOpenMicrophone == _canOpenMicrophone) client.canOpenMicrophone = null;
     for (final sub in _subs) {
       await sub.cancel();
     }
@@ -363,6 +404,28 @@ class VobizIosPush {
     unawaited(_invoke('end', <String, Object?>{'key': key, 'reason': 'unanswered'}));
   }
 
+  /// [VobizClient.canOpenMicrophone]: granted, or never asked with the app
+  /// on screen (opening the microphone shows the prompt then). If the
+  /// permission cannot be read, the call is answered as before.
+  Future<bool> _canOpenMicrophone() async {
+    try {
+      final reply = await _channel.invokeMapMethod<String, Object?>('microphone');
+      if (reply == null) return true;
+      switch (VobizMicrophonePermission._parse(reply['permission'])) {
+        case VobizMicrophonePermission.granted:
+          return true;
+        case VobizMicrophonePermission.denied:
+          return false;
+        case VobizMicrophonePermission.undetermined:
+          return reply['appActive'] == true;
+      }
+    } on MissingPluginException {
+      return true;
+    } on PlatformException {
+      return true;
+    }
+  }
+
   Future<void> _invoke(String method, [Map<String, Object?>? arguments]) async {
     if (!_supported) return;
     try {
@@ -373,6 +436,21 @@ class VobizIosPush {
       debugPrint('VobizIosPush: $method failed: ${e.code} ${e.message}');
     }
   }
+}
+
+/// Whether the app may use the microphone (iOS).
+enum VobizMicrophonePermission {
+  granted,
+  denied,
+
+  /// Never asked.
+  undetermined;
+
+  static VobizMicrophonePermission _parse(Object? value) => switch (value) {
+        'granted' => granted,
+        'denied' => denied,
+        _ => undetermined,
+      };
 }
 
 /// The Android side of the plugin: Dart only, as the SDK needs no Android

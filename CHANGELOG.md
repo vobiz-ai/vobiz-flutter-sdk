@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## Unreleased
+
+### Added
+
+- `VobizIosPush.microphonePermission()` and `requestMicrophonePermission()`, with
+  `VobizMicrophonePermission`. `start()` asks for the microphone while the app is on
+  screen (`requestsMicrophoneOnStart`, on by default).
+- `VobizClient.canOpenMicrophone`: asked before an inbound call is answered.
+  `VobizIosPush` sets it.
+- `VobizErrorCode.microphonePermissionDenied`.
+
+### Fixed
+
+- iOS: a call accepted on CallKit by a user who was never asked for the microphone hung
+  on "connecting" until the caller gave up, since iOS can't show the prompt there. It
+  now ends at once: the caller gets 480 and the app gets `microphone_permission_denied`.
+
 ## 0.3.0 - 2026-11-25
 
 iOS push-to-wake moves into the SDK. `vobiz_webrtc` is now a Flutter plugin with iOS
