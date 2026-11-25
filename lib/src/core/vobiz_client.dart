@@ -403,6 +403,12 @@ class VobizClient {
   /// returns its credentials. The client then registers as that endpoint;
   /// watch [connectionEvents] for the result.
   ///
+  /// With [userName] (such as `alice`), the server gives this phone its own
+  /// endpoint for that name instead of the account's one shared Playground
+  /// endpoint, so several phones on one account are separate SIP users: they
+  /// can ring each other (Dial-User) and each get their own push. The demo
+  /// server takes 1 to 20 of `a-z 0-9 . _ -`, starting with a letter.
+  ///
   /// The Auth ID and Auth Token stay in memory, for [transferCall], until
   /// [disconnect]. The SDK never stores them.
   ///
@@ -411,6 +417,7 @@ class VobizClient {
   Future<ZeroConfigSession> connectWithAuthToken({
     required String authId,
     required String authToken,
+    String? userName,
   }) async {
     final id = authId.trim();
     final token = authToken.trim();
@@ -439,6 +446,7 @@ class VobizClient {
         voiceApiUrl: _config.voiceApiUrl,
         authId: id,
         authToken: token,
+        userName: userName,
       );
       if (!_isSipUsername(session.sipUsername)) {
         throw const VobizException(VobizErrorCode.setupFailed,

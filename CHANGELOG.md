@@ -26,6 +26,12 @@ example's Swift. Android is unchanged and still has no native code.
 - iOS: `VobizAppDelegate` starts the app's Flutter engine at launch and registers for
   PushKit first, so a push can launch a closed app; `VobizAppDelegate.makeWindow(for:)`
   shows that engine from a SceneDelegate.
+- `connectWithAuthToken(userName:)` (demo Zero-Config): a name gives the phone its own
+  endpoint on the account instead of the one shared Playground endpoint, so several
+  phones on one account are separate SIP users that can call each other and each get
+  their own push. Needs the webhook server's named users (`/api/setup` `user_name`,
+  `/api/users`). The example adds *Your name* on the Zero-Config tab and *Call a user*
+  next to Dial-User.
 - iOS: WebRTC runs with manual audio while `VobizIosPush` is on. A CallKit call starts
   its audio when CallKit activates the session; other calls activate it themselves.
 

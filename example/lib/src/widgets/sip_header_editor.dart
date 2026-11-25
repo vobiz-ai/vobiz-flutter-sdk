@@ -37,6 +37,46 @@ class _SipHeaderEditorState extends State<SipHeaderEditor> {
     );
   }
 
+  /// The account's Playground users: tap one to ring it on the next call.
+  Future<void> _pickUser(BuildContext context, PlaygroundController c) async {
+    final me = c.connectedAs;
+    final picked = await showModalBottomSheet<PlaygroundUser>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheet) => FutureBuilder<List<PlaygroundUser>>(
+        future: c.playgroundUsers(),
+        builder: (sheet, snapshot) {
+          if (!snapshot.hasData) {
+            return const SizedBox(height: 160, child: Center(child: CircularProgressIndicator()));
+          }
+          final users = snapshot.data!.where((u) => u.sipUsername != me).toList();
+          if (users.isEmpty) {
+            return const Padding(
+              padding: EdgeInsets.fromLTRB(20, 8, 20, 32),
+              child: Text('No other Playground users on this account yet. Sign in on another phone '
+                  'with the same Auth ID under another name (Identity → Your name).'),
+            );
+          }
+          return SafeArea(
+            child: ListView(
+              shrinkWrap: true,
+              children: <Widget>[
+                for (final u in users)
+                  ListTile(
+                    leading: Icon(Icons.person, color: u.registered ? Colors.green : null),
+                    title: Text(u.name),
+                    subtitle: Text('${u.sipUsername}${u.registered ? ' · online' : ' · rings through push if signed up'}'),
+                    onTap: () => Navigator.of(sheet).pop(u),
+                  ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    if (picked != null) c.callPlaygroundUser(picked);
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = widget.controller;
@@ -101,6 +141,16 @@ class _SipHeaderEditorState extends State<SipHeaderEditor> {
                           label: const Text('Dial-User'),
                         ),
                       ),
+                      if (c.demoTools && c.authTab == AuthTab.zeroConfig)
+                        Tooltip(
+                          message: 'Ring another phone signed in on this account under a name',
+                          child: OutlinedButton.icon(
+                            key: const Key('callPlaygroundUser'),
+                            onPressed: () => _pickUser(context, c),
+                            icon: const Icon(Icons.people_alt_outlined, size: 16),
+                            label: const Text('Call a user'),
+                          ),
+                        ),
                     ],
                   ),
                   const SizedBox(height: 8),
