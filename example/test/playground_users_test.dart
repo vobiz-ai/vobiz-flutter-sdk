@@ -90,19 +90,58 @@ void main() {
     expect(c.logs.last.message, contains('does not support named users yet'));
   });
 
-  test('calling a user sets Dial-User, and the caller ID as the number when none is entered', () {
-    final c = make()
-      ..callerIdIso = 'IN'
-      ..callerIdNumber = '7965861256';
+  test('calling a user sets Dial-User; picking again replaces it', () {
+    final c = make();
     c.callPlaygroundUser(const PlaygroundUser(name: 'bob', sipUsername: 'bob0456'));
-    final dial = c.headerRows.where((r) => r.name == VobizSipHeaders.dialUser).single;
-    expect(dial.value, 'bob0456');
-    expect(c.destination, '+917965861256');
-
-    // Picking again replaces the user, and keeps a number that was typed.
-    c.destNumber = '9000000001';
+    expect(c.dialUserTarget, 'bob0456');
     c.callPlaygroundUser(const PlaygroundUser(name: 'carol', sipUsername: 'carol0789'));
     expect(c.headerRows.where((r) => r.name == VobizSipHeaders.dialUser).single.value, 'carol0789');
-    expect(c.destNumber, '9000000001');
+  });
+
+  group('endpoint-to-endpoint calls', () {
+    Future<PlaygroundController> signedIn() async {
+      final c = make();
+      await c.init();
+      c
+        ..authId = 'MA_X'
+        ..authToken = 'tok'
+        ..zeroConfigName = 'alice';
+      await c.connect();
+      return c;
+    }
+
+    test('need no number or caller ID', () async {
+      final c = await signedIn();
+      c.callPlaygroundUser(const PlaygroundUser(name: 'bob', sipUsername: 'bob0456'));
+      await c.call();
+      expect(client.actions, contains('makeCall'));
+      expect(client.lastDial!.destination, PlaygroundController.endpointCallRoute);
+      expect(client.lastDial!.callerId, isNull);
+      expect(client.lastDial!.headers[VobizSipHeaders.dialUser], 'bob0456');
+      expect(c.remoteParty, 'bob');
+    });
+
+    test('keep a caller ID and a number when they are entered', () async {
+      final c = await signedIn();
+      c
+        ..callerIdIso = 'IN'
+        ..callerIdNumber = '7965861256'
+        ..destIso = 'IN'
+        ..destNumber = '9000000001';
+      c.callPlaygroundUser(const PlaygroundUser(name: 'bob', sipUsername: 'bob0456'));
+      await c.call();
+      expect(client.lastDial!.destination, '+919000000001');
+      expect(client.lastDial!.callerId, '+917965861256');
+    });
+
+    test('a phone number still needs a caller ID', () async {
+      final c = await signedIn();
+      c
+        ..destIso = 'IN'
+        ..destNumber = '9000000001';
+      await c.call();
+      expect(client.actions, isNot(contains('makeCall')));
+      expect(c.logs.last.message, contains('Caller ID is required'));
+    });
   });
 }

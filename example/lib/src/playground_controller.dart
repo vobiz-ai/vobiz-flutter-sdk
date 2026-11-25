@@ -866,14 +866,44 @@ class PlaygroundController extends ChangeNotifier {
     return (headers: headers, errors: errors);
   }
 
+  /// The number an endpoint-to-endpoint call (Dial-User) is placed to when
+  /// none is entered. Vobiz routes a call from a SIP user to an all-digit
+  /// destination through the caller's application, whose answer URL then
+  /// dials the endpoint and ignores this number; Vobiz does not check it.
+  static const String endpointCallRoute = '0000000000';
+
+  /// The SIP user the next call rings (a Dial-User header with a value).
+  String? get dialUserTarget {
+    for (final row in headerRows) {
+      if (row.name.trim().toUpperCase() == VobizSipHeaders.dialUser.toUpperCase() && row.value.trim().isNotEmpty) {
+        return row.value.trim();
+      }
+    }
+    return null;
+  }
+
+  /// Names of the Playground users picked with "Call a user", by SIP user.
+  final Map<String, String> _userNames = <String, String>{};
+
   Future<void> call() async {
-    if (destNumber.trim().isEmpty) return log('Please enter a destination', LogType.error);
+    final dialUser = dialUserTarget;
+    if (destNumber.trim().isEmpty && dialUser == null) {
+      return log('Please enter a destination', LogType.error);
+    }
     if (!client.isConnected) return log('Login first', LogType.error);
     final cli = callerId;
-    if (cli.isEmpty || !RegExp(r'^\+\d{7,15}$').hasMatch(cli)) {
+    // A phone number needs an approved caller ID or carriers refuse the
+    // call; an endpoint (Dial-User) does not, and without one it sees the
+    // call come from this phone's SIP user.
+    if (dialUser == null && (cli.isEmpty || !RegExp(r'^\+\d{7,15}$').hasMatch(cli))) {
       return log('⚠️ Caller ID is required for PSTN calls. Enter a verified number '
           '(e.g. +919876543210)', LogType.error);
     }
+    if (cli.isNotEmpty && !RegExp(r'^\+\d{7,15}$').hasMatch(cli)) {
+      return log('⚠️ The caller ID must be a plus and 7 to 15 digits, or empty for an '
+          'endpoint call', LogType.error);
+    }
+    final dest = destNumber.trim().isEmpty ? endpointCallRoute : destination;
 
     // The SDK would refuse these anyway; say which and why before dialling.
     final built = buildRowHeaders();
@@ -885,8 +915,9 @@ class PlaygroundController extends ChangeNotifier {
       return log('Fix the highlighted SIP headers before dialling', LogType.error);
     }
 
-    remoteParty = destination;
-    log('📞 Calling $destination...', LogType.event);
+    remoteParty = dialUser == null ? dest : (_userNames[dialUser] ?? dialUser);
+    log(dialUser == null ? '📞 Calling $dest...' : '📞 Calling $remoteParty (endpoint $dialUser)...',
+        LogType.event);
     final onInvite = <String, String>{
       ...built.headers,
       if (recordCall) VobizSipHeaders.record: 'true',
@@ -905,8 +936,8 @@ class PlaygroundController extends ChangeNotifier {
 
     try {
       await client.makeCall(
-        destination,
-        callerId: cli,
+        dest,
+        callerId: cli.isEmpty ? null : cli,
         headers: built.headers,
         record: recordCall,
       );
@@ -1975,9 +2006,9 @@ class PlaygroundController extends ChangeNotifier {
   }
 
   /// Sets up the next call to ring [user]: a Dial-User header with its SIP
-  /// username. The dialled number only gets the call to the answer webhook,
-  /// so with none entered it is this phone's caller ID.
+  /// username. No number or caller ID is needed for it (see [call]).
   void callPlaygroundUser(PlaygroundUser user) {
+    _userNames[user.sipUsername] = user.name;
     final row = headerRows
         .where((r) => r.name.toUpperCase() == VobizSipHeaders.dialUser.toUpperCase())
         .firstOrNull;
@@ -1986,11 +2017,8 @@ class PlaygroundController extends ChangeNotifier {
     } else {
       row.value = user.sipUsername;
     }
-    if (destNumber.trim().isEmpty && callerIdNumber.isNotEmpty) {
-      destIso = callerIdIso;
-      destNumber = callerIdNumber;
-    }
-    log('Next call rings ${user.name} (${user.sipUsername}). Tap Call.', LogType.info);
+    log('Next call rings ${user.name} (${user.sipUsername}). Tap Call: no number or caller ID '
+        'needed.', LogType.info);
     notifyListeners();
   }
 
