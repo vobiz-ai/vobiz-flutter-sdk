@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## Unreleased
+## 0.2.1 - 2026-11-25
+
+iOS gets what Android had in 0.2.0: a closed or suspended app rings for incoming calls
+through Vobiz push, here PushKit and CallKit. The SDK's Dart API is unchanged; the iOS
+code lives in the example app, for apps to copy.
 
 ### Added
 
@@ -24,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PLATFORM_SETUP.md, README.md and doc/PUSH_DESIGN.md describe iOS push setup in place
   of "iOS rings only in the foreground".
+- Example app on iOS: signed for the Vobiz team with the bundle id
+  `ai.vobiz.vobizWebrtc`, and `Podfile.lock` and Swift Package Manager's
+  `Package.resolved` are committed, so every build uses the same pods and packages.
+- PLATFORM_SETUP.md: test VoIP push with a profile or release build. A debug build
+  cannot start without Xcode attached and crashes when a push wakes it.
 
 ## 0.2.0 - 2026-11-23
 

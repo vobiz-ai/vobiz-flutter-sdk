@@ -275,7 +275,7 @@ class VobizClient {
   _PushedCall? _pushed;
 
   /// This SDK's version, for `VobizPushDevice.sdkVersion` and logs.
-  static const String sdkVersion = '0.2.0';
+  static const String sdkVersion = '0.2.1';
 
   /// What becomes of each call push handed to [handleIncomingPush]: claimed,
   /// ringing, answered or declined from the call screen, or expired.
