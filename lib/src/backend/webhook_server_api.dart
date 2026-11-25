@@ -81,6 +81,7 @@ class WebhookServerApi {
     required String voiceApiUrl,
     required String authId,
     required String authToken,
+    String? userName,
   }) async {
     _requireDemoMode('Zero-Config Setup');
     final base = normalizeBase(webhookUrl);
@@ -95,6 +96,7 @@ class WebhookServerApi {
         'auth_token': authToken,
         'voice_api_url': normalizeBase(voiceApiUrl),
         'my_domain': base,
+        if (userName != null && userName.trim().isNotEmpty) 'user_name': userName.trim(),
       },
     );
     try {

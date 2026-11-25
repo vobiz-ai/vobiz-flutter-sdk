@@ -298,6 +298,35 @@ void main() {
       expect(session.reusedExisting, isTrue);
     });
 
+    test('setup sends a user name, trimmed, so the phone gets its own endpoint', () async {
+      late http.Request seen;
+      final api = WebhookServerApi(allowAccountCredentials: true, client: MockClient((request) async {
+        seen = request;
+        return http.Response(
+          jsonEncode(<String, Object>{'sip_username': 'alice0123', 'sip_password': 'Pwd1', 'application_id': '987'}),
+          200,
+        );
+      }));
+      final session = await api.setup(
+        webhookUrl: 'https://hooks.example.test',
+        voiceApiUrl: 'https://api.vobiz.ai',
+        authId: 'MA_TEST0001',
+        authToken: 'token-1',
+        userName: ' alice ',
+      );
+      expect((jsonDecode(seen.body) as Map)['user_name'], 'alice');
+      expect(session.sipUsername, 'alice0123');
+
+      await api.setup(
+        webhookUrl: 'https://hooks.example.test',
+        voiceApiUrl: 'https://api.vobiz.ai',
+        authId: 'MA_TEST0001',
+        authToken: 'token-1',
+        userName: '  ',
+      );
+      expect((jsonDecode(seen.body) as Map).containsKey('user_name'), isFalse);
+    });
+
     test('setup surfaces the server error', () async {
       final api = WebhookServerApi(allowAccountCredentials: true, client: MockClient((_) async => http.Response(
           jsonEncode(<String, String>{'error': 'Missing required API credentials'}), 400)));

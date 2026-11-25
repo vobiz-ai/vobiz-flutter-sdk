@@ -27,6 +27,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
   late final TextEditingController _sipPass = TextEditingController(text: widget.controller.sipPassword);
   late final TextEditingController _tokenServer = TextEditingController(text: widget.controller.tokenServerUrl);
   late final TextEditingController _tokenUser = TextEditingController(text: widget.controller.tokenUser);
+  late final TextEditingController _zeroName = TextEditingController(text: widget.controller.zeroConfigName);
   bool _showToken = false;
   bool _showPassword = false;
 
@@ -38,6 +39,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
     _sipPass.dispose();
     _tokenServer.dispose();
     _tokenUser.dispose();
+    _zeroName.dispose();
     super.dispose();
   }
 
@@ -50,6 +52,7 @@ class _IdentityPanelState extends State<IdentityPanel> {
     _sync(_sipPass, widget.controller.sipPassword);
     _sync(_tokenServer, widget.controller.tokenServerUrl);
     _sync(_tokenUser, widget.controller.tokenUser);
+    _sync(_zeroName, widget.controller.zeroConfigName);
   }
 
   void _sync(TextEditingController field, String value) {
@@ -246,6 +249,23 @@ class _IdentityPanelState extends State<IdentityPanel> {
             ),
           ),
           onChanged: (v) => _edited(c, 'authToken', () => c.authToken = v),
+        ),
+        const SizedBox(height: 14),
+        const SectionLabel('Your name (optional)',
+            trailing: InfoTip(
+                title: 'Your name',
+                message: 'Gives this phone its own SIP user on the account, such as alice. Phones '
+                    'signed in under different names can call each other (Call a user, on the '
+                    'Dialer) and each get their own push. Empty: every phone on the account shares '
+                    'one Playground endpoint, and a new sign-in replaces the last.')),
+        TextField(
+          key: const Key('zeroConfigName'),
+          controller: _zeroName,
+          autocorrect: false,
+          enableSuggestions: false,
+          textCapitalization: TextCapitalization.none,
+          decoration: const InputDecoration(hintText: 'e.g. alice'),
+          onChanged: (v) => c.zeroConfigName = v,
         ),
         const SizedBox(height: 14),
         InkWell(

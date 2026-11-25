@@ -67,6 +67,20 @@ class LogEntry {
 }
 
 /// One row of the SIP header editor.
+/// A phone signed in with Zero-Config under a name (see
+/// `PlaygroundController.zeroConfigName`).
+@immutable
+class PlaygroundUser {
+  const PlaygroundUser({required this.name, required this.sipUsername, this.registered = false});
+
+  final String name;
+  final String sipUsername;
+
+  /// Whether it is registered now. One that is not can still ring through
+  /// Vobiz push, if it signed up for push.
+  final bool registered;
+}
+
 class HeaderRow {
   HeaderRow(this.id, {this.name = VobizSipHeaders.prefix, this.value = ''});
 
@@ -182,6 +196,11 @@ class PlaygroundController extends ChangeNotifier {
   String sipPassword = '';
   bool rememberMe = true;
   String webhookUrl = SdkConfig.defaultWebhookUrl;
+
+  /// Zero-Config: this phone's name on the account (such as `alice`), so it
+  /// gets its own SIP user and other phones can call it by name. Empty: the
+  /// account's one shared Playground endpoint.
+  String zeroConfigName = '';
 
   /// Access token sign-in: where to POST for a token (the Vobiz WebRTC demo's
   /// `/token`, or your own). Empty: the sample server's `/token`.
@@ -428,6 +447,7 @@ class PlaygroundController extends ChangeNotifier {
   static const String _kTheme = 'vobiz_playground_theme';
   static const String _kMode = 'vobiz_playground_mode';
   static const String _kWebhook = 'vobiz_playground_webhook';
+  static const String _kZeroConfigName = 'vobiz_playground_user_name';
   static const String _kTokenServer = 'vobiz_playground_token_server';
   static const String _kTokenUser = 'vobiz_playground_token_user';
   static const String _kRemember = 'vobiz_playground_remember';
@@ -581,9 +601,12 @@ class PlaygroundController extends ChangeNotifier {
       if (zero) {
         client.backendUrl = hook;
         log('Generating Application & Endpoint via API...', LogType.info);
+        final name = zeroConfigName.trim().toLowerCase();
+        if (name.isNotEmpty) log('Signing in as Playground user "$name"', LogType.info);
         final session = await client.connectWithAuthToken(
           authId: authId,
           authToken: authToken,
+          userName: name.isEmpty ? null : name,
         );
         if (session_ != _session) {
           await _abandonSignIn();
@@ -1906,6 +1929,71 @@ class PlaygroundController extends ChangeNotifier {
 
   // ── SIP header editor ───────────────────────────────────────────────────────
 
+  // ── Playground users (Zero-Config) ───────────────────────────────────────────
+
+  /// The account's named Playground users (see [zeroConfigName]), from the
+  /// webhook server's `/api/users`. Empty, with a log line, when it cannot
+  /// tell (not a Zero-Config sign-in, or the server is unreachable).
+  Future<List<PlaygroundUser>> playgroundUsers() async {
+    if (!demoTools || authId.trim().isEmpty || authToken.trim().isEmpty) {
+      log('Calling Playground users by name needs a Zero-Config sign-in', LogType.warning);
+      return const <PlaygroundUser>[];
+    }
+    final hook = webhookUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    try {
+      final response = await (_http ?? http.Client())
+          .post(
+            Uri.parse('$hook/api/users'),
+            headers: <String, String>{'Content-Type': 'application/json'},
+            body: jsonEncode(<String, String>{
+              'auth_id': authId.trim(),
+              'api_username': authId.trim(),
+              'auth_token': authToken.trim(),
+              'voice_api_url': SdkConfig.defaultVoiceApiUrl,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode != 200) {
+        log('Could not list Playground users: the server answered ${response.statusCode}'
+            '${response.statusCode == 404 ? ' (it does not support named users yet)' : ''}', LogType.error);
+        return const <PlaygroundUser>[];
+      }
+      final users = (jsonDecode(response.body) as Map<String, dynamic>)['users'];
+      return <PlaygroundUser>[
+        for (final u in users is List ? users : const <Object?>[])
+          if (u is Map && u['name'] is String && u['sip_username'] is String)
+            PlaygroundUser(
+              name: u['name'] as String,
+              sipUsername: u['sip_username'] as String,
+              registered: u['registered'] == true,
+            ),
+      ];
+    } catch (e) {
+      log('Could not list Playground users: $e', LogType.error);
+      return const <PlaygroundUser>[];
+    }
+  }
+
+  /// Sets up the next call to ring [user]: a Dial-User header with its SIP
+  /// username. The dialled number only gets the call to the answer webhook,
+  /// so with none entered it is this phone's caller ID.
+  void callPlaygroundUser(PlaygroundUser user) {
+    final row = headerRows
+        .where((r) => r.name.toUpperCase() == VobizSipHeaders.dialUser.toUpperCase())
+        .firstOrNull;
+    if (row == null) {
+      headerRows.add(HeaderRow(_rowId++, name: VobizSipHeaders.dialUser, value: user.sipUsername));
+    } else {
+      row.value = user.sipUsername;
+    }
+    if (destNumber.trim().isEmpty && callerIdNumber.isNotEmpty) {
+      destIso = callerIdIso;
+      destNumber = callerIdNumber;
+    }
+    log('Next call rings ${user.name} (${user.sipUsername}). Tap Call.', LogType.info);
+    notifyListeners();
+  }
+
   void addHeaderRow({String name = VobizSipHeaders.prefix, String value = ''}) {
     headerRows.add(HeaderRow(_rowId++, name: name, value: value));
     _saveHeaderPrefs();
@@ -2382,6 +2470,7 @@ class PlaygroundController extends ChangeNotifier {
       _ => demoTools ? AuthTab.zeroConfig : AuthTab.sipDirect,
     };
     webhookUrl = prefs.getString(_kWebhook) ?? SdkConfig.defaultWebhookUrl;
+    zeroConfigName = prefs.getString(_kZeroConfigName) ?? '';
     tokenServerUrl = prefs.getString(_kTokenServer) ?? '';
     tokenUser = prefs.getString(_kTokenUser) ?? '';
     rememberMe = prefs.getBool(_kRemember) ?? true;
@@ -2463,6 +2552,7 @@ class PlaygroundController extends ChangeNotifier {
     });
     await prefs?.setBool(_kRemember, rememberMe);
     await prefs?.setString(_kWebhook, webhookUrl.trim());
+    await prefs?.setString(_kZeroConfigName, zeroConfigName.trim());
     await prefs?.setString(_kTokenServer, tokenServerUrl.trim());
     await prefs?.setString(_kTokenUser, tokenUser.trim());
     if (callerId.isNotEmpty) await prefs?.setString(_kCallerId, callerId);
