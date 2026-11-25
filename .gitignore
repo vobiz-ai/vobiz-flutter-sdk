@@ -43,3 +43,6 @@ example/push_bridge/bridge-state.json
 example/push_bridge/bridge-state.json.tmp
 example/push_bridge/*service-account*.json
 example/push_bridge/serviceAccountKey*.json
+
+# Swift Package Manager / Xcode per-user state of the iOS plugin
+ios/vobiz_webrtc/.swiftpm/

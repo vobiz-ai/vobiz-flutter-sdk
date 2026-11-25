@@ -108,14 +108,22 @@ class FakeClient implements VobizClient {
     accessToken = VobizAccessToken.parse(token);
   }
 
+  /// The user name the last Zero-Config sign-in asked for.
+  String? zeroConfigUserName;
+
   @override
   String? get lastCallUuid => null;
   @override
   String? get callUuid => null;
 
   @override
-  Future<ZeroConfigSession> connectWithAuthToken({required String authId, required String authToken}) async {
+  Future<ZeroConfigSession> connectWithAuthToken({
+    required String authId,
+    required String authToken,
+    String? userName,
+  }) async {
     actions.add('connectWithAuthToken');
+    zeroConfigUserName = userName;
     _throwIfFailing();
     final gate = setupGate;
     if (gate != null) await gate.future;

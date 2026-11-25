@@ -51,6 +51,7 @@ export 'src/conference/vobiz_conference.dart';
 // ── Push ──────────────────────────────────────────────────────────────────────
 export 'src/push/vobiz_push.dart';
 export 'src/push/vobiz_push_devices.dart';
+export 'src/push/vobiz_ios_push.dart';
 
 // ── Events ────────────────────────────────────────────────────────────────────
 export 'src/events/call_event.dart';

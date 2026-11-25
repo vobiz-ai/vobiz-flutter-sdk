@@ -47,7 +47,7 @@ your outbound calls. See [CREDENTIALS.md](CREDENTIALS.md#access-tokens-jwt).
 ```yaml
 # pubspec.yaml
 dependencies:
-  vobiz_webrtc: ^0.2.1
+  vobiz_webrtc: ^0.3.0
 ```
 
 Or run `flutter pub add vobiz_webrtc`.
@@ -270,12 +270,13 @@ for that phone.
    arrives is answered or declined as soon as it does. `pushCallUpdates` reports each
    step, and `expired` when the call never came: take the call screen down then.
 
-The SDK has no Firebase or call-screen dependency: the app receives the push and shows
-the call screen. The example app does all of this (Firebase, `flutter_callkit_incoming`,
+On Android the SDK has no Firebase or call-screen dependency: the app receives the push
+and shows the call screen. The example app does all of this (Firebase, `flutter_callkit_incoming`,
 a foreground service per call) and signs up through its sample server; turn it on under
-*Identity → Incoming calls → Receive calls through Vobiz push*. On iOS the push is a
-PushKit VoIP push and the call screen is CallKit; the example's
-`ios/Runner/AppDelegate.swift` shows how. The flow and its limits
+*Identity → Incoming calls → Receive calls through Vobiz push*. On iOS the SDK does it:
+PushKit, CallKit and the call's audio, with `VobizIosPush` and an AppDelegate that is a
+`VobizAppDelegate` ([PLATFORM_SETUP.md](PLATFORM_SETUP.md#incoming-calls-on-ios-pushkit-and-callkit-built-in)).
+The flow and its limits
 are in [doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md); the API is in
 [API_REFERENCE.md](API_REFERENCE.md#incoming-calls-to-a-closed-app-vobiz-push).
 

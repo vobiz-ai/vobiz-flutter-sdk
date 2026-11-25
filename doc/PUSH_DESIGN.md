@@ -130,15 +130,19 @@ The flow is Android's, with PushKit in place of Firebase and CallKit as the call
   to the devices signed up with `platform: ios`, `push_type: voip`. The call's fields
   (`type`, `call_id`, `index`, `label`, `registrar`, `expires_at`, …) are top-level keys
   of the payload, next to `aps`.
-- The app's `PKPushRegistry` delegate reports the call to CallKit before calling
-  PushKit's completion, for **every** push, then hands the fields to Dart, which calls
-  `handleIncomingPush` and signs in. The REGISTER that claims the call is the same.
+- The SDK's iOS code (`VobizCallKit`, registered at launch by `VobizAppDelegate`)
+  reports the call to CallKit before calling PushKit's completion, for **every** push,
+  then hands the fields to `VobizIosPush` in Dart, which calls `handleIncomingPush`; the
+  app signs in. The REGISTER that claims the call is the same.
 - Accept and Decline on CallKit are `reportCallScreenAccepted` and
   `reportCallScreenDeclined`. An answered call stays on CallKit until it ends.
-- WebRTC's audio waits for CallKit to activate the audio session.
+- WebRTC's audio waits for CallKit to activate the audio session (manual audio,
+  through RTCAudioSession, reached at run time so the plugin builds with WebRTC from
+  CocoaPods or Swift Package Manager).
+- CallKit keys calls by UUID: a call's key (the SIP Call-ID) becomes a name-based UUID.
 
-The example does all of it; [PLATFORM_SETUP.md](../PLATFORM_SETUP.md#incoming-calls-on-ios-pushkit-and-callkit)
-lists the steps. CallKit's mute button and the app's
-stay in step, and missed calls are local notifications (asked for once the phone signs
-up for push). Not done yet: outgoing calls are not reported to CallKit; they run in the
-app, kept alive in the background by the `audio` background mode.
+[PLATFORM_SETUP.md](../PLATFORM_SETUP.md#incoming-calls-on-ios-pushkit-and-callkit-built-in)
+lists the app's part. CallKit's mute and hold reach the SDK, and a held call that never
+arrives is ended on CallKit as missed (it shows in Recents). Not done yet: outgoing calls
+are not reported to CallKit; they run in the app, kept alive in the background by the
+`audio` background mode.
