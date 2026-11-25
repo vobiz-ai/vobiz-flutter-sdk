@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-11-25
 
 iOS push-to-wake moves into the SDK. `vobiz_webrtc` is now a Flutter plugin with iOS
 code of its own (PushKit, CallKit, and WebRTC's audio around CallKit), so an iOS app
