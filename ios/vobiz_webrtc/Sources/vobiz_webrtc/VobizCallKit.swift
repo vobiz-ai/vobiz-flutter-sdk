@@ -155,6 +155,22 @@ public final class VobizCallKit: NSObject {
       result(nil)
     case "bundleId":
       result(Bundle.main.bundleIdentifier)
+    case "microphone":
+      result([
+        "permission": Self.microphonePermission,
+        "appActive": UIApplication.shared.applicationState == .active,
+      ])
+    case "requestMicrophone":
+      // iOS shows the prompt only over the app itself, not over CallKit or
+      // the lock screen: asked any other time, the answer is what it is now.
+      guard Self.microphonePermission == "undetermined",
+            UIApplication.shared.applicationState == .active else {
+        result(Self.microphonePermission)
+        return
+      }
+      Self.requestMicrophone { _ in
+        DispatchQueue.main.async { result(Self.microphonePermission) }
+      }
     case "audioStart":
       audio.appCallStarted()
       result(nil)
@@ -163,6 +179,32 @@ public final class VobizCallKit: NSObject {
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
+    }
+  }
+
+  // MARK: - Microphone
+
+  /// "granted", "denied" or "undetermined" (never asked).
+  static var microphonePermission: String {
+    if #available(iOS 17.0, *) {
+      switch AVAudioApplication.shared.recordPermission {
+      case .granted: return "granted"
+      case .denied: return "denied"
+      default: return "undetermined"
+      }
+    }
+    switch AVAudioSession.sharedInstance().recordPermission {
+    case .granted: return "granted"
+    case .denied: return "denied"
+    default: return "undetermined"
+    }
+  }
+
+  private static func requestMicrophone(_ done: @escaping (Bool) -> Void) {
+    if #available(iOS 17.0, *) {
+      AVAudioApplication.requestRecordPermission(completionHandler: done)
+    } else {
+      AVAudioSession.sharedInstance().requestRecordPermission(done)
     }
   }
 

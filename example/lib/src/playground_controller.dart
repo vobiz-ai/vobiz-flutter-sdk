@@ -352,6 +352,10 @@ class PlaygroundController extends ChangeNotifier {
   /// Android 14+ permission to take over the lock screen; null while unknown.
   bool? fullScreenAllowed;
 
+  /// iOS: whether the app may use the microphone; null while unknown or
+  /// not on iOS. A call answered from CallKit cannot ask for it.
+  bool? microphoneAllowed;
+
   /// The call screen showing the current call, and whether Accept was
   /// tapped there (it then becomes the ongoing-call notification).
   String? _callScreenId;
@@ -1294,12 +1298,34 @@ class PlaygroundController extends ChangeNotifier {
   Future<void> refreshCallPermissions() async {
     notificationsAllowed = await push.notificationsAllowed();
     fullScreenAllowed = await callScreen.canUseFullScreen();
+    final ios = this.ios;
+    if (ios != null) microphoneAllowed = _allowed(await ios.microphonePermission());
+    notifyListeners();
+  }
+
+  static bool? _allowed(VobizMicrophonePermission p) => switch (p) {
+        VobizMicrophonePermission.granted => true,
+        VobizMicrophonePermission.denied => false,
+        VobizMicrophonePermission.undetermined => null,
+      };
+
+  /// iOS: asks for the microphone if it was never asked.
+  Future<void> _requestMicrophone() async {
+    final ios = this.ios;
+    if (ios == null) return;
+    final permission = await ios.requestMicrophonePermission();
+    microphoneAllowed = _allowed(permission);
+    if (permission == VobizMicrophonePermission.denied) {
+      log('⚠️ Microphone access is off, so calls cannot be answered. Turn it on in Settings → '
+          'this app → Microphone.', LogType.warning);
+    }
     notifyListeners();
   }
 
   /// Asks for what the call screen needs: notifications (Android 13+) and,
   /// when missing, full-screen notifications (Android 14+, opens Settings).
   Future<void> requestCallPermissions() async {
+    await _requestMicrophone();
     notificationsAllowed = await push.requestNotificationPermission();
     fullScreenAllowed = await callScreen.canUseFullScreen();
     if (fullScreenAllowed == false) await callScreen.requestFullScreen();
@@ -2111,6 +2137,8 @@ class PlaygroundController extends ChangeNotifier {
           // Also a sign-in whose first attempt threw but that the SDK then
           // completed by itself, which skipped the save in _connect.
           unawaited(_saveCredentials());
+          // iOS cannot ask over CallKit: ask now, before a call comes in.
+          unawaited(_requestMicrophone());
         }
         _registerWithVobizPush();
       }
@@ -2314,6 +2342,13 @@ class PlaygroundController extends ChangeNotifier {
       'call_failed', 'setup_failed', 'registration_failed', 'transfer_failed',
     };
     if (shown.contains(e.code)) return;
+    if (e.code == VobizErrorCode.microphonePermissionDenied) {
+      microphoneAllowed = false;
+      log('❌ The call could not be answered: microphone access is off. Turn it on in Settings → '
+          'this app → Microphone.', LogType.error);
+      notifyListeners();
+      return;
+    }
     log('⚠️ ${e.code}: ${e.message}', LogType.warning);
   }
 

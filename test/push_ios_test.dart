@@ -87,6 +87,8 @@ void main() {
   late VobizIosPush ios;
   late List<MethodCall> native;
   late List<Object?> startEvents;
+  late String mic;
+  late bool appActive;
 
   Future<void> fromNative(Map<String, Object?> event) async {
     final data = const StandardMethodCodec().encodeMethodCall(MethodCall('event', event));
@@ -97,9 +99,13 @@ void main() {
     client = _Client();
     native = <MethodCall>[];
     startEvents = <Object?>[];
+    mic = 'granted';
+    appActive = true;
     messenger.setMockMethodCallHandler(channel, (call) async {
       native.add(call);
       if (call.method == 'start') return <String, Object?>{'voipToken': 'tok-1', 'events': startEvents};
+      if (call.method == 'microphone') return <String, Object?>{'permission': mic, 'appActive': appActive};
+      if (call.method == 'requestMicrophone') return mic == 'undetermined' && appActive ? (mic = 'granted') : mic;
       return null;
     });
     ios = VobizIosPush(client, supported: true);
@@ -235,10 +241,54 @@ void main() {
     });
   });
 
+  group('microphone', () {
+    test('start asks for it while the app is on screen', () async {
+      mic = 'undetermined';
+      await ios.start();
+      expect(native.map((c) => c.method), contains('requestMicrophone'));
+      expect(await ios.microphonePermission(), VobizMicrophonePermission.granted);
+    });
+
+    test('start does not ask with requestsMicrophoneOnStart off', () async {
+      await ios.dispose();
+      ios = VobizIosPush(client, supported: true, requestsMicrophoneOnStart: false);
+      mic = 'undetermined';
+      await ios.start();
+      expect(native.map((c) => c.method), isNot(contains('requestMicrophone')));
+      expect(await ios.requestMicrophonePermission(), VobizMicrophonePermission.granted);
+    });
+
+    test('a call is answered only if the microphone can open', () async {
+      await ios.start();
+      final check = client.canOpenMicrophone!;
+      mic = 'granted';
+      expect(await check(), isTrue);
+      mic = 'denied';
+      expect(await check(), isFalse);
+      // Never asked: the prompt shows only over the app itself.
+      mic = 'undetermined';
+      appActive = true;
+      expect(await check(), isTrue);
+      appActive = false;
+      expect(await check(), isFalse);
+      expect(await ios.requestMicrophonePermission(), VobizMicrophonePermission.undetermined);
+    });
+
+    test('dispose removes the check', () async {
+      await ios.start();
+      expect(client.canOpenMicrophone, isNotNull);
+      await ios.dispose();
+      expect(client.canOpenMicrophone, isNull);
+      ios = VobizIosPush(client, supported: true);
+    });
+  });
+
   test('does nothing where it is not supported', () async {
     final off = VobizIosPush(client, supported: false);
     await off.start();
     expect(native, isEmpty);
+    expect(client.canOpenMicrophone, isNull);
+    expect(await off.requestMicrophonePermission(), VobizMicrophonePermission.granted);
     expect(await off.waitForVoipToken(), isNull);
     await off.dispose();
   });

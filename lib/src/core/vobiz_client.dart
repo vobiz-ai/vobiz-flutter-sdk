@@ -287,6 +287,13 @@ class VobizClient {
   /// Whether [callId] (a `CallEvent.callId`) is the call a push announced.
   bool isPushedCall(String callId) => _pushed?.callId == callId;
 
+  /// Asked before an inbound call is answered: false ends the call at once
+  /// with [VobizErrorCode.microphonePermissionDenied] (480 to the caller),
+  /// instead of waiting on a microphone that cannot open. Null (the default)
+  /// answers without asking. `VobizIosPush.start` sets it on iOS, where a
+  /// call answered from CallKit cannot show the permission prompt.
+  Future<bool> Function()? canOpenMicrophone;
+
   Stream<ConnectionEvent> get connectionEvents => _connectionEvents.stream;
   Stream<CallEvent> get callEvents => _callEvents.stream;
   Stream<MediaEvent> get mediaEvents => _mediaEvents.stream;
@@ -1857,7 +1864,14 @@ class VobizClient {
     var declineCode = 480;
     var declinePhrase = 'Temporarily Unavailable';
     var why = 'Could not open the microphone';
+    var errorCode = VobizErrorCode.answerFailed;
     try {
+      final check = canOpenMicrophone;
+      if (check != null && !await check()) {
+        why = 'This app may not use the microphone';
+        errorCode = VobizErrorCode.microphonePermissionDenied;
+        throw StateError(why);
+      }
       await _peer.initialize(callId);
       declineCode = 488;
       declinePhrase = 'Not Acceptable Here';
@@ -1908,7 +1922,7 @@ class VobizClient {
           reason: 'answer_failed',
           declineCode: declineCode,
           declinePhrase: declinePhrase);
-      _emitError(VobizErrorCode.answerFailed, why, e);
+      _emitError(errorCode, why, e);
     }
   }
 

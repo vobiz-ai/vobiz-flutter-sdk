@@ -261,6 +261,14 @@ ring over SIP on CallKit too, and keeps CallKit in step as calls connect and end
    PushKit before Flutter runs. `stop()` turns it off. Use `ios.setMuted()` to mute, so
    CallKit shows it. Don't also show calls with another CallKit plugin on iOS.
 
+   **Microphone.** iOS can't show the microphone prompt over CallKit or the lock
+   screen, so a user who has never allowed it can't answer a pushed call. `start()`
+   asks for it while the app is on screen (turn that off with
+   `requestsMicrophoneOnStart: false` and call `ios.requestMicrophonePermission()`
+   yourself, for example at sign-in). A call answered without it ends at once: the
+   caller gets 480 and `errorEvents` reports `microphone_permission_denied`. Once the
+   user denies it, only Settings can turn it back on.
+
 Vobiz pushes with the APNs key (`.p8`, with its key id and team id) saved for the app's
 bundle id under Push Notifications in the Vobiz Console, to the topic
 `<bundle id>.voip`. A debug build's token is a sandbox token: it needs the credential
@@ -312,6 +320,7 @@ bundle id in Xcode (Runner → Signing & Capabilities) and save your own APNs ke
 | iOS: the app is killed on a VoIP push, or VoIP pushes stop arriving | The AppDelegate is not a `VobizAppDelegate` (PushKit registered too late), or it is a debug build |
 | iOS: no VoIP push arrives | The Console's APNs credential is sandbox for a production token or the reverse, or it is for another bundle id |
 | iOS: a killed app crashes on a VoIP push (`ConnectivityPlusPlugin.register`, or any plugin's `register`) | It is a debug build, which cannot start without Xcode attached: test with a profile or release build |
+| iOS: Accept on CallKit stays on "connecting", or the call ends with `microphone_permission_denied` | The app was never allowed the microphone, and iOS can't ask over CallKit: ask while the app is on screen (`requestMicrophonePermission`), or turn it on in Settings |
 | iOS: a call answered on the lock screen has no audio | Another plugin activates the audio session first (another CallKit plugin, or an audio-session plugin): leave the call's audio to `VobizIosPush` |
 | No audio on an Android emulator | Use a real device, or enable the emulator's host microphone |
 | Headset not used on Android 12+ | `BLUETOOTH_CONNECT` was not granted |

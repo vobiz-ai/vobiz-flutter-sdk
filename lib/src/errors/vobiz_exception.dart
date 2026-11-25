@@ -53,6 +53,12 @@ abstract final class VobizErrorCode {
   /// An inbound call could not be answered.
   static const String answerFailed = 'answer_failed';
 
+  /// An inbound call was not answered because this app may not use the
+  /// microphone: the user denied it, or was never asked and the call was
+  /// answered where iOS cannot ask (CallKit, the lock screen). The caller
+  /// gets 480. Ask before calls come in: `VobizIosPush.requestMicrophonePermission`.
+  static const String microphonePermissionDenied = 'microphone_permission_denied';
+
   /// A call failed after it was set up.
   static const String callFailed = 'call_failed';
 
