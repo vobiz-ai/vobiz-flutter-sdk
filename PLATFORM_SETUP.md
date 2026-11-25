@@ -10,7 +10,7 @@ Everything here is taken from the [example app](example), which builds with it.
 |---|---|---|
 | Outbound calls | yes | yes |
 | Incoming calls, app in the foreground | yes | yes |
-| Incoming calls, app in the background or closed | yes, woken by Vobiz push; the app shows the call screen (the example shows how) | **not yet**: no PushKit/CallKit (see below) |
+| Incoming calls, app in the background or closed | yes, woken by Vobiz push; the app shows the call screen (the example shows how) | yes, woken by Vobiz push; the SDK shows CallKit (`VobizIosPush`, see below) |
 
 ## Dependency
 
@@ -187,49 +187,79 @@ The example commits both ([`example/ios/Podfile`](example/ios/Podfile)). Run
 <key>UIBackgroundModes</key>
 <array>
   <string>audio</string>
-  <!-- Only with PushKit and CallKit, as below. -->
+  <!-- Only with VobizIosPush, as below. -->
   <string>voip</string>
 </array>
 ```
 
 `audio` keeps a call that is already up running when the app goes to the background.
-`voip` lets PushKit wake the app for a call: add it only together with the PushKit and
-CallKit code below.
+`voip` lets PushKit wake the app for a call: add it only when the app uses
+`VobizIosPush`, below (App Review rejects `voip` without CallKit).
 The camera string says the camera is not used: the WebRTC framework that
 `flutter_webrtc` bundles contains camera code, and App Store Connect can refuse a build
 whose binary refers to the camera without a purpose string. The SDK never opens the
 camera.
 
-### Incoming calls on iOS: PushKit and CallKit
+### Incoming calls on iOS: PushKit and CallKit, built in
 
 A closed or suspended iOS app is woken for a call by a PushKit VoIP push, which Vobiz's
-push service sends through APNs. The SDK stays free of native code, as on Android: the
-app receives the push and shows the call. The example does it in
-[`example/ios/Runner/AppDelegate.swift`](example/ios/Runner/AppDelegate.swift) with
-`flutter_callkit_incoming`:
+push service sends through APNs. The SDK's iOS code does the native part: it registers
+for PushKit, reports every push to CallKit before PushKit's completion (iOS ends an app
+that doesn't), shows the CallKit call screen, and starts WebRTC's audio only when
+CallKit activates the audio session (otherwise a call answered on a locked phone can be
+silent). `VobizIosPush` (Dart) does the rest for your `VobizClient`: it claims the held
+call, turns CallKit's Accept, Decline, End, mute and hold into SDK calls, puts calls that
+ring over SIP on CallKit too, and keeps CallKit in step as calls connect and end.
 
-1. **Capabilities.** *Push Notifications* (the example's
-   [`Runner.entitlements`](example/ios/Runner/Runner.entitlements), `aps-environment`)
-   and the `voip` background mode.
-2. **One Flutter engine, started in the AppDelegate.** A VoIP push launches a closed
-   app in the background with no window scene, so an engine the scene makes would not
-   run. The example's `SceneDelegate` shows the AppDelegate's engine instead, and
-   `Info.plist` names no storyboard for the scene.
-3. **PushKit.** `PKPushRegistry` for `.voIP`; hand its token to
-   `SwiftFlutterCallkitIncomingPlugin.setDevicePushTokenVoIP`, and sign the phone up
-   with `VobizPushDevice(platform: 'ios', pushToken: <that token>, …)`.
-4. **Report every push to CallKit before PushKit's completion.** iOS ends an app that
-   takes a VoIP push without reporting a call, and stops sending it VoIP pushes after a
-   few. A push that is not a live Vobiz call (expired, or missing its hold reference)
-   is reported and ended at once. Then hand the push's fields to
-   `VobizClient.handleIncomingPush`, as on Android.
-5. **CallKit takes UUIDs.** A SIP Call-ID is not one: the example makes a name-based
-   UUID from it, the same in Swift and in Dart (`CallScreen.uuidFor`).
-6. **Audio.** WebRTC runs with manual audio (`RTCAudioSession.useManualAudio`): a call
-   answered on CallKit starts its audio when CallKit activates the session
-   (`didActivate`), and calls CallKit does not carry (outgoing calls, calls answered in
-   the app) activate it themselves. Without this, a call answered on a locked phone is
-   often silent.
+1. **Capabilities.** Xcode → Runner → *Signing & Capabilities*: add **Push
+   Notifications** (an `aps-environment` entitlement, as in the example's
+   [`Runner.entitlements`](example/ios/Runner/Runner.entitlements)), and the `voip`
+   background mode in `Info.plist`, as above.
+2. **AppDelegate.** A VoIP push launches a closed app in the background with no window
+   scene, so the Flutter engine must start in the AppDelegate:
+
+   ```swift
+   // ios/Runner/AppDelegate.swift
+   import vobiz_webrtc
+
+   @main
+   @objc class AppDelegate: VobizAppDelegate {}
+   ```
+
+   With window scenes (Flutter 3.38 and later), show that engine from the SceneDelegate,
+   and remove `UISceneStoryboardFile` from the scene configuration in `Info.plist`, so
+   the scene doesn't start a second engine:
+
+   ```swift
+   // ios/Runner/SceneDelegate.swift
+   import Flutter
+   import UIKit
+   import vobiz_webrtc
+
+   class SceneDelegate: FlutterSceneDelegate {
+     override func scene(_ scene: UIScene, willConnectTo session: UISceneSession,
+                         options connectionOptions: UIScene.ConnectionOptions) {
+       window = VobizAppDelegate.makeWindow(for: scene)
+       super.scene(scene, willConnectTo: session, options: connectionOptions)
+     }
+   }
+   ```
+
+3. **Dart.** Start `VobizIosPush` before signing in, and register the phone with its
+   VoIP token:
+
+   ```dart
+   final ios = VobizIosPush(client);
+   await ios.start();                         // before connect()
+   ios.pushes.listen((_) => signInIfNeeded()); // a push while signed out
+   final token = await ios.waitForVoipToken();
+   // Through your backend: VobizPushDevice(platform: 'ios', pushToken: token,
+   //   appBundleId: await ios.bundleId(), sipUsername: client.sipUsername!, ...)
+   ```
+
+   `start()` is remembered: on the next launches `VobizAppDelegate` registers for
+   PushKit before Flutter runs. `stop()` turns it off. Use `ios.setMuted()` to mute, so
+   CallKit shows it. Don't also show calls with another CallKit plugin on iOS.
 
 Vobiz pushes with the APNs key (`.p8`, with its key id and team id) saved for the app's
 bundle id under Push Notifications in the Vobiz Console, to the topic
@@ -265,10 +295,10 @@ bundle id in Xcode (Runner → Signing & Capabilities) and save your own APNs ke
       Firebase and the call-screen plugin)
 - [ ] iOS: `NSMicrophoneUsageDescription`, `NSCameraUsageDescription`,
       `UIBackgroundModes` = `audio`
-- [ ] iOS with push: Push Notifications capability, `voip` background mode, PushKit
-      reported to CallKit for every push, the engine started in the AppDelegate,
-      WebRTC manual audio, and the Console APNs key for your bundle id (sandbox for
-      debug builds)
+- [ ] iOS with push: Push Notifications capability, `voip` background mode,
+      `AppDelegate: VobizAppDelegate` (and the SceneDelegate's `makeWindow`),
+      `VobizIosPush.start()` before sign-in, and the Console APNs key for your bundle id
+      (sandbox for debug builds)
 - [ ] Sign-in and push sign-up use your backend ([CREDENTIALS.md](CREDENTIALS.md)), not
       the account Auth Token
 
@@ -279,10 +309,10 @@ bundle id in Xcode (Runner → Signing & Capabilities) and save your own APNs ke
 | Version solving fails on `flutter_webrtc` | Remove your own `flutter_webrtc` pin; the SDK needs `^1.0.0` |
 | `pod install`: "requires a higher minimum iOS deployment version" | Set iOS 15.0 in the Podfile and the Xcode project, as above |
 | The other side stops hearing you when the app goes to the background | No foreground service is running for the call |
-| iOS: the app is killed on a VoIP push, or VoIP pushes stop arriving | A push was not reported to CallKit before PushKit's completion |
+| iOS: the app is killed on a VoIP push, or VoIP pushes stop arriving | The AppDelegate is not a `VobizAppDelegate` (PushKit registered too late), or it is a debug build |
 | iOS: no VoIP push arrives | The Console's APNs credential is sandbox for a production token or the reverse, or it is for another bundle id |
 | iOS: a killed app crashes on a VoIP push (`ConnectivityPlusPlugin.register`, or any plugin's `register`) | It is a debug build, which cannot start without Xcode attached: test with a profile or release build |
-| iOS: a call answered on the lock screen has no audio | WebRTC activated the audio session before CallKit: use manual audio, as above |
+| iOS: a call answered on the lock screen has no audio | Another plugin activates the audio session first (another CallKit plugin, or an audio-session plugin): leave the call's audio to `VobizIosPush` |
 | No audio on an Android emulator | Use a real device, or enable the emulator's host microphone |
 | Headset not used on Android 12+ | `BLUETOOTH_CONNECT` was not granted |
 | Play Console asks about a camera foreground service | Remove the plugin's camera permissions and service type, as above |

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## 0.3.0 - Unreleased
+
+iOS push-to-wake moves into the SDK. `vobiz_webrtc` is now a Flutter plugin with iOS
+code of its own (PushKit, CallKit, and WebRTC's audio around CallKit), so an iOS app
+adds the dependency, one AppDelegate line and `VobizIosPush`, instead of copying the
+example's Swift. Android is unchanged and still has no native code.
+
+### Added
+
+- `VobizIosPush`: starts PushKit and CallKit for a `VobizClient`, hands each Vobiz push
+  to `handleIncomingPush`, and turns CallKit's Accept, Decline, End, mute and hold into
+  SDK calls. Calls that ring over SIP while the app runs show on CallKit too
+  (`showCallsOnCallKit`). It keeps CallKit in step as calls connect and end, ends held
+  calls that never arrive as missed, and exposes `voipToken`, `waitForVoipToken`,
+  `voipTokenChanges`, `pushes`, `bundleId`, `setMuted`, `start` and `stop`. CallKit
+  settings: `includesCallsInRecents`, `iconTemplateImageName`, `ringtoneSound`.
+- iOS: `VobizAppDelegate` starts the app's Flutter engine at launch and registers for
+  PushKit first, so a push can launch a closed app; `VobizAppDelegate.makeWindow(for:)`
+  shows that engine from a SceneDelegate.
+- iOS: WebRTC runs with manual audio while `VobizIosPush` is on. A CallKit call starts
+  its audio when CallKit activates the session; other calls activate it themselves.
+
+### Changed
+
+- **Breaking for iOS apps that copied 0.2.x's example code:** remove that AppDelegate
+  code and `flutter_callkit_incoming`'s iOS use, and use `VobizAppDelegate` and
+  `VobizIosPush` (two CallKit providers would show calls twice).
+- The example app uses the SDK's iOS push; its own Swift is two delegate lines.
+- The package is a Flutter plugin (iOS: `VobizWebrtcPlugin`; Android: Dart only).
+
 ## 0.2.1 - 2026-11-25
 
 iOS gets what Android had in 0.2.0: a closed or suspended app rings for incoming calls

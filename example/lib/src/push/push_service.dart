@@ -1,6 +1,6 @@
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter_callkit_incoming/entities/entities.dart' as ck;
+import 'package:vobiz_webrtc/vobiz_webrtc.dart' show VobizIosPush;
 
 import 'call_screen.dart';
 
@@ -11,8 +11,9 @@ import 'call_screen.dart';
 /// * Android: Firebase Cloud Messaging. Without
 ///   `android/app/google-services.json` the app still rings for calls while
 ///   it is open; [available] is false and [problem] says why.
-/// * iOS: PushKit VoIP pushes, through APNs. The token is PushKit's, which
-///   the app's iOS side hands to flutter_callkit_incoming. No Firebase.
+/// * iOS: PushKit VoIP pushes, through APNs, handled by the SDK
+///   (VobizIosPush): the token, the call screen and the claim. No Firebase,
+///   so [token] and [tokenRefresh] are Android's only.
 class PushService {
   PushService._({required this.available, this.problem, this.voip = false});
 
@@ -37,14 +38,11 @@ class PushService {
   /// What carries the pushes, for the screen.
   String get name => voip ? 'VoIP push (PushKit)' : 'Firebase push';
 
-  /// How long [token] waits for PushKit's first token after launch.
-  static const Duration voipTokenWait = Duration(seconds: 10);
-
   /// Starts Firebase (Android), before `runApp`. Never throws.
   static Future<PushService> start() async {
-    // PushKit registers in the app's iOS side, at launch.
-    if (CallScreen.isIOS) return PushService._(available: true, voip: true);
-    if (!CallScreen.isAndroid) {
+    // iOS: the SDK registers for PushKit (VobizIosPush.start).
+    if (VobizIosPush.isSupported) return PushService._(available: true, voip: true);
+    if (!CallScreen.supported) {
       return PushService._(available: false, problem: 'Push needs Android or iOS.');
     }
     try {
@@ -63,19 +61,10 @@ class PushService {
     return PushService._(available: true);
   }
 
-  /// This device's token: Firebase's, or PushKit's on iOS. Null without
-  /// Firebase or a network, or when PushKit has given none within
-  /// [voipTokenWait].
+  /// This device's Firebase token, or null without Firebase or a network
+  /// (and on iOS: VobizIosPush has the VoIP token).
   Future<String?> token() async {
-    if (!available) return null;
-    if (voip) {
-      final deadline = DateTime.now().add(voipTokenWait);
-      while (true) {
-        final token = await CallScreen.voipToken();
-        if (token != null || DateTime.now().isAfter(deadline)) return token;
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-      }
-    }
+    if (!available || voip) return null;
     try {
       return await FirebaseMessaging.instance.getToken();
     } catch (_) {
@@ -83,19 +72,10 @@ class PushService {
     }
   }
 
-  /// Firebase and PushKit replace tokens now and then; Vobiz push must get
-  /// the new one.
-  Stream<String> get tokenRefresh {
-    if (!available) return const Stream<String>.empty();
-    if (voip) {
-      return CallScreen.events
-          .where((e) => e is ck.CallEventActionDidUpdateDevicePushTokenVoip)
-          .asyncMap((_) => CallScreen.voipToken())
-          .where((token) => token != null)
-          .cast<String>();
-    }
-    return FirebaseMessaging.instance.onTokenRefresh;
-  }
+  /// Firebase replaces tokens now and then; Vobiz push must get the new one.
+  /// (iOS: VobizIosPush.voipTokenChanges.)
+  Stream<String> get tokenRefresh =>
+      available && !voip ? FirebaseMessaging.instance.onTokenRefresh : const Stream<String>.empty();
 
   /// Android 13+: asks for the notification permission and says whether it
   /// was given. Null when it cannot tell (no Firebase). iOS: true, as CallKit

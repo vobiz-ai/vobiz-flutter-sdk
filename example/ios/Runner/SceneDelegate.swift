@@ -1,24 +1,15 @@
 import Flutter
 import UIKit
+import vobiz_webrtc
 
-/// Shows the app's one Flutter engine (AppDelegate.flutterEngine) in the
-/// window. The scene must not make its own: a VoIP push can start the app
-/// with no scene, and the engine AppDelegate starts then is the one that
-/// signs in and takes the call.
+/// Shows the engine VobizAppDelegate started. Info.plist names no scene
+/// storyboard, so the scene does not start a second engine.
 class SceneDelegate: FlutterSceneDelegate {
   override func scene(
     _ scene: UIScene, willConnectTo session: UISceneSession,
     options connectionOptions: UIScene.ConnectionOptions
   ) {
-    if let windowScene = scene as? UIWindowScene,
-      let appDelegate = UIApplication.shared.delegate as? AppDelegate
-    {
-      let window = UIWindow(windowScene: windowScene)
-      window.rootViewController = FlutterViewController(
-        engine: appDelegate.flutterEngine, nibName: nil, bundle: nil)
-      self.window = window
-      window.makeKeyAndVisible()
-    }
+    window = VobizAppDelegate.makeWindow(for: scene)
     super.scene(scene, willConnectTo: session, options: connectionOptions)
   }
 }

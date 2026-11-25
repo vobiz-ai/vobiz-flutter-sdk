@@ -51,3 +51,6 @@ example/ios/Runner/GoogleService-Info.plist
 example/push_bridge/
 example/integration_test/
 example/test/
+
+# Swift Package Manager / Xcode per-user state
+ios/vobiz_webrtc/.swiftpm/

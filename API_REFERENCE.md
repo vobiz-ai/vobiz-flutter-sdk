@@ -351,6 +351,42 @@ backend. The example's sample server implements the same routes as
 `/push/devices/register` and `/push/devices/logout`
 ([example/push_bridge/README.md](example/push_bridge/README.md#vobiz-push-sign-up)).
 
+### iOS: VobizIosPush
+
+PushKit, CallKit and the call's audio on iOS, for a `VobizClient`. The app also needs
+an AppDelegate that is a `VobizAppDelegate` and the setup in
+[PLATFORM_SETUP.md](PLATFORM_SETUP.md#incoming-calls-on-ios-pushkit-and-callkit-built-in).
+Elsewhere every member does nothing.
+
+```dart
+VobizIosPush(
+  VobizClient client, {
+  bool includesCallsInRecents = true, // CallKit lists the calls in Recents
+  String? iconTemplateImageName,      // asset-catalog image on the call screen
+  String? ringtoneSound,              // a sound file in the app bundle
+  bool showCallsOnCallKit = true,     // calls that ring over SIP show on CallKit too
+})
+```
+
+| Member | Notes |
+|---|---|
+| `static bool isSupported` | True on iOS |
+| `Future<void> start()` | Turns iOS push on (remembered for the next launches) and drives CallKit for the client. Call it once, before signing in, so the push that launched the app is claimed by that sign-in |
+| `Future<void> stop()` | Turns iOS push off, also for the next launches. Remove the device from Vobiz push too |
+| `String? voipToken` | The PushKit VoIP token, once PushKit has given one |
+| `Future<String?> waitForVoipToken({Duration timeout = 10 s})` | The token, waiting for PushKit |
+| `Stream<String> voipTokenChanges` | New tokens: sign the phone up again with each |
+| `Stream<VobizIncomingPush> pushes` | Pushes after they are on CallKit and handed to `handleIncomingPush`: sign in on one when not signed in |
+| `Future<String?> bundleId()` | The app's bundle id, the `appBundleId` to sign the phone up with |
+| `Future<void> setMuted(bool muted)` | Mutes or unmutes the current call, and shows it on CallKit |
+| `Future<void> dispose()` | Stops listening (PushKit and CallKit stay on for the next launches) |
+
+CallKit's Accept and Decline become `reportCallScreenAccepted` and
+`reportCallScreenDeclined` (or `acceptCall` and `rejectCall` for a call ringing over
+SIP); End becomes `hangup`, and mute and hold become `mute`/`unmute` and
+`hold`/`resume`. Sign the phone up with `VobizPushDevice(platform: 'ios', pushToken:
+await ios.waitForVoipToken(), appBundleId: await ios.bundleId(), ...)`.
+
 ## VobizConference
 
 Turns the client's current call into a Vobiz conference room and manages the people in
