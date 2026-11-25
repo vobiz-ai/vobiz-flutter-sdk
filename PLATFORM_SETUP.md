@@ -237,6 +237,18 @@ bundle id under Push Notifications in the Vobiz Console, to the topic
 saved as sandbox, and a TestFlight or App Store build's a production one. See
 [doc/PUSH_DESIGN.md](doc/PUSH_DESIGN.md#ios).
 
+**Test push with a profile or release build, not debug.** A Flutter debug build runs
+its Dart code through the debugger, so on a device it starts only while Xcode or
+`flutter run` is attached. Launched any other way, from the home screen or by a VoIP
+push to a killed app, it crashes while registering plugins, and nothing rings. Build
+with `flutter run --profile` (or `flutter build ios --profile` and install it), or set
+Xcode's Run scheme to *Profile* (Product → Scheme → Edit Scheme → Run → Build
+Configuration).
+
+The example is signed for Vobiz's team with the bundle id `ai.vobiz.vobizWebrtc`, which
+the APNs key in the Console is saved for. Outside that team, pick your own team and
+bundle id in Xcode (Runner → Signing & Capabilities) and save your own APNs key for it.
+
 ## Checklist
 
 - [ ] Android: `minSdk` ≥ 24, `targetSdk` 36
@@ -269,6 +281,7 @@ saved as sandbox, and a TestFlight or App Store build's a production one. See
 | The other side stops hearing you when the app goes to the background | No foreground service is running for the call |
 | iOS: the app is killed on a VoIP push, or VoIP pushes stop arriving | A push was not reported to CallKit before PushKit's completion |
 | iOS: no VoIP push arrives | The Console's APNs credential is sandbox for a production token or the reverse, or it is for another bundle id |
+| iOS: a killed app crashes on a VoIP push (`ConnectivityPlusPlugin.register`, or any plugin's `register`) | It is a debug build, which cannot start without Xcode attached: test with a profile or release build |
 | iOS: a call answered on the lock screen has no audio | WebRTC activated the audio session before CallKit: use manual audio, as above |
 | No audio on an Android emulator | Use a real device, or enable the emulator's host microphone |
 | Headset not used on Android 12+ | `BLUETOOTH_CONNECT` was not granted |
