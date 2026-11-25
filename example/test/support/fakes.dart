@@ -108,6 +108,9 @@ class FakeClient implements VobizClient {
     accessToken = VobizAccessToken.parse(token);
   }
 
+  /// What the last makeCall dialled.
+  ({String destination, String? callerId, Map<String, String> headers})? lastDial;
+
   /// The user name the last Zero-Config sign-in asked for.
   String? zeroConfigUserName;
 
@@ -172,6 +175,7 @@ class FakeClient implements VobizClient {
     String? dialUser,
   }) async {
     actions.add('makeCall');
+    lastDial = (destination: destination, callerId: callerId, headers: headers);
     final fail = failMakeCall;
     if (fail != null) throw fail;
     state = CallStateStatus.connecting;
