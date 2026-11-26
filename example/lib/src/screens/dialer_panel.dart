@@ -93,7 +93,8 @@ class _DialerPanelState extends State<DialerPanel> {
                     title: 'PSTN Requirement',
                     message: 'Required for calls to Mobile/Landline. Use a number purchased from '
                         'Vobiz or your trial number (e.g. +919999999999). It is sent as the '
-                        'X-VH-Caller-ID header.',
+                        'X-VH-Caller-ID header. Calls to another app user use the trial number '
+                        'when this is empty.',
                   )),
               PhoneNumberField(
                 key: const Key('callerId'),

@@ -521,7 +521,8 @@ class _IdentityPanelState extends State<IdentityPanel> {
           qa('Where do I find my credentials?',
               'Auth ID and Auth Token are both on your Vobiz Console Dashboard. The Auth Token is not your login password.'),
         qa('Why do I need a Caller ID?',
-            'Carriers require an E.164 CLI to bridge calls to mobile or landlines. Use a number purchased from Vobiz or your assigned trial number.'),
+            'Carriers require an E.164 CLI to bridge calls to mobile or landlines. Use a number purchased from Vobiz or your assigned trial number. '
+            'Calls to another app user need one too; when you leave it empty the app sends the trial number.'),
         if (c.demoTools)
           qa('What does Zero-Config Setup create?',
               'An application named "Vobiz WebRTC Playground" and an endpoint aliased "Vobiz WebRTC Playground Endpoint" on your account — '

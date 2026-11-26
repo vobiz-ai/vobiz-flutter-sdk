@@ -110,13 +110,13 @@ void main() {
       return c;
     }
 
-    test('need no number or caller ID', () async {
+    test('need no number, and send the trial number as caller ID', () async {
       final c = await signedIn();
       c.callPlaygroundUser(const PlaygroundUser(name: 'bob', sipUsername: 'bob0456'));
       await c.call();
       expect(client.actions, contains('makeCall'));
       expect(client.lastDial!.destination, PlaygroundController.endpointCallRoute);
-      expect(client.lastDial!.callerId, isNull);
+      expect(client.lastDial!.callerId, PlaygroundController.trialCallerId);
       expect(client.lastDial!.headers[VobizSipHeaders.dialUser], 'bob0456');
       expect(c.remoteParty, 'bob');
     });

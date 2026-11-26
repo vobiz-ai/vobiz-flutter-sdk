@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- Example app: a call to another app user with no caller ID entered failed as
+  busy (486), because the answer URL's `<Dial><User>` needs a caller ID the
+  account owns. The example now sends the trial number (`+12402128725`) as
+  `X-VH-Caller-ID` when the field is empty.
+
 ## 0.3.1 - 2026-11-26
 
 ### Added
