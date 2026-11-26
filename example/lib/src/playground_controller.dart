@@ -876,11 +876,9 @@ class PlaygroundController extends ChangeNotifier {
   /// dials the endpoint and ignores this number; Vobiz does not check it.
   static const String endpointCallRoute = '0000000000';
 
-  /// Caller ID for an endpoint-to-endpoint call when none is entered: Vobiz's
-  /// shared trial number, which every account may present. The answer URL's
-  /// `<Dial><User>` needs a caller ID the account owns; without one Vobiz takes
-  /// this phone's SIP username, refuses the leg, and the call fails as busy.
-  static const String trialCallerId = '+12402128725';
+  /// A number the signed-in account may present as caller ID, looked up once
+  /// (see [_accountCallerId]); empty until then or when there is none.
+  String _accountNumber = '';
 
   /// The SIP user the next call rings (a Dial-User header with a value).
   String? get dialUserTarget {
@@ -912,9 +910,18 @@ class PlaygroundController extends ChangeNotifier {
       return log('⚠️ The caller ID must be a plus and 7 to 15 digits, or empty for an '
           'endpoint call', LogType.error);
     }
+    // The answer URL's <Dial><User> needs a caller ID the account owns; without
+    // one Vobiz takes this phone's SIP username, refuses the leg, and the call
+    // fails as busy. With none entered, use the account's own number (its
+    // trial number on a trial account) when it can be looked up here; else the
+    // answer URL has to set one (the Playground server does).
     if (cli.isEmpty && dialUser != null) {
-      cli = trialCallerId;
-      log('No caller ID entered: using the trial number $cli for this endpoint call', LogType.info);
+      cli = await _accountCallerId();
+      log(
+          cli.isEmpty
+              ? 'No caller ID entered: the answer URL must set one for this endpoint call'
+              : 'No caller ID entered: using the account number $cli for this endpoint call',
+          LogType.info);
     }
     final dest = destNumber.trim().isEmpty ? endpointCallRoute : destination;
 
@@ -1915,6 +1922,40 @@ class PlaygroundController extends ChangeNotifier {
       if (_http == null) web.close();
       vobizCallPlacing = false;
       notifyListeners();
+    }
+  }
+
+  /// The account's first active number, or, for a trial account with no
+  /// numbers, the trial number for its country (the numbers list returns that
+  /// row then, as the console shows it). Needs the Auth ID and Token, so only
+  /// Zero-Config sign-in can look it up; "" otherwise or on any failure.
+  Future<String> _accountCallerId() async {
+    if (_accountNumber.isNotEmpty) return _accountNumber;
+    final id = authId.trim();
+    if (authTab != AuthTab.zeroConfig || id.isEmpty || authToken.isEmpty) return '';
+    final web = _http ?? http.Client();
+    try {
+      final response = await web.get(
+          Uri.parse('https://api.vobiz.ai/api/v1/account/${Uri.encodeComponent(id)}/numbers'
+              '?status=active&per_page=1'),
+          headers: <String, String>{
+            'Authorization': 'Basic ${base64Encode(utf8.encode('$id:$authToken'))}',
+          }).timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) {
+        log('Could not look up the account number for a caller ID: HTTP ${response.statusCode}', LogType.info);
+        return '';
+      }
+      final items = (jsonDecode(response.body) as Map<String, dynamic>)['items'];
+      final first = items is List && items.isNotEmpty ? items.first : null;
+      final e164 = first is Map ? '${first['e164'] ?? ''}' : '';
+      final number = e164.startsWith('+') ? e164 : '+$e164';
+      if (!RegExp(r'^\+\d{7,15}$').hasMatch(number)) return '';
+      return _accountNumber = number;
+    } catch (e) {
+      log('Could not look up the account number for a caller ID: $e', LogType.info);
+      return '';
+    } finally {
+      if (_http == null) web.close();
     }
   }
 

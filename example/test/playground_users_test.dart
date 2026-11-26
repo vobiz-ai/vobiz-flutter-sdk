@@ -99,8 +99,8 @@ void main() {
   });
 
   group('endpoint-to-endpoint calls', () {
-    Future<PlaygroundController> signedIn() async {
-      final c = make();
+    Future<PlaygroundController> signedIn({http.Client? web}) async {
+      final c = make(web: web);
       await c.init();
       c
         ..authId = 'MA_X'
@@ -110,15 +110,42 @@ void main() {
       return c;
     }
 
-    test('need no number, and send the trial number as caller ID', () async {
-      final c = await signedIn();
+    test('need no number, and send the account number as caller ID', () async {
+      final c = await signedIn(web: MockClient((request) async {
+        requests.add(request);
+        return http.Response(
+            jsonEncode(<String, Object>{
+              'items': <Object>[
+                <String, Object>{'e164': '+12402128725', 'is_trial_number': true}
+              ],
+              'total': 1,
+            }),
+            200);
+      }));
       c.callPlaygroundUser(const PlaygroundUser(name: 'bob', sipUsername: 'bob0456'));
       await c.call();
       expect(client.actions, contains('makeCall'));
       expect(client.lastDial!.destination, PlaygroundController.endpointCallRoute);
-      expect(client.lastDial!.callerId, PlaygroundController.trialCallerId);
+      expect(client.lastDial!.callerId, '+12402128725');
+      final lookup = requests.single;
+      expect(lookup.url.toString(), 'https://api.vobiz.ai/api/v1/account/MA_X/numbers?status=active&per_page=1');
+      expect(lookup.headers['Authorization'], 'Basic ${base64Encode(utf8.encode('MA_X:tok'))}');
+
+      // Looked up once per sign-in.
+      c.callPlaygroundUser(const PlaygroundUser(name: 'bob', sipUsername: 'bob0456'));
+      await c.call();
+      expect(requests, hasLength(1));
       expect(client.lastDial!.headers[VobizSipHeaders.dialUser], 'bob0456');
       expect(c.remoteParty, 'bob');
+    });
+
+    test('send no caller ID when the account number cannot be looked up', () async {
+      final c = await signedIn(web: MockClient((_) async => http.Response('{"error":"nope"}', 403)));
+      c.callPlaygroundUser(const PlaygroundUser(name: 'bob', sipUsername: 'bob0456'));
+      await c.call();
+      expect(client.actions, contains('makeCall'));
+      expect(client.lastDial!.callerId, isNull);
+      expect(c.logs.map((l) => l.message), contains(contains('the answer URL must set one')));
     });
 
     test('keep a caller ID and a number when they are entered', () async {

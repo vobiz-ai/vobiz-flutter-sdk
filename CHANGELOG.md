@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Example app: a call to another app user with no caller ID entered failed as
   busy (486), because the answer URL's `<Dial><User>` needs a caller ID the
-  account owns. The example now sends the trial number (`+12402128725`) as
-  `X-VH-Caller-ID` when the field is empty.
+  account owns. With the field empty, a Zero-Config sign-in now looks up the
+  account's number (its trial number on a trial account) and sends it as
+  `X-VH-Caller-ID`; otherwise the answer URL sets one, as the Playground server
+  does.
 
 ## 0.3.1 - 2026-11-26
 
