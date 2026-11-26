@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'vobiz_webrtc'
-  s.version          = '0.3.0'
+  s.version          = '0.3.1'
   s.summary          = 'Vobiz voice calls for Flutter: PushKit and CallKit on iOS.'
   s.description      = <<-DESC
 Rings a closed iOS app for Vobiz calls: PushKit VoIP pushes reported to CallKit,
