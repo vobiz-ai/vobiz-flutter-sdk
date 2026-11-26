@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- iOS: 0.3.0 did not compile. The CallKit setup used `CXProviderConfiguration()`, which
+  is iOS 14+, while the plugin supports iOS 13. iOS 13 now uses
+  `CXProviderConfiguration(localizedName:)` with the app's display name.
 - iOS: a call accepted on CallKit by a user who was never asked for the microphone hung
   on "connecting" until the caller gave up, since iOS can't show the prompt there. It
   now ends at once: the caller gets 480 and the app gets `microphone_permission_denied`.
