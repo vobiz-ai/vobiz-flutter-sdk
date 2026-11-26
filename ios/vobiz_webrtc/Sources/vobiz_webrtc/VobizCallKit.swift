@@ -80,7 +80,18 @@ public final class VobizCallKit: NSObject {
   }
 
   private func makeConfiguration() -> CXProviderConfiguration {
-    let configuration = CXProviderConfiguration()
+    // init() is iOS 14+; the plugin supports iOS 13, where only
+    // init(localizedName:) exists. iOS 14+ takes the name from the app bundle.
+    let configuration: CXProviderConfiguration
+    if #available(iOS 14.0, *) {
+      configuration = CXProviderConfiguration()
+    } else {
+      let bundle = Bundle.main
+      let name = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+        ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
+        ?? ""
+      configuration = CXProviderConfiguration(localizedName: name)
+    }
     configuration.supportsVideo = false
     configuration.maximumCallGroups = 1
     configuration.maximumCallsPerCallGroup = 1
