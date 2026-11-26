@@ -47,7 +47,7 @@ your outbound calls. See [CREDENTIALS.md](CREDENTIALS.md#access-tokens-jwt).
 ```yaml
 # pubspec.yaml
 dependencies:
-  vobiz_webrtc: ^0.3.0
+  vobiz_webrtc: ^0.3.1
 ```
 
 Or run `flutter pub add vobiz_webrtc`.
