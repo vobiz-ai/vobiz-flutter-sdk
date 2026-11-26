@@ -876,6 +876,12 @@ class PlaygroundController extends ChangeNotifier {
   /// dials the endpoint and ignores this number; Vobiz does not check it.
   static const String endpointCallRoute = '0000000000';
 
+  /// Caller ID for an endpoint-to-endpoint call when none is entered: Vobiz's
+  /// shared trial number, which every account may present. The answer URL's
+  /// <Dial><User> needs a caller ID the account owns; without one Vobiz takes
+  /// this phone's SIP username, refuses the leg, and the call fails as busy.
+  static const String trialCallerId = '+12402128725';
+
   /// The SIP user the next call rings (a Dial-User header with a value).
   String? get dialUserTarget {
     for (final row in headerRows) {
@@ -895,10 +901,9 @@ class PlaygroundController extends ChangeNotifier {
       return log('Please enter a destination', LogType.error);
     }
     if (!client.isConnected) return log('Login first', LogType.error);
-    final cli = callerId;
-    // A phone number needs an approved caller ID or carriers refuse the
-    // call; an endpoint (Dial-User) does not, and without one it sees the
-    // call come from this phone's SIP user.
+    var cli = callerId;
+    // A phone number needs an approved caller ID or carriers refuse the call.
+    // An endpoint (Dial-User) needs one too, but the trial number will do.
     if (dialUser == null && (cli.isEmpty || !RegExp(r'^\+\d{7,15}$').hasMatch(cli))) {
       return log('⚠️ Caller ID is required for PSTN calls. Enter a verified number '
           '(e.g. +919876543210)', LogType.error);
@@ -906,6 +911,10 @@ class PlaygroundController extends ChangeNotifier {
     if (cli.isNotEmpty && !RegExp(r'^\+\d{7,15}$').hasMatch(cli)) {
       return log('⚠️ The caller ID must be a plus and 7 to 15 digits, or empty for an '
           'endpoint call', LogType.error);
+    }
+    if (cli.isEmpty && dialUser != null) {
+      cli = trialCallerId;
+      log('No caller ID entered: using the trial number $cli for this endpoint call', LogType.info);
     }
     final dest = destNumber.trim().isEmpty ? endpointCallRoute : destination;
 
